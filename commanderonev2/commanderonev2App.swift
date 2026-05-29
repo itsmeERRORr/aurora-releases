@@ -1,17 +1,15 @@
-//
-//  commanderonev2App.swift
-//  commanderonev2
-//
-//  Created by Joao Ferreira on 27/01/2026.
-//
-
 import SwiftUI
 
 @main
 struct commanderonev2App: App {
+    @State private var appState = AppState()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(appState: appState)
+                .frame(minWidth: 900, minHeight: 600)
         }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1200, height: 700)
     }
 }
