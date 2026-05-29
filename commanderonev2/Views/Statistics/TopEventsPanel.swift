@@ -14,18 +14,35 @@ enum EventAggregator {
     static func build(appState: AppState) -> [EventAggregate] {
         var byPath: [String: (name: String, files: Int, bytes: Int64, speedSum: Double, speedCount: Int, last: Date)] = [:]
 
-        // Honor sidebar order: known event folders first.
+        // Finalized events first — source of truth for any matching path.
+        // Track these paths so live logic does not overwrite them.
+        var finalizedPaths = Set<String>()
+        for event in appState.finalizedEvents {
+            let root = normalize(event.lastKnownPath)
+            guard !root.isEmpty else { continue }
+            byPath[root] = (
+                name: event.name,
+                files: event.photoCount,
+                bytes: event.totalBytes,
+                speedSum: 0,
+                speedCount: 0,
+                last: event.lastImportDate ?? event.finalizedAt
+            )
+            finalizedPaths.insert(root)
+        }
+
+        // Honor sidebar order: known event folders first (skip finalized paths).
         let destinations = appState.uniqueImportDestinations
-        for (path, name, _) in destinations where !path.isEmpty {
+        for (path, name, _) in destinations where !path.isEmpty && !finalizedPaths.contains(normalize(path)) {
             byPath[normalize(path), default: (name, 0, 0, 0, 0, .distantPast)].name = name
         }
 
-        // Iterate history.
+        // Iterate history (skip entries whose parent is finalized — snapshot is canonical).
         for entry in appState.importHistory {
-            // Match the entry's destination to the configured event folder it belongs to.
             let entryNorm = normalize(entry.destinationPath)
-            // Prefer the deepest known event folder that is a prefix.
             let parentNorm = bestParent(of: entryNorm, in: destinations.map { normalize($0.path) }) ?? entryNorm
+            if finalizedPaths.contains(parentNorm) { continue }
+
             let displayName = destinations.first { normalize($0.path) == parentNorm }?.name
                 ?? URL(fileURLWithPath: parentNorm).lastPathComponent
 
