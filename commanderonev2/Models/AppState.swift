@@ -117,12 +117,13 @@ final class AppState {
 
     /// All configured event folders, shown in the Events sidebar.
     /// Same set as "Most Photos per event" in Statistics — all bookmarked folders, regardless of
-    /// whether they have import history. Sorted by most recent activity date (newest first).
-    /// Activity priority: latest matching importHistory entry → finalized snapshot date
-    /// (`lastImportDate ?? finalizedAt`) → none. Bookmarks with no activity date tie-break
-    /// by insertion order *descending* so the most recently added bookmark comes first.
+    /// whether they have import history. Sorted in two groups:
+    ///   1. Open (non-finalized) events, newest activity first.
+    ///   2. Finalized events, newest activity first (using snapshot date as fallback).
+    /// Within each group ties break by insertion order *descending* so the most recently
+    /// added bookmark comes first.
     var uniqueImportDestinations: [(path: String, name: String, bookmarkIndex: Int)] {
-        var result: [(path: String, name: String, lastDate: Date, index: Int)] = []
+        var result: [(path: String, name: String, lastDate: Date, isFinalized: Bool, index: Int)] = []
 
         for index in eventFolderBookmarks.indices {
             let folderPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
@@ -150,21 +151,32 @@ final class AppState {
                     lastDate = latest
                 }
             }
-            // Fall back to the finalized snapshot's date so finalized events with a moved
-            // folder (no longer matching importHistory) still sort by their real recency.
-            if lastDate == .distantPast,
-               index < eventFolderFinalizedEventID.count,
-               let id = eventFolderFinalizedEventID[index],
-               let event = finalizedEvents.first(where: { $0.id == id }) {
+
+            // Resolve finalized link + use the snapshot date as fallback so finalized
+            // events with a moved folder (no matching importHistory) still sort by real recency.
+            let finalizedID = index < eventFolderFinalizedEventID.count ? eventFolderFinalizedEventID[index] : nil
+            let finalizedEvent = finalizedID.flatMap { id in finalizedEvents.first(where: { $0.id == id }) }
+            if lastDate == .distantPast, let event = finalizedEvent {
                 lastDate = event.lastImportDate ?? event.finalizedAt
             }
 
-            result.append((path: folderPath, name: name, lastDate: lastDate, index: index))
+            result.append((
+                path: folderPath,
+                name: name,
+                lastDate: lastDate,
+                isFinalized: finalizedEvent != nil,
+                index: index
+            ))
         }
 
         return result
             .sorted { lhs, rhs in
-                lhs.lastDate != rhs.lastDate ? lhs.lastDate > rhs.lastDate : lhs.index > rhs.index
+                // Group 1 (open) before Group 2 (finalized).
+                if lhs.isFinalized != rhs.isFinalized { return !lhs.isFinalized }
+                // Within a group, newest activity first.
+                if lhs.lastDate != rhs.lastDate { return lhs.lastDate > rhs.lastDate }
+                // Tie-break: most recently added bookmark first.
+                return lhs.index > rhs.index
             }
             .map { (path: $0.path, name: $0.name, bookmarkIndex: $0.index) }
     }
