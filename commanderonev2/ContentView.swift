@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @Bindable var appState: AppState
@@ -190,6 +191,21 @@ struct ContentView: View {
         guard let dest = appState.destinationURL else {
             appState.log("Cannot import: no destination selected", level: .warning)
             return
+        }
+        if let finalized = appState.finalizedEvent(matchingPath: dest.path) {
+            let alert = NSAlert()
+            alert.messageText = "\"\(finalized.name)\" is finalized"
+            alert.informativeText = "Reopen the event to continue importing into this folder."
+            alert.addButton(withTitle: "Reopen and Import")
+            alert.addButton(withTitle: "Cancel")
+            let response = alert.runModal()
+            guard response == .alertFirstButtonReturn else {
+                appState.log("Import cancelled: destination belongs to finalized event \(finalized.name)", level: .warning)
+                return
+            }
+            if let idx = appState.eventFolderFinalizedEventID.firstIndex(where: { $0 == finalized.id }) {
+                appState.reopenEvent(at: idx)
+            }
         }
         guard let watcher = volumeWatcher else { return }
 
