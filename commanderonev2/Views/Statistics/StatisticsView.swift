@@ -4,7 +4,7 @@ struct StatisticsView: View {
     @Bindable var appState: AppState
     let statsRunner: StatsRunner?
 
-    @State private var mode: StatsMode = .lastImport
+    @State private var mode: StatsMode = .total
 
     var body: some View {
         ScrollView {
@@ -39,8 +39,8 @@ struct StatisticsView: View {
             let unit = (geo.size.width - totalGap) / totalWeight
             HStack(alignment: .top, spacing: gap) {
                 TopEventsPanel(appState: appState).frame(width: unit * 1)
-                LatestImportsPanel(appState: appState).frame(width: unit * 1)
-                FeaturedEventsPanel(appState: appState).frame(width: unit * 1.04)
+                TopCamerasPanel(appState: appState).frame(width: unit * 1)
+                TopLensesPanel(appState: appState).frame(width: unit * 1.04)
             }
         }
         .frame(minHeight: 320)

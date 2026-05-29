@@ -12,7 +12,7 @@ struct StatisticsTopbar: View {
                 .foregroundStyle(Color.auroraTxt)
             Spacer()
             SegmentedToggle(
-                options: [(.lastImport, "Last Import"), (.total, "Total")],
+                options: [(.total, "Total"), (.lastImport, "Last Import")],
                 selection: $mode
             )
         }

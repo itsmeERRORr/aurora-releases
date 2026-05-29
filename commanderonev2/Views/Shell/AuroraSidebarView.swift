@@ -32,10 +32,7 @@ struct AuroraSidebarView: View {
             eventsList
                 .frame(maxHeight: .infinity)
                 .layoutPriority(0)
-
-            storageWidget
-                .padding(.horizontal, 18)
-                .padding(.bottom, 14)
+                .padding(.bottom, 10)
 
             Divider()
                 .background(Color.auroraStroke)
