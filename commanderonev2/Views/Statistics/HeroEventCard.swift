@@ -37,11 +37,23 @@ struct HeroEventCard: View {
                 .tracking(1.9)
                 .foregroundStyle(Color.auroraCyan)
 
-            Text(info.name)
-                .font(.auroraHero)
-                .tracking(-0.8)
-                .foregroundStyle(Color.auroraTxt)
-                .lineLimit(2)
+            HStack(spacing: 8) {
+                Text(info.name)
+                    .font(.auroraHero)
+                    .tracking(-0.8)
+                    .foregroundStyle(Color.auroraTxt)
+                    .lineLimit(2)
+
+                if info.isFinalized {
+                    Text("Finalizado")
+                        .font(.manrope(8.5, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(Color.auroraFaint)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.auroraPanel2))
+                }
+            }
 
             if let meta = info.meta {
                 Text(meta)
@@ -189,6 +201,7 @@ struct HeroEventCard: View {
         let badge: String
         let strip: HeroStrip
         let hasData: Bool
+        let isFinalized: Bool
     }
 
     private struct HeroStrip {
@@ -207,7 +220,8 @@ struct HeroEventCard: View {
                 description: "Connect a card reader and import to see your most recent event here.",
                 badge: "Idle",
                 strip: HeroStrip(rawFiles: "—", data: "—", speed: "—", date: "—"),
-                hasData: false
+                hasData: false,
+                isFinalized: false
             )
         }
 
@@ -232,6 +246,8 @@ struct HeroEventCard: View {
         let bytes = AuroraFormat.bytesParts(report.totalBytes)
         let speed = AuroraFormat.speedParts(report.averageSpeed)
 
+        let isFinalized = appState.finalizedEvent(matchingPath: report.destinationPath) != nil
+
         return LatestEventInfo(
             name: name,
             folderPath: report.destinationPath,
@@ -244,7 +260,8 @@ struct HeroEventCard: View {
                 speed: "\(speed.value) \(speed.unit)",
                 date: AuroraFormat.dateCompact(lastDate)
             ),
-            hasData: true
+            hasData: true,
+            isFinalized: isFinalized
         )
     }
 }
