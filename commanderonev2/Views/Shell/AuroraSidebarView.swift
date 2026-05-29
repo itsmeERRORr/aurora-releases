@@ -30,8 +30,8 @@ struct AuroraSidebarView: View {
                 .padding(.bottom, 6)
 
             eventsList
-
-            Spacer(minLength: 0)
+                .frame(maxHeight: .infinity)
+                .layoutPriority(0)
 
             storageWidget
                 .padding(.horizontal, 18)
@@ -129,7 +129,7 @@ struct AuroraSidebarView: View {
                 }
                 .padding(.horizontal, 10)
             }
-            .frame(maxHeight: 260)
+            .scrollIndicators(.hidden)
         }
     }
 
