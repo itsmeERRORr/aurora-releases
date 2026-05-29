@@ -119,13 +119,12 @@ final class AppState {
     /// Same set as "Most Photos per event" in Statistics — all bookmarked folders, regardless of
     /// whether they have import history. Sorted by most recent import date (folders without any
     /// import history appear last, sorted by index).
-    var uniqueImportDestinations: [(path: String, name: String)] {
+    var uniqueImportDestinations: [(path: String, name: String, bookmarkIndex: Int)] {
         var result: [(path: String, name: String, lastDate: Date, index: Int)] = []
 
         for index in eventFolderBookmarks.indices {
             let folderPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
 
-            // Build display name: custom > last path component > placeholder
             let customName = index < eventFolderDisplayNames.count ? eventFolderDisplayNames[index] : ""
             let folderName: String
             if !folderPath.isEmpty {
@@ -135,7 +134,6 @@ final class AppState {
             }
             let name = customName.isEmpty ? folderName : customName
 
-            // Sort by most recent import (normalise trailing slashes to avoid mismatches)
             let lastDate: Date
             if !folderPath.isEmpty {
                 let norm = folderPath.hasSuffix("/") ? String(folderPath.dropLast()) : folderPath
@@ -155,12 +153,11 @@ final class AppState {
             result.append((path: folderPath, name: name, lastDate: lastDate, index: index))
         }
 
-        // Most recently imported first; tie-break by original index
         return result
             .sorted { lhs, rhs in
                 lhs.lastDate != rhs.lastDate ? lhs.lastDate > rhs.lastDate : lhs.index < rhs.index
             }
-            .map { (path: $0.path, name: $0.name) }
+            .map { (path: $0.path, name: $0.name, bookmarkIndex: $0.index) }
     }
 
     var photosByMonth: [(month: String, count: Int)] {

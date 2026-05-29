@@ -16,7 +16,7 @@ enum EventAggregator {
 
         // Honor sidebar order: known event folders first.
         let destinations = appState.uniqueImportDestinations
-        for (path, name) in destinations where !path.isEmpty {
+        for (path, name, _) in destinations where !path.isEmpty {
             byPath[normalize(path), default: (name, 0, 0, 0, 0, .distantPast)].name = name
         }
 
