@@ -97,6 +97,21 @@ final class AppState {
         }
     }
 
+    // MARK: - Finalized Events
+
+    /// Snapshots for events the user has marked as finalized.
+    /// Persisted via `FinalizedEventsStore`. Source of truth for finalized events
+    /// across the app (Top Events, Hero Card, sidebar row totals).
+    var finalizedEvents: [FinalizedEvent] = [] {
+        didSet { FinalizedEventsStore.saveAll(finalizedEvents) }
+    }
+
+    /// Per-bookmark link to a finalized snapshot. Same count as `eventFolderBookmarks`.
+    /// `nil` = active event (live counts), non-nil = finalized (snapshot is source of truth).
+    var eventFolderFinalizedEventID: [UUID?] = [] {
+        didSet { saveFinalizedEventIDs() }
+    }
+
     // MARK: - Import History
     var importHistory: [ImportHistoryEntry] = []
 
@@ -329,7 +344,7 @@ final class AppState {
 
     /// Bookmark data for "event" folders; RAW count is computed when displayed.
     var eventFolderBookmarks: [Data] = [] {
-        didSet { syncDisplayNamesCount(); syncPeakCounts(); syncCachedCounts(); saveEventFolderBookmarks() }
+        didSet { syncDisplayNamesCount(); syncPeakCounts(); syncCachedCounts(); syncFinalizedEventIDs(); saveEventFolderBookmarks() }
     }
     /// Custom display names per folder; same count as eventFolderBookmarks. Empty string = use folder name.
     var eventFolderDisplayNames: [String] = [] {
@@ -414,9 +429,19 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([Data].self, from: data) {
             eventFolderBookmarks = decoded
         }
+        // Load finalized snapshots
+        finalizedEvents = FinalizedEventsStore.loadAll()
+
+        // Load per-bookmark finalized IDs
+        if let data = UserDefaults.standard.data(forKey: "eventFolderFinalizedEventIDData"),
+           let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
+            eventFolderFinalizedEventID = decoded.map { $0.isEmpty ? nil : UUID(uuidString: $0) }
+        }
+
         syncDisplayNamesCount()
         syncPeakCounts()
         syncCachedCounts()
+        syncFinalizedEventIDs()
     }
 
     private func syncDisplayNamesCount() {
@@ -449,6 +474,21 @@ final class AppState {
         } else if eventFolderCachedPaths.count < n {
             eventFolderCachedPaths += Array(repeating: "", count: n - eventFolderCachedPaths.count)
         }
+    }
+
+    private func syncFinalizedEventIDs() {
+        let n = eventFolderBookmarks.count
+        if eventFolderFinalizedEventID.count > n {
+            eventFolderFinalizedEventID = Array(eventFolderFinalizedEventID.prefix(n))
+        } else if eventFolderFinalizedEventID.count < n {
+            eventFolderFinalizedEventID += Array(repeating: nil, count: n - eventFolderFinalizedEventID.count)
+        }
+    }
+
+    private func saveFinalizedEventIDs() {
+        let strings: [String] = eventFolderFinalizedEventID.map { $0?.uuidString ?? "" }
+        guard let data = try? PropertyListEncoder().encode(strings) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderFinalizedEventIDData")
     }
 
     private func saveEventFolderBookmarks() {
@@ -533,6 +573,7 @@ final class AppState {
         if index < eventFolderCachedPaths.count  { eventFolderCachedPaths.remove(at: index)  }
         if index < eventFolderDisplayNames.count { eventFolderDisplayNames.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
+        if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
         // Clean up scanning indicator: remove the deleted index and shift higher indices down by 1
         eventFolderScanningIndices.remove(index)
         eventFolderScanningIndices = Set(eventFolderScanningIndices.map { $0 > index ? $0 - 1 : $0 })
