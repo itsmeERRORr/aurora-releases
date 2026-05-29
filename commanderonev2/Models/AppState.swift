@@ -439,6 +439,37 @@ final class AppState {
         syncPeakCounts()
         syncCachedCounts()
         syncFinalizedEventIDs()
+        reconcileOrphanFinalizedEvents()
+    }
+
+    /// Recovery pass: re-link finalized snapshots to their sidebar bookmark when the
+    /// link was lost (e.g. because a previous build's subscript-mutation didSet didn't
+    /// fire and the IDs never persisted). Matches by `lastKnownPath` prefix against
+    /// `eventFolderCachedPaths`.
+    private func reconcileOrphanFinalizedEvents() {
+        let linkedIDs = Set(eventFolderFinalizedEventID.compactMap { $0 })
+        var didLink = false
+        for event in finalizedEvents where !linkedIDs.contains(event.id) {
+            let eventPath = event.lastKnownPath.hasSuffix("/")
+                ? String(event.lastKnownPath.dropLast())
+                : event.lastKnownPath
+            guard !eventPath.isEmpty else { continue }
+            for index in eventFolderBookmarks.indices {
+                let raw = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+                let norm = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+                guard !norm.isEmpty else { continue }
+                if eventFolderFinalizedEventID[index] != nil { continue }
+                if norm == eventPath || norm.hasPrefix(eventPath + "/") || eventPath.hasPrefix(norm + "/") {
+                    eventFolderFinalizedEventID[index] = event.id
+                    didLink = true
+                    break
+                }
+            }
+        }
+        if didLink {
+            saveFinalizedEventIDs()
+            log("Reconciled orphan finalized events with sidebar bookmarks")
+        }
     }
 
     private func syncDisplayNamesCount() {
@@ -646,6 +677,9 @@ final class AppState {
 
         finalizedEvents.append(event)
         eventFolderFinalizedEventID[index] = event.id
+        // Subscript mutation on @Observable stored properties can skip didSet on some
+        // compiler versions, so persist explicitly to guarantee the link survives a relaunch.
+        saveFinalizedEventIDs()
         log("Finalized event '\(name)' with \(photoCount) photos")
         return event
     }
@@ -656,6 +690,7 @@ final class AppState {
         guard let id = eventFolderFinalizedEventID[index] else { return }
         finalizedEvents.removeAll { $0.id == id }
         eventFolderFinalizedEventID[index] = nil
+        saveFinalizedEventIDs()
         log("Reopened event at index \(index)")
     }
 
