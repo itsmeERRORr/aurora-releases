@@ -4,12 +4,16 @@ import SwiftUI
 struct commanderonev2App: App {
     @State private var appState = AppState()
 
+    init() {
+        FontLoader.registerAll()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView(appState: appState)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 1280, minHeight: 800)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1200, height: 700)
+        .defaultSize(width: 1440, height: 900)
     }
 }

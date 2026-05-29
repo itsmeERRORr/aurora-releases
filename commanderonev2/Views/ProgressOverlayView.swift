@@ -7,103 +7,91 @@ struct ProgressOverlayView: View {
     let onCancel: () -> Void
 
     var body: some View {
-        VStack(spacing: 20) {
-            // Title
-            HStack {
-                Image(systemName: stateIcon)
-                    .font(.title2)
-                    .foregroundStyle(Color.primaryPurple)
-                Text(stateTitle)
-                    .font(.title2.bold())
-                    .foregroundColor(.textPrimary)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                IconChip(systemName: stateIcon, color: .auroraViolet, size: 36, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(stateTitle)
+                        .font(.sora(20, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    Text(stateSubtitle)
+                        .font(.manrope(12, weight: .semibold))
+                        .foregroundStyle(Color.auroraMuted)
+                }
                 Spacer()
             }
 
-            // Progress bar
-            VStack(alignment: .leading, spacing: 6) {
-                ProgressView(value: appState.importProgress.fraction) {
-                    HStack {
-                        Text("\(appState.importProgress.completedFiles) / \(appState.importProgress.totalFiles) files")
-                        Spacer()
-                        Text("\(Int(appState.importProgress.fraction * 100))%")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(Color.textSecondary)
-                }
-                .tint(progressColor)
-            }
+            progressBlock
 
-            // Details grid
-            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
-                GridRow {
-                    Label("Current File", systemImage: "doc")
-                        .foregroundStyle(Color.textSecondary)
-                    Text(appState.importProgress.currentFileName)
-                        .font(.mono(13))
-                        .foregroundColor(.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+            grid
 
-                GridRow {
-                    Label("Speed", systemImage: "gauge.with.dots.needle.67percent")
-                        .foregroundStyle(Color.textSecondary)
-                    Text(appState.importProgress.speedFormatted)
-                        .font(.mono(13))
-                        .foregroundColor(.textPrimary)
-                }
+            Divider().background(Color.auroraStroke)
 
-                GridRow {
-                    Label("Elapsed", systemImage: "clock")
-                        .foregroundStyle(Color.textSecondary)
-                    Text(appState.importProgress.elapsedFormatted)
-                        .font(.mono(13))
-                        .foregroundColor(.textPrimary)
-                }
-
-                GridRow {
-                    Label("Transferred", systemImage: "arrow.down.circle")
-                        .foregroundStyle(Color.textSecondary)
-                    Text(bytesFormatted)
-                        .font(.mono(13))
-                        .foregroundColor(.textPrimary)
-                }
-            }
-
-            Divider()
-
-            // Controls
-            HStack {
-                Spacer()
-
-                if appState.importState == .importing {
-                    Button("Pause") { onPause() }
-                        .buttonStyle(SecondaryButtonStyle())
-                } else if appState.importState == .paused {
-                    Button("Resume") { onResume() }
-                        .buttonStyle(PrimaryButtonStyle())
-                }
-
-                Button("Cancel") { onCancel() }
-                    .buttonStyle(PrimaryButtonStyle(isDestructive: true))
-            }
+            actions
         }
         .padding(24)
-        .frame(width: 480)
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(Color.glassStrong)
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(.regularMaterial)
-                )
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .strokeBorder(Color.glassBorder, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+        .frame(width: 520)
+        .auroraStaticCard(radius: AuroraRadius.large, paddingH: 22, paddingV: 22)
+        .shadow(color: .black.opacity(0.55), radius: 30, x: 0, y: 16)
     }
+
+    private var progressBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            StorageBar(
+                fraction: appState.importProgress.fraction,
+                height: 8, radius: 4,
+                animateOnAppear: false
+            )
+            HStack {
+                Text("\(appState.importProgress.completedFiles) / \(appState.importProgress.totalFiles) files")
+                Spacer()
+                Text("\(Int(appState.importProgress.fraction * 100))%")
+            }
+            .font(.manrope(11.5, weight: .semibold))
+            .foregroundStyle(Color.auroraMuted)
+        }
+    }
+
+    private var grid: some View {
+        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+            row(icon: "doc", label: "Current file", value: appState.importProgress.currentFileName, mono: true)
+            row(icon: "gauge.with.dots.needle.67percent", label: "Speed", value: appState.importProgress.speedFormatted, mono: true)
+            row(icon: "clock", label: "Elapsed", value: appState.importProgress.elapsedFormatted, mono: true)
+            row(icon: "arrow.down.circle", label: "Transferred", value: bytesFormatted, mono: true)
+        }
+    }
+
+    private func row(icon: String, label: String, value: String, mono: Bool) -> some View {
+        GridRow {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(label)
+            }
+            .foregroundStyle(Color.auroraMuted)
+            .font(.manrope(12, weight: .semibold))
+
+            Text(value)
+                .font(mono ? .system(size: 12, weight: .semibold, design: .monospaced) : .manrope(12, weight: .semibold))
+                .foregroundStyle(Color.auroraTxt)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private var actions: some View {
+        HStack {
+            Spacer()
+            if appState.importState == .importing {
+                Button("Pause", action: onPause).buttonStyle(AuroraGhostButtonStyle())
+            } else if appState.importState == .paused {
+                Button("Resume", action: onResume).buttonStyle(AuroraGradientButtonStyle(compact: true))
+            }
+            Button("Cancel", action: onCancel).buttonStyle(AuroraGhostButtonStyle())
+        }
+    }
+
+    // MARK: - State
 
     private var stateIcon: String {
         switch appState.importState {
@@ -120,23 +108,30 @@ struct ProgressOverlayView: View {
 
     private var stateTitle: String {
         switch appState.importState {
-        case .scanning: return "Scanning..."
-        case .importing: return "Importing..."
+        case .scanning: return "Scanning…"
+        case .importing: return "Importing…"
         case .paused: return "Paused"
-        case .verifying: return "Verifying..."
-        case .done: return "Import Complete"
-        case .ejecting: return "Ejecting card..."
-        case .ejectingDone: return "Ejecting card... Done"
-        case .generatingStats: return "Generating Stats"
+        case .verifying: return "Verifying…"
+        case .done: return "Import complete"
+        case .ejecting: return "Ejecting card…"
+        case .ejectingDone: return "Ejecting card… Done"
+        case .generatingStats: return "Generating stats…"
         default: return "Importing"
         }
     }
 
-    private var progressColor: Color {
+    private var stateSubtitle: String {
         switch appState.importState {
-        case .paused: return .orange
-        case .error: return .red
-        default: return .accentGreen
+        case .importing:
+            return "Don't disconnect the card or destination until this finishes."
+        case .paused:
+            return "Tap Resume to continue, Cancel to abort."
+        case .done:
+            return "Stats will refresh in a moment."
+        default:
+            return appState.importProgress.currentFileName.isEmpty
+                ? "Working…"
+                : appState.importProgress.currentFileName
         }
     }
 

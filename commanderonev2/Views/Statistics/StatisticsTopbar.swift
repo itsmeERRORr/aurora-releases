@@ -1,0 +1,21 @@
+import SwiftUI
+
+struct StatisticsTopbar: View {
+    @Binding var mode: StatsMode
+
+    var body: some View {
+        HStack(spacing: 14) {
+            IconChip(systemName: "chart.bar.fill", color: .auroraViolet, size: 36, iconScale: 0.5)
+            Text("Import Statistics")
+                .font(.auroraTopbarH2)
+                .tracking(-0.4)
+                .foregroundStyle(Color.auroraTxt)
+            Spacer()
+            SegmentedToggle(
+                options: [(.lastImport, "Last Import"), (.total, "Total")],
+                selection: $mode
+            )
+        }
+        .padding(.bottom, 20)
+    }
+}
