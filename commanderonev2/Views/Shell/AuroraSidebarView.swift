@@ -128,28 +128,13 @@ struct AuroraSidebarView: View {
     private func eventRow(idx: Int, event: (path: String, name: String, bookmarkIndex: Int)) -> some View {
         let isFinalized = appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) != nil
 
-        HStack(spacing: 6) {
-            AuroraNavRow(
-                label: event.name,
-                systemIcon: isFinalized ? "lock" : "folder",
-                isActive: selectedItem == .event(index: idx),
-                compact: true
-            ) {
-                selectedItem = .event(index: idx)
-            }
-
-            if isFinalized {
-                Text("Finalizado")
-                    .font(.manrope(8.5, weight: .bold))
-                    .tracking(0.6)
-                    .foregroundStyle(Color.auroraFaint)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule().fill(Color.auroraPanel2)
-                    )
-                    .padding(.trailing, 4)
-            }
+        AuroraNavRow(
+            label: event.name,
+            systemIcon: isFinalized ? "lock" : "folder",
+            isActive: selectedItem == .event(index: idx),
+            compact: true
+        ) {
+            selectedItem = .event(index: idx)
         }
         .contextMenu {
             if isFinalized {
