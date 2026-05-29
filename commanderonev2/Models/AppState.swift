@@ -586,6 +586,87 @@ final class AppState {
         eventFolderDisplayNames[index] = name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Finalize / Reopen
+
+    /// Returns the finalized snapshot for the given bookmark index, if any.
+    func finalizedEvent(forBookmarkIndex index: Int) -> FinalizedEvent? {
+        guard index >= 0, index < eventFolderFinalizedEventID.count else { return nil }
+        guard let id = eventFolderFinalizedEventID[index] else { return nil }
+        return finalizedEvents.first { $0.id == id }
+    }
+
+    /// Returns the finalized snapshot whose `lastKnownPath` matches (or contains) `path`.
+    /// Used to guard imports against finalized event folders.
+    func finalizedEvent(matchingPath path: String) -> FinalizedEvent? {
+        let norm = path.hasSuffix("/") ? String(path.dropLast()) : path
+        return finalizedEvents.first { event in
+            let p = event.lastKnownPath.hasSuffix("/")
+                ? String(event.lastKnownPath.dropLast())
+                : event.lastKnownPath
+            guard !p.isEmpty else { return false }
+            return norm == p || norm.hasPrefix(p + "/")
+        }
+    }
+
+    /// Builds a snapshot for the event at the given bookmark index using:
+    /// - the cached `StatsReport` from `EventStatsCache` for the folder path
+    /// - `importHistory` entries that match the folder path (for bytes and dates)
+    /// - `eventFolderPeakRawCounts` and `eventFolderCachedCounts` for the count floor
+    ///
+    /// If no `StatsReport` cache is available, returns `nil` (caller should trigger a scan first).
+    @discardableResult
+    func finalizeEvent(at index: Int) -> FinalizedEvent? {
+        guard index >= 0, index < eventFolderBookmarks.count else { return nil }
+        if let existing = finalizedEvent(forBookmarkIndex: index) { return existing }
+
+        let path = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        guard !path.isEmpty else { return nil }
+
+        guard let cached = EventStatsCache.load(forPath: path) else { return nil }
+        let snapshot = cached.report
+
+        let history = importStats(forEventPath: path)
+        let peak = index < eventFolderPeakRawCounts.count ? eventFolderPeakRawCounts[index] : 0
+        let cachedCount = index < eventFolderCachedCounts.count ? eventFolderCachedCounts[index] : -1
+        let photoCount = max(snapshot.totalFilesAnalyzed, max(peak, max(cachedCount, 0)))
+
+        let customName = index < eventFolderDisplayNames.count ? eventFolderDisplayNames[index] : ""
+        let folderName = URL(fileURLWithPath: path).lastPathComponent
+        let name = customName.isEmpty ? folderName : customName
+
+        let bookmark = eventFolderBookmarks[index]
+
+        let event = FinalizedEvent(
+            name: name,
+            snapshot: snapshot,
+            totalBytes: history?.totalBytes ?? snapshot.totalBytes,
+            photoCount: photoCount,
+            firstImportDate: history?.firstDate ?? snapshot.firstImportDate,
+            lastImportDate: history?.lastDate,
+            lastKnownPath: path,
+            originalBookmark: bookmark
+        )
+
+        finalizedEvents.append(event)
+        eventFolderFinalizedEventID[index] = event.id
+        log("Finalized event '\(name)' with \(photoCount) photos")
+        return event
+    }
+
+    /// Removes the snapshot link for the given bookmark index and deletes the snapshot from the store.
+    func reopenEvent(at index: Int) {
+        guard index >= 0, index < eventFolderFinalizedEventID.count else { return }
+        guard let id = eventFolderFinalizedEventID[index] else { return }
+        finalizedEvents.removeAll { $0.id == id }
+        eventFolderFinalizedEventID[index] = nil
+        log("Reopened event at index \(index)")
+    }
+
+    /// Permanently deletes a snapshot from the store (used when a finalized event no longer has a bookmark in the sidebar).
+    func deleteFinalizedEvent(id: UUID) {
+        finalizedEvents.removeAll { $0.id == id }
+    }
+
     // MARK: - Source File Ordering
     func updateSourceFiles(_ files: [URL]) {
         sortedSourceFiles = files
