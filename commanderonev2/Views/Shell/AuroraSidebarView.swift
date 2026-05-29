@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct AuroraSidebarView: View {
     @Binding var selectedItem: NavigationItem
@@ -114,20 +115,80 @@ struct AuroraSidebarView: View {
             ScrollView {
                 VStack(spacing: 2) {
                     ForEach(Array(events.enumerated()), id: \.offset) { idx, event in
-                        AuroraNavRow(
-                            label: event.name,
-                            systemIcon: "folder",
-                            isActive: selectedItem == .event(index: idx),
-                            compact: true
-                        ) {
-                            selectedItem = .event(index: idx)
-                        }
+                        eventRow(idx: idx, event: event)
                     }
                 }
                 .padding(.horizontal, 10)
             }
             .scrollIndicators(.hidden)
         }
+    }
+
+    @ViewBuilder
+    private func eventRow(idx: Int, event: (path: String, name: String, bookmarkIndex: Int)) -> some View {
+        let isFinalized = appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) != nil
+
+        HStack(spacing: 6) {
+            AuroraNavRow(
+                label: event.name,
+                systemIcon: isFinalized ? "lock" : "folder",
+                isActive: selectedItem == .event(index: idx),
+                compact: true
+            ) {
+                selectedItem = .event(index: idx)
+            }
+
+            if isFinalized {
+                Text("Finalizado")
+                    .font(.manrope(8.5, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(Color.auroraFaint)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule().fill(Color.auroraPanel2)
+                    )
+                    .padding(.trailing, 4)
+            }
+        }
+        .contextMenu {
+            if isFinalized {
+                Button("Reopen Event…") {
+                    confirmReopen(bookmarkIndex: event.bookmarkIndex, name: event.name)
+                }
+            } else {
+                Button("Finalize Event…") {
+                    confirmFinalize(bookmarkIndex: event.bookmarkIndex, name: event.name)
+                }
+            }
+        }
+    }
+
+    private func confirmFinalize(bookmarkIndex: Int, name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Finalize \(name)?"
+        alert.informativeText = "Current totals will be saved permanently. New imports won't update them. You can reopen later."
+        alert.addButton(withTitle: "Finalize")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if appState.finalizeEvent(at: bookmarkIndex) == nil {
+            let warn = NSAlert()
+            warn.messageText = "No fresh data for this folder"
+            warn.informativeText = "Run a scan from the event detail view before finalizing."
+            warn.addButton(withTitle: "OK")
+            warn.runModal()
+        }
+    }
+
+    private func confirmReopen(bookmarkIndex: Int, name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Reopen \(name)?"
+        alert.informativeText = "The snapshot will be deleted and the event will return to live counts. New imports will start counting again."
+        alert.addButton(withTitle: "Reopen")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        appState.reopenEvent(at: bookmarkIndex)
     }
 
     // MARK: - Storage widget
