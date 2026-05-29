@@ -460,7 +460,32 @@ final class AppState {
         syncPeakCounts()
         syncCachedCounts()
         syncFinalizedEventIDs()
+        refreshEventFolderCachedPaths()
         reconcileOrphanFinalizedEvents()
+    }
+
+    /// Resolves every event-folder bookmark and writes the resulting filesystem path
+    /// into `eventFolderCachedPaths`. Bookmarks that fail to resolve keep whatever
+    /// last-known path they had (so finalized events whose volume is offline still
+    /// remember where they used to live).
+    ///
+    /// Without this, newly-added bookmarks never get their cached path written
+    /// (the old code path that did this was removed at some point) — which leaves
+    /// `EventStatsView` thinking the folder is unreachable even when it isn't.
+    private func refreshEventFolderCachedPaths() {
+        var didChange = false
+        for index in eventFolderBookmarks.indices {
+            guard index < eventFolderCachedPaths.count else { continue }
+            let data = eventFolderBookmarks[index]
+            guard let url = BookmarkManager.resolveBookmark(data) else { continue }
+            // Only overwrite when resolution succeeds — preserves last-known path on offline.
+            if eventFolderCachedPaths[index] != url.path {
+                eventFolderCachedPaths[index] = url.path
+                didChange = true
+            }
+        }
+        // Subscript mutation on @Observable can swallow didSet; persist explicitly.
+        if didChange { saveCachedPaths() }
     }
 
     /// Recovery pass: re-link finalized snapshots to their sidebar bookmark when the
@@ -610,7 +635,10 @@ final class AppState {
 
     func addEventFolder(bookmark: Data) {
         eventFolderBookmarks.append(bookmark)
-        // syncDisplayNamesCount() in didSet will append "" for the new folder
+        // syncDisplayNamesCount() in didSet will append "" for the new folder.
+        // Resolve immediately so the cached path is populated for this session
+        // (otherwise EventStatsView thinks the folder is unreachable).
+        refreshEventFolderCachedPaths()
     }
 
     func removeEventFolder(at index: Int) {
