@@ -126,20 +126,13 @@ struct TopEventRow: View {
                         .font(.auroraEventName)
                         .foregroundStyle(Color.auroraTxt)
                         .lineLimit(1)
-                    HStack(spacing: 6) {
-                        Text(AuroraFormat.count(event.totalFiles))
-                        Text("·").foregroundStyle(Color.auroraFaint)
-                        let parts = AuroraFormat.bytesParts(event.totalBytes)
-                        Text("\(parts.value) \(parts.unit)")
-                    }
-                    .font(.manrope(11, weight: .semibold))
-                    .foregroundStyle(Color.auroraFaint)
+                    let parts = AuroraFormat.bytesParts(event.totalBytes)
+                    Text("\(parts.value) \(parts.unit)")
+                        .font(.manrope(11, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
                 }
                 Spacer(minLength: 4)
-                if event.averageSpeed > 0 {
-                    let s = AuroraFormat.speedParts(event.averageSpeed)
-                    SpeedPill(text: "\(s.value) \(s.unit)", tint: .auroraCyan)
-                }
+                SpeedPill(text: AuroraFormat.count(event.totalFiles), tint: .auroraCyan)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
