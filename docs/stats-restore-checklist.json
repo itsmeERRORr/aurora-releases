@@ -1,0 +1,340 @@
+{
+  "exportedAt": "2026-05-30",
+  "source": {
+    "file": "~/Library/Application Support/commanderonev2/totalStats.json",
+    "firstImportDate": "2026-04-04T11:07:53.625Z",
+    "activeDaysForDailyAverages": 57,
+    "importCountSource": "totalStats.importCount"
+  },
+  "stats": [
+    {
+      "id": "data_transferred_total",
+      "label": "Data Transferred",
+      "category": "transfer",
+      "aggregation": "total",
+      "unit": "bytes",
+      "value": 5978369445888,
+      "displayValue": "5.44 TB"
+    },
+    {
+      "id": "data_transferred_avg_import",
+      "label": "Data Transferred",
+      "category": "transfer",
+      "aggregation": "average_per_import",
+      "unit": "bytes",
+      "value": 14200402484.294537,
+      "displayValue": "13.2 GB"
+    },
+    {
+      "id": "data_transferred_avg_day",
+      "label": "Data Transferred",
+      "category": "transfer",
+      "aggregation": "average_per_day",
+      "unit": "bytes",
+      "value": 104883674489.26315,
+      "displayValue": "97.7 GB"
+    },
+    {
+      "id": "avg_speed",
+      "label": "Avg Speed",
+      "category": "transfer",
+      "aggregation": "average",
+      "unit": "bytes_per_second",
+      "value": 929906586.69902,
+      "displayValue": "887 MB/s"
+    },
+    {
+      "id": "time_wasted_import_total",
+      "label": "Time Wasted Import",
+      "category": "time",
+      "aggregation": "total",
+      "unit": "seconds",
+      "value": 6429,
+      "displayValue": "1h 47m 9s"
+    },
+    {
+      "id": "time_wasted_import_avg_import",
+      "label": "Time Wasted Import",
+      "category": "time",
+      "aggregation": "average_per_import",
+      "unit": "seconds",
+      "value": 15.270783847980997,
+      "displayValue": "15s"
+    },
+    {
+      "id": "total_imports",
+      "label": "Total Imports",
+      "category": "imports",
+      "aggregation": "total",
+      "unit": "count",
+      "value": 421,
+      "displayValue": "421"
+    },
+    {
+      "id": "total_imports_avg_day",
+      "label": "Total Imports",
+      "category": "imports",
+      "aggregation": "average_per_day",
+      "unit": "count",
+      "value": 7.385964912280702,
+      "displayValue": "7.39"
+    },
+    {
+      "id": "photos_added_total",
+      "label": "Photos Added",
+      "category": "photos",
+      "aggregation": "total",
+      "unit": "count",
+      "value": 151495,
+      "displayValue": "151 495"
+    },
+    {
+      "id": "photos_added_avg_import",
+      "label": "Photos Added",
+      "category": "photos",
+      "aggregation": "average_per_import",
+      "unit": "count",
+      "value": 359.8456057007126,
+      "displayValue": "360"
+    },
+    {
+      "id": "photos_added_avg_day",
+      "label": "Photos Added",
+      "category": "photos",
+      "aggregation": "average_per_day",
+      "unit": "count",
+      "value": 2657.8070175438597,
+      "displayValue": "2 658"
+    },
+    {
+      "id": "iso_avg",
+      "label": "Avg ISO",
+      "category": "exif_iso",
+      "aggregation": "average",
+      "unit": "iso",
+      "value": 959.4720947886069,
+      "displayValue": "959"
+    },
+    {
+      "id": "iso_highest",
+      "label": "Highest ISO",
+      "category": "exif_iso",
+      "aggregation": "max",
+      "unit": "iso",
+      "value": 25600,
+      "displayValue": "25600"
+    },
+    {
+      "id": "iso_lowest",
+      "label": "Lowest ISO",
+      "category": "exif_iso",
+      "aggregation": "min",
+      "unit": "iso",
+      "value": 50,
+      "displayValue": "50"
+    },
+    {
+      "id": "aperture_avg",
+      "label": "Avg Aperture",
+      "category": "exif_aperture",
+      "aggregation": "average",
+      "unit": "f_stop",
+      "value": 1.5866074787946844,
+      "displayValue": "f/1.6"
+    },
+    {
+      "id": "aperture_highest",
+      "label": "Highest Aperture",
+      "category": "exif_aperture",
+      "aggregation": "max",
+      "unit": "f_stop",
+      "value": 16,
+      "displayValue": "f/16.0"
+    },
+    {
+      "id": "aperture_lowest",
+      "label": "Lowest Aperture",
+      "category": "exif_aperture",
+      "aggregation": "min",
+      "unit": "f_stop",
+      "value": 1.2,
+      "displayValue": "f/1.2"
+    },
+    {
+      "id": "focal_avg",
+      "label": "Avg Focal",
+      "category": "exif_focal_length",
+      "aggregation": "average",
+      "unit": "mm",
+      "value": 67.93991880920163,
+      "displayValue": "68mm"
+    },
+    {
+      "id": "focal_highest",
+      "label": "Highest Focal",
+      "category": "exif_focal_length",
+      "aggregation": "max",
+      "unit": "mm",
+      "value": 200,
+      "displayValue": "200mm"
+    },
+    {
+      "id": "focal_lowest",
+      "label": "Lowest Focal",
+      "category": "exif_focal_length",
+      "aggregation": "min",
+      "unit": "mm",
+      "value": 9,
+      "displayValue": "9mm"
+    },
+    {
+      "id": "shutter_avg",
+      "label": "Avg Shutter",
+      "category": "exif_shutter_speed",
+      "aggregation": "average",
+      "unit": "seconds",
+      "value": 0.003225914386613419,
+      "displayValue": "1/310s"
+    },
+    {
+      "id": "shutter_highest",
+      "label": "Highest Shutter",
+      "category": "exif_shutter_speed",
+      "aggregation": "max",
+      "unit": "seconds",
+      "value": 1,
+      "displayValue": "1.0s"
+    },
+    {
+      "id": "shutter_lowest",
+      "label": "Lowest Shutter",
+      "category": "exif_shutter_speed",
+      "aggregation": "min",
+      "unit": "seconds",
+      "value": 0.00015625,
+      "displayValue": "1/6400s"
+    },
+    {
+      "id": "top_cameras",
+      "label": "Top Cameras",
+      "category": "ranking",
+      "aggregation": "top_n",
+      "unit": "count",
+      "value": [
+        {
+          "rank": 1,
+          "make": "SONY",
+          "model": "ILCE-9M3",
+          "name": "SONY ILCE-9M3",
+          "count": 81096
+        },
+        {
+          "rank": 2,
+          "make": "SONY",
+          "model": "ILCE-1M2",
+          "name": "SONY ILCE-1M2",
+          "count": 68848
+        },
+        {
+          "rank": 3,
+          "make": "SONY",
+          "model": "ILCE-7M4",
+          "name": "SONY ILCE-7M4",
+          "count": 1551
+        }
+      ]
+    },
+    {
+      "id": "top_lenses",
+      "label": "Top Lenses",
+      "category": "ranking",
+      "aggregation": "top_n",
+      "unit": "count",
+      "value": [
+        {
+          "rank": 1,
+          "make": "SONY",
+          "model": "FE 50mm F1.2 GM",
+          "name": "SONY FE 50mm F1.2 GM",
+          "count": 61668
+        },
+        {
+          "rank": 2,
+          "make": "SONY",
+          "model": "FE 85mm F1.4 GM II",
+          "name": "SONY FE 85mm F1.4 GM II",
+          "count": 61270
+        },
+        {
+          "rank": 3,
+          "make": "SONY",
+          "model": "FE 70-200mm F2.8 GM OSS II",
+          "name": "SONY FE 70-200mm F2.8 GM OSS II",
+          "count": 12004
+        },
+        {
+          "rank": 4,
+          "make": "SONY",
+          "model": "FE 16-35mm F2.8 GM II",
+          "name": "SONY FE 16-35mm F2.8 GM II",
+          "count": 8197
+        },
+        {
+          "rank": 5,
+          "make": "SONY",
+          "model": "15mm F1.4 DG DN DIAGONAL FISHEYE | Art 024",
+          "name": "SONY 15mm F1.4 DG DN DIAGONAL FISHEYE | Art 024",
+          "count": 5483
+        },
+        {
+          "rank": 6,
+          "make": "SONY",
+          "model": "LAOWA FFII 10mm F2.8 C&D Dreamer",
+          "name": "SONY LAOWA FFII 10mm F2.8 C&D Dreamer",
+          "count": 2682
+        },
+        {
+          "rank": 7,
+          "make": "SONY",
+          "model": "DT 8-15mm F4 SAM",
+          "name": "SONY DT 8-15mm F4 SAM",
+          "count": 32
+        }
+      ]
+    },
+    {
+      "id": "most_photos_per_month",
+      "label": "Most Photos per Month",
+      "category": "chart",
+      "aggregation": "monthly_count",
+      "unit": "count",
+      "value": [
+        {
+          "rank": 1,
+          "month": "Feb 2026",
+          "count": 57810
+        },
+        {
+          "rank": 2,
+          "month": "May 2026",
+          "count": 39340
+        },
+        {
+          "rank": 3,
+          "month": "Apr 2026",
+          "count": 30436
+        },
+        {
+          "rank": 4,
+          "month": "Mar 2026",
+          "count": 20277
+        },
+        {
+          "rank": 5,
+          "month": "Jan 2026",
+          "count": 3632
+        }
+      ]
+    }
+  ]
+}
