@@ -138,18 +138,8 @@ final class AppState {
             let name = customName.isEmpty ? folderName : customName
 
             var lastDate: Date = .distantPast
-            if !folderPath.isEmpty {
-                let norm = folderPath.hasSuffix("/") ? String(folderPath.dropLast()) : folderPath
-                if let latest = importHistory
-                    .filter({ e in
-                        let d = e.destinationPath.hasSuffix("/")
-                            ? String(e.destinationPath.dropLast())
-                            : e.destinationPath
-                        return d == norm || d.hasPrefix(norm + "/")
-                    })
-                    .map(\.date).max() {
-                    lastDate = latest
-                }
+            if let latest = importStatsForEventFolder(at: index)?.lastDate {
+                lastDate = latest
             }
 
             // Resolve finalized link + use the snapshot date as fallback so finalized
@@ -380,6 +370,17 @@ final class AppState {
     var eventFolderCachedPaths: [String] = [] {
         didSet { saveCachedPaths() }
     }
+    /// Previous cached paths, kept when a folder is relinked to a new location. Used so
+    /// `finalizeEvent` can still find the original import-history entries (which recorded the
+    /// old path) even after the folder moves to a different volume.
+    var eventFolderPreviousCachedPaths: [String] = [] {
+        didSet { savePreviousCachedPaths() }
+    }
+    /// Cached banner image paths per event folder. These point to copies stored in
+    /// Application Support, so the banner survives if the original photo moves.
+    var eventFolderBannerImagePaths: [String] = [] {
+        didSet { saveBannerImagePaths() }
+    }
 
     // MARK: - Configuration
     /// RAW extensions: Sony ARW, Canon CR2/CR3, Adobe/Leica/Ricoh DNG
@@ -441,6 +442,14 @@ final class AppState {
         if let data = UserDefaults.standard.data(forKey: "eventFolderCachedPathsData"),
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
             eventFolderCachedPaths = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderPreviousCachedPathsData"),
+           let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
+            eventFolderPreviousCachedPaths = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderBannerImagePathsData"),
+           let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
+            eventFolderBannerImagePaths = decoded
         }
         // Load event folder bookmarks (o didSet chama syncDisplayNamesCount e syncPeakCounts)
         if let data = UserDefaults.standard.data(forKey: "eventFolderBookmarksData"),
@@ -548,6 +557,16 @@ final class AppState {
         } else if eventFolderCachedPaths.count < n {
             eventFolderCachedPaths += Array(repeating: "", count: n - eventFolderCachedPaths.count)
         }
+        if eventFolderPreviousCachedPaths.count > n {
+            eventFolderPreviousCachedPaths = Array(eventFolderPreviousCachedPaths.prefix(n))
+        } else if eventFolderPreviousCachedPaths.count < n {
+            eventFolderPreviousCachedPaths += Array(repeating: "", count: n - eventFolderPreviousCachedPaths.count)
+        }
+        if eventFolderBannerImagePaths.count > n {
+            eventFolderBannerImagePaths = Array(eventFolderBannerImagePaths.prefix(n))
+        } else if eventFolderBannerImagePaths.count < n {
+            eventFolderBannerImagePaths += Array(repeating: "", count: n - eventFolderBannerImagePaths.count)
+        }
     }
 
     private func syncFinalizedEventIDs() {
@@ -563,6 +582,16 @@ final class AppState {
         let strings: [String] = eventFolderFinalizedEventID.map { $0?.uuidString ?? "" }
         guard let data = try? PropertyListEncoder().encode(strings) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderFinalizedEventIDData")
+    }
+
+    private func savePreviousCachedPaths() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderPreviousCachedPaths) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderPreviousCachedPathsData")
+    }
+
+    private func saveBannerImagePaths() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderBannerImagePaths) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderBannerImagePathsData")
     }
 
     private func saveEventFolderBookmarks() {
@@ -590,6 +619,16 @@ final class AppState {
         UserDefaults.standard.set(data, forKey: "eventFolderCachedPathsData")
     }
 
+    private func normalizePath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
+
+    private var eventBannerCacheDirectory: URL {
+        let appSupport = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("commanderonev2/event_banners", isDirectory: true)
+    }
+
     /// Atualiza o cache de count e path para um folder (chamado quando o disco está online).
     func updateEventFolderCache(at index: Int, count: Int, path: String) {
         guard index >= 0, index < eventFolderCachedCounts.count else { return }
@@ -601,15 +640,21 @@ final class AppState {
 
     /// Returns aggregated import stats for a specific event folder path.
     /// Matches all ImportHistoryEntry records where destinationPath equals or is inside the event folder.
-    func importStats(forEventPath eventPath: String) -> (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
-        guard !eventPath.isEmpty else { return nil }
-        // Normalise trailing slashes so "/path/to/folder" and "/path/to/folder/" both match
-        let norm = eventPath.hasSuffix("/") ? String(eventPath.dropLast()) : eventPath
+    func importStats(
+        forEventPath eventPath: String,
+        alternatePaths: [String] = []
+    ) -> (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
+        let candidatePaths = ([eventPath] + alternatePaths)
+            .map(normalizePath)
+            .filter { !$0.isEmpty }
+        let uniquePaths = Array(Set(candidatePaths))
+        guard !uniquePaths.isEmpty else { return nil }
+
         let matching = importHistory.filter { entry in
-            let d = entry.destinationPath.hasSuffix("/")
-                ? String(entry.destinationPath.dropLast())
-                : entry.destinationPath
-            return d == norm || d.hasPrefix(norm + "/")
+            let destination = normalizePath(entry.destinationPath)
+            return uniquePaths.contains { path in
+                destination == path || destination.hasPrefix(path + "/")
+            }
         }
         guard !matching.isEmpty else { return nil }
         let photoCount = matching.reduce(0) { $0 + $1.fileCount }
@@ -622,6 +667,13 @@ final class AppState {
             firstDate: dates.min(),
             lastDate: dates.max()
         )
+    }
+
+    func importStatsForEventFolder(at index: Int) -> (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
+        guard index >= 0, index < eventFolderBookmarks.count else { return nil }
+        let currentPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        let previousPath = index < eventFolderPreviousCachedPaths.count ? eventFolderPreviousCachedPaths[index] : ""
+        return importStats(forEventPath: currentPath, alternatePaths: [previousPath])
     }
 
     /// Atualiza o pico de RAWs da pasta se o novo valor for maior (para não baixar ao apagar ficheiros).
@@ -648,6 +700,12 @@ final class AppState {
         // the right length (no-op). This also fixes multi-folder removal correctness.
         if index < eventFolderCachedCounts.count { eventFolderCachedCounts.remove(at: index) }
         if index < eventFolderCachedPaths.count  { eventFolderCachedPaths.remove(at: index)  }
+        if index < eventFolderPreviousCachedPaths.count { eventFolderPreviousCachedPaths.remove(at: index) }
+        if index < eventFolderBannerImagePaths.count {
+            let bannerPath = eventFolderBannerImagePaths[index]
+            if !bannerPath.isEmpty { try? FileManager.default.removeItem(atPath: bannerPath) }
+            eventFolderBannerImagePaths.remove(at: index)
+        }
         if index < eventFolderDisplayNames.count { eventFolderDisplayNames.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
         if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
@@ -656,6 +714,80 @@ final class AppState {
         eventFolderScanningIndices = Set(eventFolderScanningIndices.map { $0 > index ? $0 - 1 : $0 })
         // Triggers didSet → syncDisplayNamesCount / syncPeakCounts / syncCachedCounts (all no-ops now)
         eventFolderBookmarks.remove(at: index)
+    }
+
+    @discardableResult
+    func relinkEventFolder(at index: Int, to url: URL, bookmark: Data) -> Bool {
+        guard index >= 0, index < eventFolderBookmarks.count else { return false }
+
+        syncCachedCounts()
+        syncFinalizedEventIDs()
+
+        let newPath = url.path
+        let oldPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        let oldNorm = normalizePath(oldPath)
+        let newNorm = normalizePath(newPath)
+
+        if !oldNorm.isEmpty, oldNorm != newNorm, index < eventFolderPreviousCachedPaths.count {
+            let existingPrevious = normalizePath(eventFolderPreviousCachedPaths[index])
+            if existingPrevious.isEmpty {
+                eventFolderPreviousCachedPaths[index] = oldPath
+            }
+        }
+
+        eventFolderBookmarks[index] = bookmark
+        eventFolderCachedPaths[index] = newPath
+
+        if index < eventFolderFinalizedEventID.count,
+           let id = eventFolderFinalizedEventID[index],
+           let finalizedIndex = finalizedEvents.firstIndex(where: { $0.id == id }) {
+            finalizedEvents[finalizedIndex].lastKnownPath = newPath
+            finalizedEvents[finalizedIndex].originalBookmark = bookmark
+            FinalizedEventsStore.saveAll(finalizedEvents)
+        }
+
+        saveEventFolderBookmarks()
+        saveCachedPaths()
+        savePreviousCachedPaths()
+        log("Relinked event folder to \(newPath)")
+        return true
+    }
+
+    @discardableResult
+    func setEventFolderBanner(at index: Int, sourceURL: URL) -> Bool {
+        guard index >= 0, index < eventFolderBookmarks.count else { return false }
+        syncCachedCounts()
+
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: eventBannerCacheDirectory, withIntermediateDirectories: true)
+            let ext = sourceURL.pathExtension.isEmpty ? "image" : sourceURL.pathExtension.lowercased()
+            let cachedURL = eventBannerCacheDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
+            try fm.copyItem(at: sourceURL, to: cachedURL)
+
+            if index < eventFolderBannerImagePaths.count {
+                var paths = eventFolderBannerImagePaths
+                let oldPath = paths[index]
+                if !oldPath.isEmpty { try? fm.removeItem(atPath: oldPath) }
+                paths[index] = cachedURL.path
+                eventFolderBannerImagePaths = paths
+            }
+            log("Updated event banner image")
+            return true
+        } catch {
+            log("Failed to cache event banner image: \(error.localizedDescription)", level: .error)
+            return false
+        }
+    }
+
+    func clearEventFolderBanner(at index: Int) {
+        guard index >= 0, index < eventFolderBannerImagePaths.count else { return }
+        var paths = eventFolderBannerImagePaths
+        let path = paths[index]
+        if !path.isEmpty { try? FileManager.default.removeItem(atPath: path) }
+        paths[index] = ""
+        eventFolderBannerImagePaths = paths
+        log("Cleared event banner image")
     }
 
     func setEventFolderDisplayName(at index: Int, name: String) {
@@ -699,13 +831,17 @@ final class AppState {
         let path = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
         guard !path.isEmpty else { return nil }
 
-        guard let cached = EventStatsCache.load(forPath: path) else { return nil }
+        let previousPath = index < eventFolderPreviousCachedPaths.count ? eventFolderPreviousCachedPaths[index] : ""
+        let cached = EventStatsCache.load(forPath: path)
+            ?? (!previousPath.isEmpty ? EventStatsCache.load(forPath: previousPath) : nil)
+        guard let cached else { return nil }
         let snapshot = cached.report
 
-        let history = importStats(forEventPath: path)
+        let history = importStats(forEventPath: path, alternatePaths: [previousPath])
         let peak = index < eventFolderPeakRawCounts.count ? eventFolderPeakRawCounts[index] : 0
         let cachedCount = index < eventFolderCachedCounts.count ? eventFolderCachedCounts[index] : -1
-        let photoCount = max(snapshot.totalFilesAnalyzed, max(peak, max(cachedCount, 0)))
+        let historyCount = history?.photoCount ?? 0
+        let photoCount = max(historyCount, max(snapshot.totalFilesAnalyzed, max(peak, max(cachedCount, 0))))
 
         let customName = index < eventFolderDisplayNames.count ? eventFolderDisplayNames[index] : ""
         let folderName = URL(fileURLWithPath: path).lastPathComponent

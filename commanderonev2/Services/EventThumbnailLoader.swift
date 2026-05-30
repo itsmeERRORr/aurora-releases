@@ -60,15 +60,17 @@ final class EventThumbnailLoader: ObservableObject {
                 representationTypes: .thumbnail
             )
 
-            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, _ in
-                Task { @MainActor in
+            do {
+                let rep = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+                await MainActor.run {
                     self.inFlight.remove(path)
-                    if let nsImage = rep?.nsImage {
-                        self.cache[path] = nsImage
-                        self.version &+= 1
-                    } else {
-                        self.negative.insert(path)
-                    }
+                    self.cache[path] = rep.nsImage
+                    self.version &+= 1
+                }
+            } catch {
+                await MainActor.run {
+                    self.inFlight.remove(path)
+                    self.negative.insert(path)
                 }
             }
         }

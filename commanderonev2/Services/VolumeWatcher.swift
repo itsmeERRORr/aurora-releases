@@ -22,9 +22,10 @@ final class VolumeWatcher {
             object: nil,
             queue: .main
         ) { [weak self] notif in
-            guard let self else { return }
             guard let path = notif.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
-            self.handleMountInternal(path: path)
+            Task { @MainActor [weak self] in
+                self?.handleMountInternal(path: path)
+            }
         }
 
         center.addObserver(
@@ -32,9 +33,10 @@ final class VolumeWatcher {
             object: nil,
             queue: .main
         ) { [weak self] notif in
-            guard let self else { return }
             guard let path = notif.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
-            self.handleUnmountInternal(path: path)
+            Task { @MainActor [weak self] in
+                self?.handleUnmountInternal(path: path)
+            }
         }
 
         scanExistingVolumes()
