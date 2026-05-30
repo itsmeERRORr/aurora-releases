@@ -145,7 +145,7 @@ struct StorageView: View {
             } else {
                 VStack(spacing: 4) {
                     ForEach(Array(dests.enumerated()), id: \.offset) { _, dest in
-                        eventRow(name: dest.name, path: dest.path)
+                        eventRow(name: dest.name, path: dest.path, bookmarkIndex: dest.bookmarkIndex)
                     }
                 }
             }
@@ -153,8 +153,8 @@ struct StorageView: View {
         .auroraStaticCard()
     }
 
-    private func eventRow(name: String, path: String) -> some View {
-        let agg = appState.importStats(forEventPath: path)
+    private func eventRow(name: String, path: String, bookmarkIndex: Int) -> some View {
+        let agg = appState.importStatsForEventFolder(at: bookmarkIndex)
         return HStack(spacing: 12) {
             IconChip(systemName: "folder.fill", color: .auroraViolet)
             VStack(alignment: .leading, spacing: 2) {

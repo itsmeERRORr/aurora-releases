@@ -2,10 +2,11 @@ import SwiftUI
 
 struct PhotosPerEventChart: View {
     @Bindable var appState: AppState
+    var onViewAll: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Most Photos per Event", actionLabel: "View all →")
+            AuroraPanelHeader(title: "Most Photos per Event", actionLabel: "View all →", action: onViewAll)
 
             let top = topEvents()
             if top.count < 3 {

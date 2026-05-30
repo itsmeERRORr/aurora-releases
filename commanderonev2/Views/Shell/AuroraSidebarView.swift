@@ -9,7 +9,7 @@ struct AuroraSidebarView: View {
         VStack(alignment: .leading, spacing: 0) {
             brand
                 .padding(.horizontal, 18)
-                .padding(.top, 22)
+                .padding(.top, 34)
                 .padding(.bottom, 18)
 
             sectionLabel("Main Menu")
@@ -137,6 +137,10 @@ struct AuroraSidebarView: View {
             selectedItem = .event(index: idx)
         }
         .contextMenu {
+            Button("Relink Event Folder…") {
+                relinkEvent(bookmarkIndex: event.bookmarkIndex, name: event.name)
+            }
+
             if isFinalized {
                 Button("Reopen Event…") {
                     confirmReopen(bookmarkIndex: event.bookmarkIndex, name: event.name)
@@ -146,6 +150,26 @@ struct AuroraSidebarView: View {
                     confirmFinalize(bookmarkIndex: event.bookmarkIndex, name: event.name)
                 }
             }
+        }
+    }
+
+    private func relinkEvent(bookmarkIndex: Int, name: String) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select the new location for \(name)"
+        panel.prompt = "Relink Folder"
+
+        guard panel.runModal() == .OK, let url = panel.url,
+              let bookmark = BookmarkManager.saveBookmark(for: url) else { return }
+
+        if !appState.relinkEventFolder(at: bookmarkIndex, to: url, bookmark: bookmark) {
+            let warn = NSAlert()
+            warn.messageText = "Could not relink event"
+            warn.informativeText = "The selected event is no longer available. Try adding it again."
+            warn.addButton(withTitle: "OK")
+            warn.runModal()
         }
     }
 

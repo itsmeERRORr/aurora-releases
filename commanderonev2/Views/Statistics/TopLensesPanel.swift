@@ -1,13 +1,49 @@
 import SwiftUI
 
+enum LensDisplayFormatter {
+    static func displayName(make: String, model: String) -> String {
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = model.uppercased()
+
+        if upper.contains("15MM F1.4"), upper.contains("FISHEYE") {
+            return "15mm F1.4 FISHEYE"
+        }
+        if upper.contains("10MM F2.8") {
+            return "10mm F2.8"
+        }
+
+        return model
+            .replacingOccurrences(of: "Sony ", with: "")
+            .replacingOccurrences(of: "SONY ", with: "")
+            .replacingOccurrences(of: "FE ", with: "")
+            .replacingOccurrences(of: "DT ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func brandName(make: String, model: String) -> String {
+        let upperModel = model.uppercased()
+        let upperMake = make.uppercased()
+
+        if upperModel.contains("LAOWA") { return "LAOWA" }
+        if upperModel.contains("SIGMA") || upperModel.contains("DG DN") || upperModel.contains("| ART") || upperModel.contains("FISHEYE") { return "SIGMA" }
+        if upperModel.contains("SAMYANG") { return "SAMYANG" }
+        if upperModel.contains("TAMRON") { return "TAMRON" }
+        if upperMake.contains("RICOH") { return "RICOH" }
+        if upperMake.contains("SONY") { return "SONY" }
+
+        return make.isEmpty ? "LENS" : make.uppercased()
+    }
+}
+
 struct TopLensesPanel: View {
     @Bindable var appState: AppState
+    var onViewAll: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Top Lenses", actionLabel: "View all →")
+            AuroraPanelHeader(title: "Top Lenses", actionLabel: "View all →", action: onViewAll)
 
-            let lenses = (appState.totalStatsReport?.allLenses ?? []).prefix(4)
+            let lenses = (appState.totalStatsReport?.allLenses ?? []).prefix(5)
 
             if lenses.isEmpty {
                 emptyState
@@ -49,11 +85,11 @@ struct TopLensRow: View {
             IconChip(systemName: "camera.aperture", color: accentForRank(lens.rank), size: 34, iconScale: 0.5)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(lens.fullName)
+                Text(displayName)
                     .font(.auroraEventName)
                     .foregroundStyle(Color.auroraTxt)
                     .lineLimit(1)
-                Text(lens.make.isEmpty ? "Lens" : lens.make)
+                Text(brandName)
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
                     .lineLimit(1)
@@ -70,6 +106,14 @@ struct TopLensRow: View {
                 .fill(hovering ? Color.auroraPanel2 : Color.clear)
         )
         .onHover { hovering = $0 }
+    }
+
+    private var displayName: String {
+        LensDisplayFormatter.displayName(make: lens.make, model: lens.model)
+    }
+
+    private var brandName: String {
+        LensDisplayFormatter.brandName(make: lens.make, model: lens.model)
     }
 
     private func accentForRank(_ rank: Int) -> Color {

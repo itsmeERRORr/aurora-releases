@@ -74,10 +74,15 @@ struct ContentView: View {
                 onImportNow: startImport,
                 onPause: pauseImport,
                 onResume: resumeImport,
-                onCancel: cancelImport
+                onCancel: cancelImport,
+                onViewAllEvents: { selectedNavItem = .statistics },
+                onSelectEvent: selectEventFromDashboard
             )
         case .statistics:
-            StatisticsView(appState: appState, statsRunner: statsRunner)
+            StatisticsView(appState: appState, statsRunner: statsRunner) { bookmarkIndex in
+                guard let eventIndex = appState.uniqueImportDestinations.firstIndex(where: { $0.bookmarkIndex == bookmarkIndex }) else { return }
+                selectedNavItem = .event(index: eventIndex)
+            }
         case .activity:
             ActivityView(appState: appState)
         case .storage:
@@ -93,12 +98,30 @@ struct ContentView: View {
                     ? appState.uniqueImportDestinations[index].path : "",
                 eventName: index < appState.uniqueImportDestinations.count
                     ? appState.uniqueImportDestinations[index].name : "",
+                bookmarkIndex: index < appState.uniqueImportDestinations.count
+                    ? appState.uniqueImportDestinations[index].bookmarkIndex : nil,
                 statsRunner: statsRunner
             )
         }
     }
 
     // MARK: - Setup
+
+    private func selectEventFromDashboard(_ event: EventAggregate) {
+        let eventPath = normalizedPath(event.id)
+        guard let index = appState.uniqueImportDestinations.firstIndex(where: { destination in
+            let destinationPath = normalizedPath(destination.path)
+            return destinationPath == eventPath
+                || destinationPath.hasPrefix(eventPath + "/")
+                || eventPath.hasPrefix(destinationPath + "/")
+        }) else { return }
+
+        selectedNavItem = .event(index: index)
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
 
     private func setupServices() {
         let watcher = VolumeWatcher(appState: appState)

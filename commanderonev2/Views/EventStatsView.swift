@@ -4,6 +4,7 @@ struct EventStatsView: View {
     @Bindable var appState: AppState
     let destinationPath: String
     let eventName: String
+    let bookmarkIndex: Int?
     let statsRunner: StatsRunner?
 
     @State private var report: StatsReport?
@@ -18,6 +19,9 @@ struct EventStatsView: View {
     // Import history summary — available instantly, no scan needed
     // Falls back to cached report data if folder has been moved and history can't be matched
     private var importSummary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
+        if let bookmarkIndex, let summary = appState.importStatsForEventFolder(at: bookmarkIndex) {
+            return summary
+        }
         if let summary = appState.importStats(forEventPath: destinationPath) {
             return summary
         }
@@ -124,46 +128,37 @@ struct EventStatsView: View {
 
     @ViewBuilder
     private func importHistoryCard(summary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Import History")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundColor(.textPrimary)
+        VStack(alignment: .leading, spacing: 6) {
+            AuroraPanelHeader(title: "Import History")
 
-            HStack(spacing: 16) {
-                StatCard(
-                    title: "Photos Imported",
-                    value: summary.photoCount.formatted(),
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: summary.firstDate == nil ? 2 : 3),
+                spacing: AuroraSpacing.gridGap
+            ) {
+                PhotoStatCard(
                     icon: "arrow.down.circle.fill",
-                    color: Color.accentGreen
+                    accent: .auroraHealthy,
+                    pages: [(label: "Photos Imported", value: AuroraFormat.count(summary.photoCount))]
                 )
-                StatCard(
-                    title: "Data Transferred",
-                    value: formatBytes(summary.totalBytes),
+
+                let parts = AuroraFormat.bytesParts(summary.totalBytes)
+                PhotoStatCard(
                     icon: "externaldrive.fill",
-                    color: Color.blue
+                    accent: .auroraBlue,
+                    pages: [(label: "Data Transferred", value: "\(parts.value) \(parts.unit)")]
                 )
+
                 if let first = summary.firstDate {
-                    let dateFormatter = DateFormatter()
-                    let _ = { dateFormatter.dateStyle = .medium; dateFormatter.timeStyle = .none }()
                     let last = summary.lastDate ?? first
-                    StackableStatCard(
-                        cards: {
-                            var items: [StackableStatCard.CardData] = [
-                                .init(title: "Last Import", value: dateFormatter.string(from: last))
-                            ]
-                            if first != last {
-                                items.append(.init(title: "First Import", value: dateFormatter.string(from: first)))
-                            }
-                            return items
-                        }(),
+                    PhotoStatCard(
                         icon: "calendar",
-                        color: Color.orange
+                        accent: .auroraMagenta,
+                        pages: datePages(first: first, last: last)
                     )
                 }
             }
         }
-        .padding(16)
-        .glassPanel()
+        .auroraStaticCard()
     }
 
     // MARK: - States
@@ -172,16 +167,16 @@ struct EventStatsView: View {
         VStack(spacing: 16) {
             ProgressView()
                 .scaleEffect(1.5)
-                .tint(Color.primaryPurple)
+                .tint(Color.auroraViolet)
             Text("Analyzing photos in event folder…")
-                .font(.subheadline)
-                .foregroundColor(.textSecondary)
+                .font(.manrope(12, weight: .semibold))
+                .foregroundStyle(Color.auroraMuted)
             Text("This may take a moment for large folders")
-                .font(.caption)
-                .foregroundColor(.textTertiary)
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
         }
         .frame(maxWidth: .infinity, minHeight: 160)
-        .glassPanel()
+        .auroraStaticCard()
     }
 
     private func errorState(message: String) -> some View {
@@ -189,37 +184,35 @@ struct EventStatsView: View {
         return VStack(spacing: 12) {
             Image(systemName: isDiskOffline ? "externaldrive.badge.xmark" : "exclamationmark.triangle.fill")
                 .font(.system(size: 40))
-                .foregroundStyle(isDiskOffline ? Color.textSecondary : Color.orange)
+                .foregroundStyle(isDiskOffline ? Color.auroraMuted : Color.orange)
             Text(isDiskOffline ? "Disk not connected" : "Unable to scan folder")
-                .font(.title3)
-                .foregroundColor(.textPrimary)
+                .font(.manrope(15, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
             Text(isDiskOffline
                  ? "Photo stats (ISO, aperture, cameras, lenses) require the disk to be connected. Connect the disk and click \"Scan Photos\"."
                  : message)
-                .font(.caption)
-                .foregroundColor(.textSecondary)
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 160)
-        .padding(16)
-        .glassPanel()
+        .auroraStaticCard()
     }
 
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "photo.stack")
                 .font(.system(size: 48))
-                .foregroundStyle(Color.textTertiary)
+                .foregroundStyle(Color.auroraFaint)
             Text("No RAW files found")
-                .font(.title3)
-                .foregroundColor(.textSecondary)
+                .font(.manrope(15, weight: .bold))
+                .foregroundStyle(Color.auroraMuted)
             Text("No ARW, CR2, CR3 or DNG files found in this folder")
-                .font(.caption)
-                .foregroundColor(.textTertiary)
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
         }
         .frame(maxWidth: .infinity, minHeight: 160)
-        .padding(16)
-        .glassPanel()
+        .auroraStaticCard()
     }
 
     // MARK: - EXIF Stats Content
@@ -231,7 +224,7 @@ struct EventStatsView: View {
 
             HStack(alignment: .top, spacing: 16) {
                 if !report.allCameras.isEmpty {
-                    topCamerasSection(cameras: report.allCameras, total: report.totalFilesAnalyzed)
+                    topCamerasSection(cameras: report.allCameras)
                         .frame(maxWidth: .infinity)
                 }
                 if !report.allLenses.isEmpty {
@@ -250,10 +243,8 @@ struct EventStatsView: View {
     @ViewBuilder
     private func photoStatsCard(for report: StatsReport) -> some View {
         let isLimitedData = report.avgISO == nil && report.avgAperture == nil && report.avgFocalLength == nil && report.totalFilesAnalyzed > 0
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Photo Stats")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundColor(.textPrimary)
+        VStack(alignment: .leading, spacing: 6) {
+            AuroraPanelHeader(title: "Photo Stats")
 
             if isLimitedData {
                 HStack(spacing: 8) {
@@ -273,104 +264,89 @@ struct EventStatsView: View {
                 .cornerRadius(8)
             }
 
-            HStack(spacing: 16) {
-                StatCard(
-                    title: "RAW Files",
-                    value: "\(report.totalFilesAnalyzed)",
-                    icon: "photo.stack",
-                    color: Color.primaryPurple
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 5),
+                spacing: AuroraSpacing.gridGap
+            ) {
+                PhotoStatCard(
+                    icon: "photo.stack.fill",
+                    accent: .auroraCyan,
+                    pages: [(label: "RAW Files", value: AuroraFormat.count(report.totalFilesAnalyzed))]
                 )
-                if let iso = report.avgISO {
-                    StackableStatCard(
-                        cards: {
-                            var items: [StackableStatCard.CardData] = [.init(title: "Avg ISO", value: String(format: "%.0f", iso))]
-                            if let max = report.maxISO { items.append(.init(title: "Highest ISO", value: String(format: "%.0f", max))) }
-                            if let min = report.minISO { items.append(.init(title: "Lowest ISO", value: String(format: "%.0f", min))) }
-                            return items
-                        }(),
-                        icon: "camera.aperture",
-                        color: Color.blue
-                    )
-                }
-                if let aperture = report.avgAperture, aperture > 0 {
-                    StackableStatCard(
-                        cards: {
-                            var items: [StackableStatCard.CardData] = [.init(title: "Avg Aperture", value: String(format: "f/%.1f", aperture))]
-                            if let max = report.maxAperture, max > 0 { items.append(.init(title: "Highest Aperture", value: String(format: "f/%.1f", max))) }
-                            if let min = report.minAperture, min > 0 { items.append(.init(title: "Lowest Aperture", value: String(format: "f/%.1f", min))) }
-                            else { items.append(.init(title: "Lowest Aperture", value: "N/A")) }
-                            return items
-                        }(),
-                        icon: "circle.hexagongrid",
-                        color: Color.cyan
-                    )
-                }
-                if let focal = report.avgFocalLength, focal > 0 {
-                    StackableStatCard(
-                        cards: {
-                            var items: [StackableStatCard.CardData] = [.init(title: "Avg Focal", value: String(format: "%.0fmm", focal))]
-                            if let max = report.maxFocalLength, max > 0 { items.append(.init(title: "Highest Focal", value: String(format: "%.0fmm", max))) }
-                            if let min = report.minFocalLength, min > 0 { items.append(.init(title: "Lowest Focal", value: String(format: "%.0fmm", min))) }
-                            else { items.append(.init(title: "Lowest Focal", value: "N/A")) }
-                            return items
-                        }(),
-                        icon: "camera.macro",
-                        color: Color.pink
-                    )
-                }
+
+                PhotoStatCard(icon: "camera.aperture", accent: .auroraBlue, pages: isoPages(for: report))
+                PhotoStatCard(icon: "circle.dotted", accent: .auroraViolet, pages: aperturePages(for: report))
+                PhotoStatCard(icon: "viewfinder", accent: .auroraMagenta, pages: focalPages(for: report))
+                PhotoStatCard(icon: "timer", accent: .auroraPurple, pages: shutterPages(for: report))
             }
         }
-        .padding(16)
-        .glassPanel()
+        .auroraStaticCard()
+    }
+
+    private func datePages(first: Date, last: Date) -> [(label: String, value: String)] {
+        var pages: [(label: String, value: String)] = [
+            (label: "Last Import", value: AuroraFormat.dateMedium(last))
+        ]
+        if !Calendar.current.isDate(first, inSameDayAs: last) {
+            pages.append((label: "First Import", value: AuroraFormat.dateMedium(first)))
+        }
+        return pages
+    }
+
+    private func isoPages(for report: StatsReport) -> [(label: String, value: String)] {
+        var pages: [(label: String, value: String)] = [("Avg ISO", formatOptional(report.avgISO, AuroraFormat.iso))]
+        if let v = report.maxISO, v > 0 { pages.append(("Highest ISO", AuroraFormat.iso(v))) }
+        if let v = report.minISO, v > 0 { pages.append(("Lowest ISO", AuroraFormat.iso(v))) }
+        return pages
+    }
+
+    private func aperturePages(for report: StatsReport) -> [(label: String, value: String)] {
+        var pages: [(label: String, value: String)] = [("Avg Aperture", formatOptional(report.avgAperture, AuroraFormat.aperture))]
+        if let v = report.maxAperture, v > 0 { pages.append(("Highest Aperture", AuroraFormat.aperture(v))) }
+        if let v = report.minAperture, v > 0 { pages.append(("Lowest Aperture", AuroraFormat.aperture(v))) }
+        return pages
+    }
+
+    private func focalPages(for report: StatsReport) -> [(label: String, value: String)] {
+        var pages: [(label: String, value: String)] = [("Avg Focal", formatOptional(report.avgFocalLength, AuroraFormat.focal))]
+        if let v = report.maxFocalLength, v > 0 { pages.append(("Highest Focal", AuroraFormat.focal(v))) }
+        if let v = report.minFocalLength, v > 0 { pages.append(("Lowest Focal", AuroraFormat.focal(v))) }
+        return pages
+    }
+
+    private func shutterPages(for report: StatsReport) -> [(label: String, value: String)] {
+        var pages: [(label: String, value: String)] = [("Avg Shutter", formatOptional(report.avgShutterSpeed, AuroraFormat.shutter))]
+        if let v = report.minShutterSpeed, v > 0 { pages.append(("Fastest Shutter", AuroraFormat.shutter(v))) }
+        if let v = report.maxShutterSpeed, v > 0 { pages.append(("Longest Shutter", AuroraFormat.shutter(v))) }
+        return pages
+    }
+
+    private func formatOptional(_ value: Double?, _ formatter: (Double) -> String) -> String {
+        guard let value, value > 0 else { return "—" }
+        return formatter(value)
     }
 
     // MARK: - Top Lenses
 
     @ViewBuilder
     private func topLensesSection(report: StatsReport) -> some View {
-        let podium = Array(report.allLenses.prefix(3))
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Top Lenses")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(.textPrimary)
-                Spacer()
-                if report.allLenses.count > 3 {
-                    Button(showAllLenses ? "Less" : "More") {
-                        withAnimation(.easeInOut(duration: 0.2)) { showAllLenses.toggle() }
-                    }
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
-                    .buttonStyle(.plain)
-                }
+        let lenses = showAllLenses ? report.allLenses : Array(report.allLenses.prefix(5))
+        VStack(alignment: .leading, spacing: 6) {
+            AuroraPanelHeader(
+                title: "Top Lenses",
+                actionLabel: report.allLenses.count > 5 ? (showAllLenses ? "Less" : "More") : nil
+            ) {
+                withAnimation(.easeInOut(duration: 0.2)) { showAllLenses.toggle() }
             }
-            HStack(spacing: -20) {
-                if podium.count >= 2 { lensCard(lens: podium[1]) }
-                if podium.count >= 1 { lensCard(lens: podium[0]) }
-                if podium.count >= 3 { lensCard(lens: podium[2]) }
-            }
-            if showAllLenses {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(report.allLenses) { lens in
-                        HStack {
-                            Text(lens.fullName)
-                                .font(.system(size: 13))
-                                .foregroundColor(.textPrimary)
-                            Spacer()
-                            Text("\(lens.count) photos")
-                                .font(.caption)
-                                .foregroundColor(.textSecondary)
-                        }
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                    }
+
+            VStack(spacing: 4) {
+                ForEach(lenses) { lens in
+                    TopLensRow(lens: lens)
                 }
-                .padding(.top, 4)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity)
-        .glassPanel()
+        .frame(maxHeight: .infinity, alignment: .top)
+        .auroraStaticCard()
     }
 
     private func lensCard(lens: StatsReport.LensStat) -> some View {
@@ -403,50 +379,24 @@ struct EventStatsView: View {
     // MARK: - Top Cameras
 
     @ViewBuilder
-    private func topCamerasSection(cameras: [StatsReport.CameraStat], total: Int) -> some View {
-        let podium = Array(cameras.prefix(3))
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Top Cameras")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(.textPrimary)
-                Spacer()
-                if cameras.count > 3 {
-                    Button(showAllCameras ? "Less" : "More") {
-                        withAnimation(.easeInOut(duration: 0.2)) { showAllCameras.toggle() }
-                    }
-                    .font(.caption)
-                    .foregroundColor(.textSecondary)
-                    .buttonStyle(.plain)
-                }
+    private func topCamerasSection(cameras: [StatsReport.CameraStat]) -> some View {
+        let visibleCameras = showAllCameras ? cameras : Array(cameras.prefix(5))
+        VStack(alignment: .leading, spacing: 6) {
+            AuroraPanelHeader(
+                title: "Top Cameras",
+                actionLabel: cameras.count > 5 ? (showAllCameras ? "Less" : "More") : nil
+            ) {
+                withAnimation(.easeInOut(duration: 0.2)) { showAllCameras.toggle() }
             }
-            HStack(spacing: -20) {
-                if podium.count >= 2 { cameraCard(camera: podium[1], rank: 2) }
-                if podium.count >= 1 { cameraCard(camera: podium[0], rank: 1) }
-                if podium.count >= 3 { cameraCard(camera: podium[2], rank: 3) }
-            }
-            if showAllCameras {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(cameras, id: \.fullName) { cam in
-                        HStack {
-                            Text(friendlyCameraName(for: cam.model))
-                                .font(.system(size: 13))
-                                .foregroundColor(.textPrimary)
-                            Spacer()
-                            Text("\(cam.count) photos")
-                                .font(.caption)
-                                .foregroundColor(.textSecondary)
-                        }
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                    }
+
+            VStack(spacing: 4) {
+                ForEach(Array(visibleCameras.enumerated()), id: \.offset) { idx, camera in
+                    TopCameraRow(rank: idx + 1, camera: camera)
                 }
-                .padding(.top, 4)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity)
-        .glassPanel()
+        .frame(maxHeight: .infinity, alignment: .top)
+        .auroraStaticCard()
     }
 
     private func cameraCard(camera: StatsReport.CameraStat, rank: Int) -> some View {
@@ -518,7 +468,7 @@ struct EventStatsView: View {
     /// folder is first added (Statistics/Dashboard). The user can manually refresh here.
     @MainActor
     private func loadFromCacheThenScan() {
-        if let cached = EventStatsCache.load(forPath: destinationPath) {
+        if let cached = cachedStatsForCurrentEvent() {
             report = cached.report
             scanDate = cached.scanDate
             isCachedData = true
@@ -535,6 +485,17 @@ struct EventStatsView: View {
             }
             // If reachable but no cache: show emptyState with "Scan Photos" button in header
         }
+    }
+
+    private func cachedStatsForCurrentEvent() -> (report: StatsReport, scanDate: Date)? {
+        if let cached = EventStatsCache.load(forPath: destinationPath) {
+            return cached
+        }
+        guard let bookmarkIndex,
+              bookmarkIndex < appState.eventFolderPreviousCachedPaths.count else { return nil }
+        let previousPath = appState.eventFolderPreviousCachedPaths[bookmarkIndex]
+        guard !previousPath.isEmpty else { return nil }
+        return EventStatsCache.load(forPath: previousPath)
     }
 
     /// Fresh exiftool scan — saves result to cache on success.

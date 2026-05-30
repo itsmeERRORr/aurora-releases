@@ -2,12 +2,13 @@ import SwiftUI
 
 struct TopCamerasPanel: View {
     @Bindable var appState: AppState
+    var onViewAll: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Top Cameras", actionLabel: "View all →")
+            AuroraPanelHeader(title: "Top Cameras", actionLabel: "View all →", action: onViewAll)
 
-            let cameras = (appState.totalStatsReport?.allCameras ?? []).prefix(4)
+            let cameras = (appState.totalStatsReport?.allCameras ?? []).prefix(5)
 
             if cameras.isEmpty {
                 emptyState
@@ -49,16 +50,10 @@ struct TopCameraRow: View {
 
             IconChip(systemName: "camera.fill", color: accentForRank(rank), size: 34, iconScale: 0.5)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(camera.fullName)
-                    .font(.auroraEventName)
-                    .foregroundStyle(Color.auroraTxt)
-                    .lineLimit(1)
-                Text(camera.make.isEmpty ? "Camera body" : camera.make)
-                    .font(.manrope(11, weight: .semibold))
-                    .foregroundStyle(Color.auroraFaint)
-                    .lineLimit(1)
-            }
+            Text(displayName)
+                .font(.auroraEventName)
+                .foregroundStyle(Color.auroraTxt)
+                .lineLimit(1)
 
             Spacer(minLength: 4)
 
@@ -71,6 +66,20 @@ struct TopCameraRow: View {
                 .fill(hovering ? Color.auroraPanel2 : Color.clear)
         )
         .onHover { hovering = $0 }
+    }
+
+    private var displayName: String {
+        let model = camera.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullName = camera.fullName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mappings: [String: String] = [
+            "ILCE-9M3": "Sony A9 III",
+            "SONY ILCE-9M3": "Sony A9 III",
+            "ILCE-1M2": "Sony A1 II",
+            "SONY ILCE-1M2": "Sony A1 II",
+            "ILCE-7M4": "Sony A7 IV",
+            "SONY ILCE-7M4": "Sony A7 IV"
+        ]
+        return mappings[fullName.uppercased()] ?? mappings[model.uppercased()] ?? fullName
     }
 
     private func accentForRank(_ rank: Int) -> Color {

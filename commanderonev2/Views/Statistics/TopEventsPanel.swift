@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct EventAggregate: Identifiable, Hashable {
     let id: String       // folder path
@@ -10,75 +11,65 @@ struct EventAggregate: Identifiable, Hashable {
 }
 
 enum EventAggregator {
-    /// Build aggregates for every unique destination in the import history.
-    ///
-    /// Display names are resolved by walking the path up past media subfolders
-    /// (RAWs, JPGs, exports) and date-stamped subfolders, so an event imported
-    /// into `/My Event/2026-05-20/RAWs/` is shown as "My Event", not "RAWs".
+    /// Builds event aggregates using the sidebar destinations as the canonical
+    /// event list and display names, then attaches stats from history/cache.
+    @MainActor
     static func build(appState: AppState) -> [EventAggregate] {
-        var byPath: [String: (name: String, files: Int, bytes: Int64, speedSum: Double, speedCount: Int, last: Date)] = [:]
+        var byPath: [String: (name: String, files: Int, bytes: Int64, last: Date)] = [:]
+        var sidebarRoots = Set<String>()
 
-        // Finalized events first — source of truth for any matching path.
-        // Track these paths so live logic does not overwrite them.
-        var finalizedPaths = Set<String>()
-        for event in appState.finalizedEvents {
-            let root = inferredEventRoot(from: normalize(event.lastKnownPath))
-            guard !root.isEmpty, !isInvalidEventName(event.name) else { continue }
+        // The sidebar is the canonical list of events and display names. Stats/history
+        // are attached to those folders, but should not rename them back to folder names.
+        for destination in appState.uniqueImportDestinations {
+            let root = inferredEventRoot(from: normalize(destination.path))
+            guard !root.isEmpty, !isInvalidEventName(destination.name) else { continue }
+
+            let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
+            let finalized = appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)
+            let peak = destination.bookmarkIndex < appState.eventFolderPeakRawCounts.count
+                ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex]
+                : 0
+            let cached = destination.bookmarkIndex < appState.eventFolderCachedCounts.count
+                ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
+                : 0
+            let files = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
+            let bytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
+            let lastDate = summary?.lastDate
+                ?? finalized?.lastImportDate
+                ?? finalized?.finalizedAt
+                ?? .distantPast
+
             byPath[root] = (
-                name: event.name,
-                files: event.photoCount,
-                bytes: event.totalBytes,
-                speedSum: 0,
-                speedCount: 0,
-                last: event.lastImportDate ?? event.finalizedAt
+                name: destination.name,
+                files: files,
+                bytes: bytes,
+                last: lastDate
             )
-            finalizedPaths.insert(root)
+            sidebarRoots.insert(root)
+
+            let previousPath = destination.bookmarkIndex < appState.eventFolderPreviousCachedPaths.count
+                ? inferredEventRoot(from: normalize(appState.eventFolderPreviousCachedPaths[destination.bookmarkIndex]))
+                : ""
+            if !previousPath.isEmpty { sidebarRoots.insert(previousPath) }
         }
 
-        // Configured event folders, resolved to their event root (strips RAW/date subfolders).
-        let destinations = appState.eventFolderBookmarks.indices.compactMap { index -> (path: String, name: String, files: Int) in
-            let rawPath = index < appState.eventFolderCachedPaths.count ? appState.eventFolderCachedPaths[index] : ""
-            let root = inferredEventRoot(from: normalize(rawPath))
-            let customName = index < appState.eventFolderDisplayNames.count ? appState.eventFolderDisplayNames[index] : ""
-            let count = index < appState.eventFolderCachedCounts.count ? appState.eventFolderCachedCounts[index] : -1
-            let peak = index < appState.eventFolderPeakRawCounts.count ? appState.eventFolderPeakRawCounts[index] : 0
-            return (path: root, name: displayName(preferred: customName, root: root), files: max(count, peak))
-        }
-        for destination in destinations where !destination.path.isEmpty && !finalizedPaths.contains(destination.path) {
-            byPath[destination.path, default: (destination.name, 0, 0, 0, 0, .distantPast)].name = destination.name
-        }
-
-        // Iterate history (skip entries whose parent is finalized — snapshot is canonical).
+        // Keep orphaned import-history rows as a fallback, but do not let them override
+        // configured sidebar events or their user-facing names.
         for entry in appState.importHistory {
-            let entryNorm = normalize(entry.destinationPath)
-            let entryRoot = inferredEventRoot(from: entryNorm)
-            let parentNorm = bestParent(of: entryRoot, in: destinations.map { $0.path }) ?? entryRoot
-            if finalizedPaths.contains(parentNorm) { continue }
+            let entryRoot = inferredEventRoot(from: normalize(entry.destinationPath))
+            let parentRoot = bestParent(of: entryRoot, in: Array(sidebarRoots)) ?? entryRoot
+            if sidebarRoots.contains(parentRoot) { continue }
 
-            let resolvedName = destinations.first { normalize($0.path) == parentNorm }?.name
-                ?? displayName(preferred: nil, root: parentNorm)
-
+            let resolvedName = displayName(preferred: nil, root: parentRoot)
             guard !isInvalidEventName(resolvedName) else { continue }
 
-            var slot = byPath[parentNorm] ?? (resolvedName, 0, 0, 0, 0, .distantPast)
-            slot.name = slot.name.isEmpty ? resolvedName : slot.name
+            var slot = byPath[parentRoot] ?? (resolvedName, 0, 0, .distantPast)
             slot.files += entry.fileCount
             slot.bytes += entry.totalBytes
             slot.last = max(slot.last, entry.date)
-            byPath[parentNorm] = slot
+            byPath[parentRoot] = slot
         }
 
-        // If a configured event has cached counts but no import-history match, still show it.
-        for event in destinations where !event.path.isEmpty && event.files > 0
-            && !isInvalidEventName(event.name) && !finalizedPaths.contains(event.path)
-        {
-            var slot = byPath[event.path] ?? (event.name, 0, 0, 0, 0, .distantPast)
-            slot.name = event.name
-            slot.files = max(slot.files, event.files)
-            byPath[event.path] = slot
-        }
-
-        // Pull speed averages from totalStatsReport when we have any.
         let avgSpeed = appState.totalStatsReport?.averageSpeed ?? 0
 
         return byPath.compactMap { path, info in
@@ -186,14 +177,15 @@ enum EventAggregator {
 struct TopEventsPanel: View {
     @Bindable var appState: AppState
     var onSelect: (EventAggregate) -> Void = { _ in }
+    var onViewAll: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Top Events", actionLabel: "View all →")
+            AuroraPanelHeader(title: "Top Events", actionLabel: "View all →", action: onViewAll)
 
             let sorted = EventAggregator.build(appState: appState)
                 .sorted { $0.totalBytes > $1.totalBytes }
-                .prefix(4)
+                .prefix(5)
 
             if sorted.isEmpty {
                 emptyState
@@ -223,6 +215,86 @@ struct TopEventsPanel: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
+}
+
+struct LatestEventsPanel: View {
+    @Bindable var appState: AppState
+    var onSelect: (EventAggregate) -> Void = { _ in }
+    var onViewAll: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            AuroraPanelHeader(title: "Latest Events", actionLabel: "View all →", action: onViewAll)
+
+            let sorted = appState.uniqueImportDestinations
+                .prefix(5)
+                .compactMap(latestEventDisplay)
+
+            if sorted.isEmpty {
+                emptyState
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, event in
+                        LatestEventRow(rank: idx + 1, event: event) {
+                            onSelect(event.aggregate)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+        .auroraStaticCard()
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 6) {
+            Text("No recent events yet")
+                .font(.manrope(12, weight: .semibold))
+                .foregroundStyle(Color.auroraFaint)
+            Text("Latest events appear here once imports complete.")
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+    }
+
+    private func latestEventDisplay(
+        for destination: (path: String, name: String, bookmarkIndex: Int)
+    ) -> LatestEventDisplay? {
+        let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
+        let peak = destination.bookmarkIndex < appState.eventFolderPeakRawCounts.count
+            ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex]
+            : 0
+        let cached = destination.bookmarkIndex < appState.eventFolderCachedCounts.count
+            ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
+            : 0
+        let totalFiles = max(summary?.photoCount ?? 0, max(peak, cached))
+
+        let aggregate = EventAggregate(
+            id: destination.path,
+            name: destination.name,
+            totalFiles: totalFiles,
+            totalBytes: summary?.totalBytes ?? 0,
+            averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
+            lastDate: summary?.lastDate ?? .distantPast
+        )
+        let bannerPath: String? = if destination.bookmarkIndex < appState.eventFolderBannerImagePaths.count {
+            appState.eventFolderBannerImagePaths[destination.bookmarkIndex].isEmpty
+                ? nil
+                : appState.eventFolderBannerImagePaths[destination.bookmarkIndex]
+        } else {
+            nil
+        }
+        return LatestEventDisplay(aggregate: aggregate, bannerImagePath: bannerPath)
+    }
+}
+
+struct LatestEventDisplay: Identifiable {
+    let aggregate: EventAggregate
+    let bannerImagePath: String?
+
+    var id: String { aggregate.id }
 }
 
 struct TopEventRow: View {
@@ -260,6 +332,59 @@ struct TopEventRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+struct LatestEventRow: View {
+    let rank: Int
+    let event: LatestEventDisplay
+    var onTap: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 12) {
+                RankBadge(rank: rank)
+                latestThumbnail
+                    .frame(width: 44, height: 34)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(event.aggregate.name)
+                        .font(.auroraEventName)
+                        .foregroundStyle(Color.auroraTxt)
+                        .lineLimit(1)
+                    Text(dateText)
+                        .font(.manrope(11, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+                Spacer(minLength: 4)
+                SpeedPill(text: AuroraFormat.count(event.aggregate.totalFiles), tint: .auroraViolet)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(hovering ? Color.auroraPanel2 : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    @ViewBuilder
+    private var latestThumbnail: some View {
+        if let path = event.bannerImagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+            EventThumbnail(eventName: event.aggregate.name, folderPath: event.aggregate.id)
+        }
+    }
+
+    private var dateText: String {
+        event.aggregate.lastDate == .distantPast ? "—" : AuroraFormat.dateCompact(event.aggregate.lastDate)
     }
 }
 

@@ -10,6 +10,8 @@ struct DashboardView: View {
     let onPause: () -> Void
     let onResume: () -> Void
     let onCancel: () -> Void
+    var onViewAllEvents: () -> Void = {}
+    var onSelectEvent: (EventAggregate) -> Void = { _ in }
 
     var body: some View {
         ScrollView {
@@ -40,7 +42,7 @@ struct DashboardView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .bold))
-                    Text("Add folder")
+                    Text("New Event")
                 }
             }
             .buttonStyle(AuroraGradientButtonStyle(compact: true))
@@ -69,11 +71,11 @@ struct DashboardView: View {
 
     private var recentEvents: some View {
         VStack(alignment: .leading, spacing: 8) {
-            AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →")
+            AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →", action: onViewAllEvents)
 
-            let events = EventAggregator.build(appState: appState)
-                .sorted { $0.lastDate > $1.lastDate }
+            let events = appState.uniqueImportDestinations
                 .prefix(4)
+                .compactMap(recentEventDisplay)
 
             if events.isEmpty {
                 emptyEvents
@@ -83,11 +85,41 @@ struct DashboardView: View {
                     spacing: AuroraSpacing.gridGap
                 ) {
                     ForEach(events) { event in
-                        RecentEventThumb(event: event)
+                        RecentEventThumb(event: event) {
+                            onSelectEvent(event)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private func recentEventDisplay(for destination: (path: String, name: String, bookmarkIndex: Int)) -> EventAggregate? {
+        guard !destination.path.isEmpty else { return nil }
+
+        let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
+        let finalized = appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)
+        let peak = destination.bookmarkIndex < appState.eventFolderPeakRawCounts.count
+            ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex]
+            : 0
+        let cached = destination.bookmarkIndex < appState.eventFolderCachedCounts.count
+            ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
+            : 0
+        let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
+        let totalBytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
+        let lastDate = summary?.lastDate
+            ?? finalized?.lastImportDate
+            ?? finalized?.finalizedAt
+            ?? .distantPast
+
+        return EventAggregate(
+            id: destination.path,
+            name: destination.name,
+            totalFiles: totalFiles,
+            totalBytes: totalBytes,
+            averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
+            lastDate: lastDate
+        )
     }
 
     private var emptyEvents: some View {
@@ -377,39 +409,43 @@ struct WaitingCard: View {
 
 struct RecentEventThumb: View {
     let event: EventAggregate
+    var onTap: () -> Void
 
     @State private var hovering = false
 
     var body: some View {
-        EventThumbnail(
-            eventName: event.name,
-            folderPath: event.id,
-            cornerRadius: 14,
-            overlay: AnyView(
-                ZStack(alignment: .bottomLeading) {
-                    LinearGradient(
-                        colors: [.clear, Color.black.opacity(0.85)],
-                        startPoint: .top, endPoint: .bottom
-                    )
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(event.name)
-                            .font(.manrope(12.5, weight: .bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        Text("\(AuroraFormat.count(event.totalFiles)) RAW files")
-                            .font(.manrope(11, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.78))
+        Button(action: onTap) {
+            EventThumbnail(
+                eventName: event.name,
+                folderPath: event.id,
+                cornerRadius: 14,
+                overlay: AnyView(
+                    ZStack(alignment: .bottomLeading) {
+                        LinearGradient(
+                            colors: [.clear, Color.black.opacity(0.85)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(event.name)
+                                .font(.manrope(12.5, weight: .bold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                            Text("\(AuroraFormat.count(event.totalFiles)) RAW files")
+                                .font(.manrope(11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.78))
+                        }
+                        .padding(12)
                     }
-                    .padding(12)
-                }
+                )
             )
-        )
-        .aspectRatio(4.0/3.0, contentMode: .fit)
-        .offset(y: hovering ? -2 : 0)
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(hovering ? Color.auroraStroke2 : Color.auroraStroke, lineWidth: 1)
-        )
+            .aspectRatio(4.0/3.0, contentMode: .fit)
+            .offset(y: hovering ? -2 : 0)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(hovering ? Color.auroraStroke2 : Color.auroraStroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.18), value: hovering)
         .onHover { hovering = $0 }
     }
