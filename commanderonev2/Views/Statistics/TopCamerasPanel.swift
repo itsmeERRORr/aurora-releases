@@ -20,7 +20,6 @@ struct TopCamerasPanel: View {
                 }
             }
         }
-        .frame(maxHeight: .infinity, alignment: .top)
         .auroraStaticCard()
     }
 

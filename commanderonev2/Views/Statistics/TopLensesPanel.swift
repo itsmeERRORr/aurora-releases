@@ -55,7 +55,6 @@ struct TopLensesPanel: View {
                 }
             }
         }
-        .frame(maxHeight: .infinity, alignment: .top)
         .auroraStaticCard()
     }
 

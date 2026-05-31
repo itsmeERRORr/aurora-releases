@@ -20,6 +20,8 @@ struct DashboardView: View {
 
                 heroRow
 
+                FileBrowserRow(appState: appState)
+
                 recentEvents
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
@@ -73,25 +75,35 @@ struct DashboardView: View {
         VStack(alignment: .leading, spacing: 8) {
             AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →", action: onViewAllEvents)
 
-            let events = appState.uniqueImportDestinations
+            let items = appState.uniqueImportDestinations
                 .prefix(4)
-                .compactMap(recentEventDisplay)
+                .compactMap { destination -> (EventAggregate, String?)? in
+                    guard let event = recentEventDisplay(for: destination) else { return nil }
+                    return (event, bannerImagePath(for: destination.bookmarkIndex))
+                }
 
-            if events.isEmpty {
+            if items.isEmpty {
                 emptyEvents
             } else {
                 LazyVGrid(
                     columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
                     spacing: AuroraSpacing.gridGap
                 ) {
-                    ForEach(events) { event in
-                        RecentEventThumb(event: event) {
+                    ForEach(items, id: \.0.id) { event, bannerPath in
+                        RecentEventThumb(event: event, bannerImagePath: bannerPath) {
                             onSelectEvent(event)
                         }
                     }
                 }
             }
         }
+    }
+
+    private func bannerImagePath(for bookmarkIndex: Int) -> String? {
+        guard bookmarkIndex >= 0,
+              bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
+        let path = appState.eventFolderBannerImagePaths[bookmarkIndex]
+        return path.isEmpty ? nil : path
     }
 
     private func recentEventDisplay(for destination: (path: String, name: String, bookmarkIndex: Int)) -> EventAggregate? {
@@ -289,7 +301,7 @@ struct WaitingCard: View {
                 Spacer()
             }
 
-            dropZone
+            destinationPicker
 
             Spacer(minLength: 4)
 
@@ -339,37 +351,61 @@ struct WaitingCard: View {
         return "Plug in a reader to start an import"
     }
 
-    private var dropZone: some View {
-        RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
-            .strokeBorder(Color.auroraStroke2, style: StrokeStyle(lineWidth: 1, dash: [6, 5]))
-            .background(
-                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
-                    .fill(Color.auroraPanel)
-            )
-            .overlay(
-                VStack(spacing: 6) {
-                    Image(systemName: "arrow.down.to.line.square")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(Color.auroraFaint)
-                    Text(dropLabel)
-                        .font(.manrope(12, weight: .semibold))
-                        .foregroundStyle(Color.auroraMuted)
-                    Text(dropHint)
+    @ViewBuilder
+    private var destinationPicker: some View {
+        if let dest = appState.destinationURL {
+            HStack(spacing: 10) {
+                IconChip(systemName: "folder.fill", color: .auroraViolet, size: 32, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(dest.lastPathComponent)
+                        .font(.manrope(13, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                        .lineLimit(1)
+                    Text(dest.path)
                         .font(.manrope(11, weight: .medium))
                         .foregroundStyle(Color.auroraFaint)
+                        .lineLimit(1)
                 }
+                Spacer()
+                Button("Change…", action: chooseDestination)
+                    .buttonStyle(AuroraGhostButtonStyle())
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .fill(Color.auroraPanel2)
             )
-            .frame(height: 96)
+            .overlay(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .strokeBorder(Color.auroraStroke, lineWidth: 1)
+            )
+        } else {
+            Button("Choose Destination", action: chooseDestination)
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+                .frame(maxWidth: .infinity)
+                .frame(height: 96)
+            .background(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .fill(Color.auroraPanel2)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .strokeBorder(Color.auroraStroke, lineWidth: 1)
+            )
+        }
     }
 
-    private var dropLabel: String {
-        if appState.destinationURL != nil { return "Destination set" }
-        return "Drop a destination folder"
-    }
-
-    private var dropHint: String {
-        if let dest = appState.destinationURL { return dest.lastPathComponent }
-        return "Imports will be moved or copied here"
+    private func chooseDestination() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose where to import photos"
+        panel.prompt = "Select"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = BookmarkManager.saveBookmark(for: url) else { return }
+        appState.destinationURL = url
+        appState.destinationBookmarkData = data
     }
 
     private var actions: some View {
@@ -409,6 +445,7 @@ struct WaitingCard: View {
 
 struct RecentEventThumb: View {
     let event: EventAggregate
+    var bannerImagePath: String? = nil
     var onTap: () -> Void
 
     @State private var hovering = false
@@ -436,7 +473,8 @@ struct RecentEventThumb: View {
                         }
                         .padding(12)
                     }
-                )
+                ),
+                bannerImagePath: bannerImagePath
             )
             .aspectRatio(4.0/3.0, contentMode: .fit)
             .offset(y: hovering ? -2 : 0)
@@ -448,5 +486,168 @@ struct RecentEventThumb: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.18), value: hovering)
         .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - File Browser Row
+
+struct FileBrowserRow: View {
+    @Bindable var appState: AppState
+
+    @State private var sourceFiles: [URL] = []
+    @State private var destFiles: [URL] = []
+    @State private var isLoadingSource = false
+    @State private var isLoadingDest = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
+            filePanel(
+                title: "Source Files",
+                icon: "sdcard",
+                color: .auroraCyan,
+                files: sourceFiles,
+                isLoading: isLoadingSource,
+                emptyHint: appState.activeVolume == nil ? "No card detected" : "No RAW files found"
+            )
+            filePanel(
+                title: "Destination Files",
+                icon: "folder.fill",
+                color: .auroraViolet,
+                files: destFiles,
+                isLoading: isLoadingDest,
+                emptyHint: appState.destinationURL == nil ? "No destination set" : "No files found"
+            )
+        }
+        .onChange(of: appState.activeVolume) { _, volume in
+            loadSourceFiles(from: volume)
+        }
+        .onChange(of: appState.destinationURL) { _, url in
+            loadDestFiles(from: url)
+        }
+        .onAppear {
+            loadSourceFiles(from: appState.activeVolume)
+            loadDestFiles(from: appState.destinationURL)
+        }
+    }
+
+    private func filePanel(title: String, icon: String, color: Color, files: [URL], isLoading: Bool, emptyHint: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                IconChip(systemName: icon, color: color, size: 26, iconScale: 0.5)
+                Text(title)
+                    .font(.manrope(13, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+                Spacer()
+                if !files.isEmpty {
+                    Text("\(files.count)")
+                        .font(.manrope(11, weight: .bold))
+                        .foregroundStyle(color)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(color.opacity(0.12)))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+
+            Rectangle()
+                .fill(Color.auroraStroke)
+                .frame(height: 1)
+
+            if isLoading {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.7)
+                    Text("Loading…")
+                        .font(.manrope(11, weight: .medium))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .frame(height: 180)
+            } else if files.isEmpty {
+                Text(emptyHint)
+                    .font(.manrope(12, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .frame(height: 180)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(files.enumerated()), id: \.offset) { idx, file in
+                            HStack(spacing: 10) {
+                                Text(file.pathExtension.uppercased())
+                                    .font(.manrope(9, weight: .bold))
+                                    .foregroundStyle(color)
+                                    .frame(width: 34)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(color.opacity(0.12)))
+                                    .multilineTextAlignment(.center)
+                                Text(file.lastPathComponent)
+                                    .font(.manrope(11.5, weight: .medium))
+                                    .foregroundStyle(Color.auroraTxt)
+                                    .lineLimit(1)
+                                Spacer()
+                                if let size = fileSize(for: file) {
+                                    Text(size)
+                                        .font(.manrope(10, weight: .medium))
+                                        .foregroundStyle(Color.auroraFaint)
+                                }
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+
+                            if idx < files.count - 1 {
+                                Rectangle()
+                                    .fill(Color.auroraStroke)
+                                    .frame(height: 1)
+                                    .padding(.leading, 14)
+                            }
+                        }
+                    }
+                }
+                .frame(height: 180)
+                .scrollIndicators(.hidden)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .fill(Color.auroraPanel)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke, lineWidth: 1)
+        )
+    }
+
+    private func fileSize(for url: URL) -> String? {
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 else { return nil }
+        let parts = AuroraFormat.bytesParts(Int64(size))
+        return "\(parts.value) \(parts.unit)"
+    }
+
+    private func loadSourceFiles(from volume: VolumeInfo?) {
+        guard let volume = volume else { sourceFiles = []; return }
+        isLoadingSource = true
+        let path = volume.path
+        let exts = appState.supportedExtensions
+        Task {
+            let files = VolumeWatcher.listRawFiles(at: path, extensions: exts)
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            sourceFiles = files
+            isLoadingSource = false
+        }
+    }
+
+    private func loadDestFiles(from url: URL?) {
+        guard let url = url else { destFiles = []; return }
+        isLoadingDest = true
+        let exts = appState.supportedExtensions
+        Task {
+            let files = VolumeWatcher.listRawFiles(at: url, extensions: exts)
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            destFiles = files
+            isLoadingDest = false
+        }
     }
 }

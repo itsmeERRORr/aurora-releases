@@ -7,7 +7,6 @@ struct ActivityView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 topbar
-                summaryStrip
                 content
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
@@ -26,40 +25,6 @@ struct ActivityView: View {
             Spacer()
         }
         .padding(.bottom, 6)
-    }
-
-    private var summaryStrip: some View {
-        HStack(spacing: AuroraSpacing.gridGap) {
-            summaryItem(icon: "checkmark.seal.fill", color: .auroraHealthy,
-                        label: "Imports",
-                        value: "\(appState.importHistory.count)")
-            summaryItem(icon: "photo.stack.fill", color: .auroraCyan,
-                        label: "Photos imported",
-                        value: AuroraFormat.count(appState.importHistory.reduce(0) { $0 + $1.fileCount }))
-            summaryItem(icon: "externaldrive.fill", color: .auroraViolet,
-                        label: "Data moved",
-                        value: bytesStr)
-            summaryItem(icon: "clock.fill", color: .auroraMagenta,
-                        label: "Last activity",
-                        value: lastStr)
-        }
-    }
-
-    private func summaryItem(icon: String, color: Color, label: String, value: String) -> some View {
-        HStack(spacing: 12) {
-            IconChip(systemName: icon, color: color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(value)
-                    .font(.sora(18, weight: .bold))
-                    .foregroundStyle(Color.auroraTxt)
-                Text(label)
-                    .font(.manrope(11, weight: .semibold))
-                    .foregroundStyle(Color.auroraFaint)
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .auroraCard()
     }
 
     @ViewBuilder
@@ -169,14 +134,4 @@ struct ActivityView: View {
         }
     }
 
-    private var bytesStr: String {
-        let total = appState.importHistory.reduce(Int64(0)) { $0 + $1.totalBytes }
-        let p = AuroraFormat.bytesParts(total)
-        return "\(p.value) \(p.unit)"
-    }
-
-    private var lastStr: String {
-        guard let date = appState.importHistory.map(\.date).max() else { return "—" }
-        return AuroraFormat.dateShort(date)
-    }
 }

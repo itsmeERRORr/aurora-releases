@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct EventStatsView: View {
     @Bindable var appState: AppState
@@ -41,7 +43,7 @@ struct EventStatsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                headerCard
+                eventBannerCard
 
                 // Import history card — always visible, no scan needed
                 if let summary = importSummary {
@@ -81,47 +83,166 @@ struct EventStatsView: View {
 
     // MARK: - Header
 
-    private var headerCard: some View {
-        HStack(alignment: .center) {
+    private var diskIsReachable: Bool {
+        guard !destinationPath.isEmpty else { return false }
+        return (try? URL(fileURLWithPath: destinationPath).checkResourceIsReachable()) == true
+    }
+
+    private var eventBannerCard: some View {
+        ZStack(alignment: .topLeading) {
+            bannerCardBackground
+
+            LinearGradient(
+                colors: [Color.black.opacity(0.72), Color.black.opacity(0.12), Color.black.opacity(0.55)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            VStack(alignment: .leading, spacing: 0) {
+                bannerHeader
+                Spacer()
+                if let summary = importSummary {
+                    Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
+                        .font(.manrope(12, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+            }
+            .padding(18)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 400)
+        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke, lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var bannerCardBackground: some View {
+        if let path = eventBannerImagePath, let img = NSImage(contentsOfFile: path) {
+            Image(nsImage: img)
+                .resizable()
+                .scaledToFill()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+        } else {
+            EventThumbnail(
+                eventName: eventName,
+                folderPath: destinationPath,
+                cornerRadius: 0
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var bannerHeader: some View {
+        HStack(alignment: .center, spacing: 12) {
             Image(systemName: "folder.fill")
-                .foregroundStyle(Color.primaryPurple)
-                .font(.title2)
+                .foregroundStyle(Color.auroraViolet)
+                .font(.system(size: 18, weight: .bold))
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(eventName)
-                    .font(.title2.bold())
-                    .foregroundColor(.textPrimary)
+                    .font(.sora(21, weight: .bold))
+                    .tracking(-0.3)
+                    .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let date = scanDate {
                     Text("Last scan: \(date.formatted(date: .abbreviated, time: .omitted))")
-                        .font(.system(size: 11))
-                        .foregroundColor(.textSecondary.opacity(0.7))
+                        .font(.manrope(11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.68))
                 }
             }
-            Spacer()
+
+            Spacer(minLength: 12)
+
             if isLoading {
                 ProgressView()
                     .scaleEffect(0.8)
-                    .tint(Color.primaryPurple)
+                    .tint(Color.white)
             } else if diskIsReachable {
-                // Disk online — show Refresh (if cached) or Scan (if never scanned)
                 Button {
                     loadEventStats()
                 } label: {
                     Label(isCachedData ? "Refresh" : "Scan Photos", systemImage: "arrow.clockwise")
-                        .font(.caption)
+                        .font(.manrope(12, weight: .bold))
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Color.primaryPurple)
+                .buttonStyle(AuroraGhostButtonStyle())
             }
+
+            bannerMenu
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.black.opacity(0.42))
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+        )
     }
 
-    private var diskIsReachable: Bool {
-        guard !destinationPath.isEmpty else { return false }
-        return (try? URL(fileURLWithPath: destinationPath).checkResourceIsReachable()) == true
+    @ViewBuilder
+    private var bannerMenu: some View {
+        if let bookmarkIndex {
+            Menu {
+                Button("Choose Banner Photo…") {
+                    chooseBannerPhoto(for: bookmarkIndex)
+                }
+                if eventBannerImagePath != nil {
+                    Button("Remove Banner Photo") {
+                        appState.clearEventFolderBanner(at: bookmarkIndex)
+                    }
+                }
+            } label: {
+                Label("Banner", systemImage: "photo.fill")
+                    .font(.manrope(12, weight: .bold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule()
+                            .fill(Color.auroraViolet.opacity(0.82))
+                            .background(.ultraThinMaterial, in: Capsule())
+                    )
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
+                    .shadow(color: Color.black.opacity(0.35), radius: 10, x: 0, y: 5)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+    }
+
+    private func chooseBannerPhoto(for bookmarkIndex: Int) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "Choose a photo to use as this event banner"
+        panel.prompt = "Use as Banner"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if !appState.setEventFolderBanner(at: bookmarkIndex, sourceURL: url) {
+            let alert = NSAlert()
+            alert.messageText = "Could not use this banner"
+            alert.informativeText = "The selected image could not be copied into the app cache."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    private var eventBannerImagePath: String? {
+        guard let bookmarkIndex,
+              bookmarkIndex >= 0,
+              bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
+        let path = appState.eventFolderBannerImagePaths[bookmarkIndex]
+        return path.isEmpty ? nil : path
     }
 
     // MARK: - Import History Card (instant — from ImportHistory, no scan)

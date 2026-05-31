@@ -23,7 +23,9 @@ struct StatisticsView: View {
 
                 camerasAndLensesRow
 
-                twoColumnRow
+                chartsRow
+
+                photosPerMonthRow
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
             .padding(.vertical, AuroraSpacing.mainPaddingV)
@@ -37,46 +39,42 @@ struct StatisticsView: View {
 
     // 1 : 1 — Top Events + Latest Events
     private var eventsRow: some View {
-        GeometryReader { geo in
-            let gap = AuroraSpacing.gridGap
-            let unit = (geo.size.width - gap) / 2
-            HStack(alignment: .top, spacing: gap) {
-                TopEventsPanel(appState: appState, onViewAll: { viewAllSheet = .topEvents })
-                    .frame(width: unit)
-                LatestEventsPanel(appState: appState, onViewAll: { viewAllSheet = .latestEvents })
-                    .frame(width: unit)
-            }
+        HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
+            TopEventsPanel(appState: appState, onViewAll: { viewAllSheet = .topEvents })
+                .frame(maxWidth: .infinity)
+            LatestEventsPanel(appState: appState, onViewAll: { viewAllSheet = .latestEvents })
+                .frame(maxWidth: .infinity)
         }
-        .frame(minHeight: 320)
     }
 
     // 1 : 1 — Top Cameras + Top Lenses
     private var camerasAndLensesRow: some View {
+        HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
+            TopCamerasPanel(appState: appState, onViewAll: { viewAllSheet = .topCameras })
+                .frame(maxWidth: .infinity)
+            TopLensesPanel(appState: appState, onViewAll: { viewAllSheet = .topLenses })
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    // 1 : 1 — Most RAW Photos + Most Deliverable Photos
+    private var chartsRow: some View {
         GeometryReader { geo in
             let gap = AuroraSpacing.gridGap
             let unit = (geo.size.width - gap) / 2
             HStack(alignment: .top, spacing: gap) {
-                TopCamerasPanel(appState: appState, onViewAll: { viewAllSheet = .topCameras })
+                PhotosPerEventChart(appState: appState, onViewAll: { viewAllSheet = .photosPerEvent })
                     .frame(width: unit)
-                TopLensesPanel(appState: appState, onViewAll: { viewAllSheet = .topLenses })
+                DeliverablesPerEventChart(appState: appState)
                     .frame(width: unit)
-            }
-        }
-        .frame(minHeight: 320)
-    }
-
-    // 1 : 1.18
-    private var twoColumnRow: some View {
-        GeometryReader { geo in
-            let gap = AuroraSpacing.gridGap
-            let totalWeight: CGFloat = 1 + 1.18
-            let unit = (geo.size.width - gap) / totalWeight
-            HStack(alignment: .top, spacing: gap) {
-                PhotosPerMonthChart(appState: appState).frame(width: unit * 1)
-                PhotosPerEventChart(appState: appState, onViewAll: { viewAllSheet = .photosPerEvent }).frame(width: unit * 1.18)
             }
         }
         .frame(minHeight: 360)
+    }
+
+    // Full width — Photos per Month
+    private var photosPerMonthRow: some View {
+        PhotosPerMonthChart(appState: appState)
     }
 }
 

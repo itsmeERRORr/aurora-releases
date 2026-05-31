@@ -6,6 +6,7 @@ struct Sparkline: View {
     var values: [Double]
     var stroke: [Color] = [.auroraCyan, .auroraCyanDeep]
     var fill: Color = .auroraCyan
+    private let drawingInset: CGFloat = 3
 
     var body: some View {
         GeometryReader { geo in
@@ -21,8 +22,8 @@ struct Sparkline: View {
 
                 // Area fill: line + closure to baseline.
                 var areaPath = linePath
-                areaPath.addLine(to: CGPoint(x: points.last!.x, y: h))
-                areaPath.addLine(to: CGPoint(x: points.first!.x, y: h))
+                areaPath.addLine(to: CGPoint(x: points.last!.x, y: h - drawingInset))
+                areaPath.addLine(to: CGPoint(x: points.first!.x, y: h - drawingInset))
                 areaPath.closeSubpath()
 
                 let areaShading = GraphicsContext.Shading.linearGradient(
@@ -47,11 +48,13 @@ struct Sparkline: View {
         let minV = values.min() ?? 0
         let maxV = values.max() ?? 1
         let range = max(maxV - minV, 0.0001)
-        let stepX = values.count > 1 ? size.width / CGFloat(values.count - 1) : size.width
+        let drawableWidth = max(size.width - drawingInset * 2, 1)
+        let drawableHeight = max(size.height - drawingInset * 2, 1)
+        let stepX = values.count > 1 ? drawableWidth / CGFloat(values.count - 1) : drawableWidth
         return values.enumerated().map { i, v in
-            let x = CGFloat(i) * stepX
+            let x = drawingInset + CGFloat(i) * stepX
             let normalized = (v - minV) / range
-            let y = size.height - CGFloat(normalized) * (size.height - 2) - 1
+            let y = drawingInset + (1 - CGFloat(normalized)) * drawableHeight
             return CGPoint(x: x, y: y)
         }
     }

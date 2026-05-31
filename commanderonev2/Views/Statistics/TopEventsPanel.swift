@@ -11,27 +11,30 @@ struct EventAggregate: Identifiable, Hashable {
 }
 
 enum EventAggregator {
-    /// Builds event aggregates using the sidebar destinations as the canonical
-    /// event list and display names, then attaches stats from history/cache.
+    /// Builds event aggregates strictly from sidebar destinations so names always
+    /// match what the sidebar shows. Stats come from bookmarked summaries and caches.
     @MainActor
     static func build(appState: AppState) -> [EventAggregate] {
-        var byPath: [String: (name: String, files: Int, bytes: Int64, last: Date)] = [:]
-        var sidebarRoots = Set<String>()
+        let avgSpeed = appState.totalStatsReport?.averageSpeed ?? 0
 
-        // The sidebar is the canonical list of events and display names. Stats/history
-        // are attached to those folders, but should not rename them back to folder names.
-        for destination in appState.uniqueImportDestinations {
-            let root = inferredEventRoot(from: normalize(destination.path))
-            guard !root.isEmpty, !isInvalidEventName(destination.name) else { continue }
+        return appState.uniqueImportDestinations.compactMap { destination in
+            guard !destination.path.isEmpty else { return nil }
+
+            let effectiveName: String
+            if isInvalidEventName(destination.name) {
+                let root = inferredEventRoot(from: normalize(destination.path))
+                effectiveName = URL(fileURLWithPath: root).lastPathComponent
+            } else {
+                effectiveName = destination.name
+            }
+            guard !isInvalidEventName(effectiveName) else { return nil }
 
             let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
             let finalized = appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)
             let peak = destination.bookmarkIndex < appState.eventFolderPeakRawCounts.count
-                ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex]
-                : 0
+                ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex] : 0
             let cached = destination.bookmarkIndex < appState.eventFolderCachedCounts.count
-                ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
-                : 0
+                ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0) : 0
             let files = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
             let bytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
             let lastDate = summary?.lastDate
@@ -39,49 +42,15 @@ enum EventAggregator {
                 ?? finalized?.finalizedAt
                 ?? .distantPast
 
-            byPath[root] = (
-                name: destination.name,
-                files: files,
-                bytes: bytes,
-                last: lastDate
-            )
-            sidebarRoots.insert(root)
+            guard files > 0 else { return nil }
 
-            let previousPath = destination.bookmarkIndex < appState.eventFolderPreviousCachedPaths.count
-                ? inferredEventRoot(from: normalize(appState.eventFolderPreviousCachedPaths[destination.bookmarkIndex]))
-                : ""
-            if !previousPath.isEmpty { sidebarRoots.insert(previousPath) }
-        }
-
-        // Keep orphaned import-history rows as a fallback, but do not let them override
-        // configured sidebar events or their user-facing names.
-        for entry in appState.importHistory {
-            let entryRoot = inferredEventRoot(from: normalize(entry.destinationPath))
-            let parentRoot = bestParent(of: entryRoot, in: Array(sidebarRoots)) ?? entryRoot
-            if sidebarRoots.contains(parentRoot) { continue }
-
-            let resolvedName = displayName(preferred: nil, root: parentRoot)
-            guard !isInvalidEventName(resolvedName) else { continue }
-
-            var slot = byPath[parentRoot] ?? (resolvedName, 0, 0, .distantPast)
-            slot.files += entry.fileCount
-            slot.bytes += entry.totalBytes
-            slot.last = max(slot.last, entry.date)
-            byPath[parentRoot] = slot
-        }
-
-        let avgSpeed = appState.totalStatsReport?.averageSpeed ?? 0
-
-        return byPath.compactMap { path, info in
-            guard info.files > 0 else { return nil }
-            guard !isInvalidEventName(info.name) else { return nil }
             return EventAggregate(
-                id: path,
-                name: info.name,
-                totalFiles: info.files,
-                totalBytes: info.bytes,
+                id: destination.path,
+                name: effectiveName,
+                totalFiles: files,
+                totalBytes: bytes,
                 averageSpeed: avgSpeed,
-                lastDate: info.last
+                lastDate: lastDate
             )
         }
     }
@@ -199,7 +168,6 @@ struct TopEventsPanel: View {
                 }
             }
         }
-        .frame(maxHeight: .infinity, alignment: .top)
         .auroraStaticCard()
     }
 
@@ -242,7 +210,6 @@ struct LatestEventsPanel: View {
                 }
             }
         }
-        .frame(maxHeight: .infinity, alignment: .top)
         .auroraStaticCard()
     }
 

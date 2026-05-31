@@ -8,6 +8,8 @@ struct EventThumbnail: View {
     var folderPath: String? = nil
     var cornerRadius: CGFloat = 8
     var overlay: AnyView? = nil
+    /// Custom banner image path — takes priority over the folder thumbnail.
+    var bannerImagePath: String? = nil
 
     @StateObject private var loader = EventThumbnailLoader.shared
 
@@ -23,7 +25,12 @@ struct EventThumbnail: View {
                     )
                 )
 
-            if let path = folderPath, let img = loader.image(forFolderPath: path) {
+            if let path = bannerImagePath, let img = NSImage(contentsOfFile: path) {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
+            } else if let path = folderPath, let img = loader.image(forFolderPath: path) {
                 Image(nsImage: img)
                     .resizable()
                     .scaledToFill()
@@ -34,11 +41,11 @@ struct EventThumbnail: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .onAppear {
-            if let path = folderPath {
+            if bannerImagePath == nil, let path = folderPath {
                 loader.requestLoad(folderPath: path)
             }
         }
-        .id(loader.version) // re-evaluate when cache changes
+        .id("\(loader.version)-\(bannerImagePath ?? "")") // re-evaluate when cache or manual banner changes
     }
 }
 

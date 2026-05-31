@@ -11,7 +11,6 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
                 topbar
                 importSection
-                destinationSection
                 dataSection
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
@@ -102,48 +101,6 @@ struct SettingsView: View {
         }
         .toggleStyle(.switch)
         .tint(Color.auroraCyan)
-    }
-
-    // MARK: - Destination
-
-    private var destinationSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Default Destination")
-
-            HStack(spacing: 12) {
-                IconChip(systemName: "folder.fill", color: .auroraViolet)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(appState.destinationURL?.lastPathComponent ?? "Not set")
-                        .font(.manrope(13, weight: .bold))
-                        .foregroundStyle(Color.auroraTxt)
-                    Text(appState.destinationURL?.path ?? "Choose a folder for imports")
-                        .font(.manrope(11, weight: .medium))
-                        .foregroundStyle(Color.auroraFaint)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Button(action: chooseDestination) {
-                    Text("Choose…")
-                }
-                .buttonStyle(AuroraGhostButtonStyle())
-            }
-            .padding(.horizontal, 6)
-        }
-        .auroraStaticCard()
-    }
-
-    private func chooseDestination() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "Choose the default destination folder"
-        panel.prompt = "Select"
-        guard panel.runModal() == .OK, let url = panel.url,
-              let data = BookmarkManager.saveBookmark(for: url) else { return }
-        appState.destinationURL = url
-        appState.destinationBookmarkData = data
-        appState.log("Destination set to \(url.path)")
     }
 
     // MARK: - Data
