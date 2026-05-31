@@ -160,7 +160,7 @@ struct StatsViewAllSheetView: View {
             let events = EventAggregator.build(appState: appState)
                 .sorted { $0.totalFiles > $1.totalFiles }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
-                PhotosPerEventListRow(rank: idx + 1, event: event)
+                PhotosPerEventListRow(rank: idx + 1, event: event, appState: appState)
             }
         }
     }
@@ -173,9 +173,14 @@ private struct LatestSidebarOrderRow: View {
 
     var body: some View {
         let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
+        let bannerPath: String? = {
+            guard event.bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
+            let path = appState.eventFolderBannerImagePaths[event.bookmarkIndex]
+            return path.isEmpty ? nil : path
+        }()
         HStack(spacing: 12) {
             RankBadge(rank: rank)
-            EventThumbnail(eventName: event.name, folderPath: event.path)
+            EventThumbnail(eventName: event.name, folderPath: event.path, bannerImagePath: bannerPath)
                 .frame(width: 44, height: 34)
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.name)
@@ -197,12 +202,17 @@ private struct LatestSidebarOrderRow: View {
 private struct PhotosPerEventListRow: View {
     let rank: Int
     let event: EventAggregate
+    @Bindable var appState: AppState
 
     var body: some View {
         HStack(spacing: 12) {
             RankBadge(rank: rank)
-            EventThumbnail(eventName: event.name, folderPath: event.id)
-                .frame(width: 44, height: 34)
+            EventThumbnail(
+                eventName: event.name,
+                folderPath: event.id,
+                bannerImagePath: appState.bannerImagePath(forEventPath: event.id)
+            )
+            .frame(width: 44, height: 34)
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.name)
                     .font(.auroraEventName)

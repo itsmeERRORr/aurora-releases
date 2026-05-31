@@ -281,8 +281,8 @@ struct TopEventRow: View {
         Button(action: onTap) {
             HStack(spacing: 12) {
                 RankBadge(rank: rank)
-                EventRowThumbnail(
-                    name: event.aggregate.name,
+                EventThumbnail(
+                    eventName: event.aggregate.name,
                     folderPath: event.aggregate.id,
                     bannerImagePath: event.bannerImagePath
                 )
@@ -312,25 +312,6 @@ struct TopEventRow: View {
     }
 }
 
-/// Shared thumbnail for event list rows. Uses the banner photo when available,
-/// otherwise falls back to the generated gradient thumbnail.
-struct EventRowThumbnail: View {
-    let name: String
-    let folderPath: String
-    let bannerImagePath: String?
-
-    var body: some View {
-        if let path = bannerImagePath, let image = NSImage(contentsOfFile: path) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        } else {
-            EventThumbnail(eventName: name, folderPath: folderPath)
-        }
-    }
-}
-
 struct LatestEventRow: View {
     let rank: Int
     let event: LatestEventDisplay
@@ -342,8 +323,8 @@ struct LatestEventRow: View {
         Button(action: onTap) {
             HStack(spacing: 12) {
                 RankBadge(rank: rank)
-                EventRowThumbnail(
-                    name: event.aggregate.name,
+                EventThumbnail(
+                    eventName: event.aggregate.name,
                     folderPath: event.aggregate.id,
                     bannerImagePath: event.bannerImagePath
                 )
