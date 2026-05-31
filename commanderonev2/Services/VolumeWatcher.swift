@@ -121,6 +121,7 @@ final class VolumeWatcher {
             appState.mountedVolumes[idx] = activated
         }
         appState.log("Active volume set: \(info.name)")
+        NotificationCenter.default.post(name: .cardDetected, object: nil)
     }
 
     // Manual folder selection
@@ -244,4 +245,5 @@ final class VolumeWatcher {
 
 extension Notification.Name {
     static let startAutoImport = Notification.Name("startAutoImport")
+    static let cardDetected = Notification.Name("cardDetected")
 }

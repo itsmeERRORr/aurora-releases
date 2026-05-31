@@ -366,6 +366,10 @@ final class AppState {
     var eventFolderCachedCounts: [Int] = [] {
         didSet { saveCachedCounts() }
     }
+    /// Last known JPG/JPEG count per folder — shown when disk is offline.
+    var eventFolderCachedJPGCounts: [Int] = [] {
+        didSet { saveCachedJPGCounts() }
+    }
     /// Resolved folder paths (last known) — used to detect if destination overlaps with an event folder.
     var eventFolderCachedPaths: [String] = [] {
         didSet { saveCachedPaths() }
@@ -438,6 +442,10 @@ final class AppState {
         if let data = UserDefaults.standard.data(forKey: "eventFolderCachedCountsData"),
            let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
             eventFolderCachedCounts = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderCachedJPGCountsData"),
+           let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
+            eventFolderCachedJPGCounts = decoded
         }
         if let data = UserDefaults.standard.data(forKey: "eventFolderCachedPathsData"),
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
@@ -552,6 +560,11 @@ final class AppState {
         } else if eventFolderCachedCounts.count < n {
             eventFolderCachedCounts += Array(repeating: -1, count: n - eventFolderCachedCounts.count)
         }
+        if eventFolderCachedJPGCounts.count > n {
+            eventFolderCachedJPGCounts = Array(eventFolderCachedJPGCounts.prefix(n))
+        } else if eventFolderCachedJPGCounts.count < n {
+            eventFolderCachedJPGCounts += Array(repeating: -1, count: n - eventFolderCachedJPGCounts.count)
+        }
         if eventFolderCachedPaths.count > n {
             eventFolderCachedPaths = Array(eventFolderCachedPaths.prefix(n))
         } else if eventFolderCachedPaths.count < n {
@@ -614,6 +627,11 @@ final class AppState {
         UserDefaults.standard.set(data, forKey: "eventFolderCachedCountsData")
     }
 
+    private func saveCachedJPGCounts() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderCachedJPGCounts) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderCachedJPGCountsData")
+    }
+
     private func saveCachedPaths() {
         guard let data = try? PropertyListEncoder().encode(eventFolderCachedPaths) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderCachedPathsData")
@@ -636,6 +654,76 @@ final class AppState {
         if index < eventFolderCachedPaths.count {
             eventFolderCachedPaths[index] = path
         }
+    }
+
+    /// Recounts RAW and JPG/JPEG files for open, reachable event folders.
+    /// Finalized or offline events keep their cached values so historical totals stay stable.
+    func refreshEventFolderMediaCounts() {
+        guard !isRefreshingEventFolders, importState == .idle else { return }
+        syncCachedCounts()
+        syncFinalizedEventIDs()
+
+        let items = eventFolderBookmarks.enumerated().compactMap { index, bookmark -> (index: Int, bookmark: Data)? in
+            guard index < eventFolderFinalizedEventID.count, eventFolderFinalizedEventID[index] == nil else { return nil }
+            return (index, bookmark)
+        }
+        guard !items.isEmpty else { return }
+
+        isRefreshingEventFolders = true
+        let rawExtensions = supportedExtensions
+
+        Task {
+            var updates: [(index: Int, path: String, rawCount: Int, jpgCount: Int)] = []
+
+            for item in items {
+                guard let url = BookmarkManager.resolveBookmark(item.bookmark) else { continue }
+                let counts = await Task.detached(priority: .background) {
+                    Self.countMediaFiles(at: url, rawExtensions: rawExtensions)
+                }.value
+                guard counts.isReachable else { continue }
+                updates.append((item.index, url.path, counts.rawCount, counts.jpgCount))
+            }
+
+            for update in updates {
+                guard update.index < eventFolderCachedCounts.count else { continue }
+                eventFolderCachedCounts[update.index] = update.rawCount
+                setEventFolderPeakIfHigher(at: update.index, count: update.rawCount)
+                if update.index < eventFolderCachedJPGCounts.count {
+                    eventFolderCachedJPGCounts[update.index] = update.jpgCount
+                }
+                if update.index < eventFolderCachedPaths.count {
+                    eventFolderCachedPaths[update.index] = update.path
+                }
+            }
+
+            isRefreshingEventFolders = false
+            if !updates.isEmpty {
+                log("Updated media counts for \(updates.count) event folder\(updates.count == 1 ? "" : "s")")
+            }
+        }
+    }
+
+    nonisolated private static func countMediaFiles(at url: URL, rawExtensions: Set<String>) -> (isReachable: Bool, rawCount: Int, jpgCount: Int) {
+        let fm = FileManager.default
+        guard (try? url.checkResourceIsReachable()) ?? false else { return (false, 0, 0) }
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return (false, 0, 0) }
+
+        var rawCount = 0
+        var jpgCount = 0
+        for case let fileURL as URL in enumerator {
+            guard (try? fileURL.checkResourceIsReachable()) ?? false else { continue }
+            let ext = fileURL.pathExtension.lowercased()
+            if rawExtensions.contains(ext) {
+                rawCount += 1
+            } else if ext == "jpg" || ext == "jpeg" {
+                jpgCount += 1
+            }
+        }
+        return (true, rawCount, jpgCount)
     }
 
     /// Returns aggregated import stats for a specific event folder path.
@@ -691,6 +779,7 @@ final class AppState {
         // Resolve immediately so the cached path is populated for this session
         // (otherwise EventStatsView thinks the folder is unreachable).
         refreshEventFolderCachedPaths()
+        refreshEventFolderMediaCounts()
     }
 
     func removeEventFolder(at index: Int) {
@@ -699,6 +788,7 @@ final class AppState {
         // so that when eventFolderBookmarks.didSet fires syncCachedCounts the arrays are already
         // the right length (no-op). This also fixes multi-folder removal correctness.
         if index < eventFolderCachedCounts.count { eventFolderCachedCounts.remove(at: index) }
+        if index < eventFolderCachedJPGCounts.count { eventFolderCachedJPGCounts.remove(at: index) }
         if index < eventFolderCachedPaths.count  { eventFolderCachedPaths.remove(at: index)  }
         if index < eventFolderPreviousCachedPaths.count { eventFolderPreviousCachedPaths.remove(at: index) }
         if index < eventFolderBannerImagePaths.count {

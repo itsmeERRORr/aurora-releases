@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var showAutoImportOverlay = false
     @State private var autoImportCountdown = 5
     @State private var autoImportTask: Task<Void, Never>?
+    @State private var eventCountsRefreshTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -53,6 +54,10 @@ struct ContentView: View {
         .background(TransparentTitleBar())
         #endif
         .onAppear { setupServices() }
+        .onDisappear { stopEventCountsRefreshTimer() }
+        .onReceive(NotificationCenter.default.publisher(for: .cardDetected)) { _ in
+            selectedNavItem = .dashboard
+        }
         .onReceive(NotificationCenter.default.publisher(for: .startAutoImport)) { _ in
             startAutoImportCountdown()
         }
@@ -124,11 +129,31 @@ struct ContentView: View {
     }
 
     private func setupServices() {
+        guard volumeWatcher == nil else { return }
         let watcher = VolumeWatcher(appState: appState)
         volumeWatcher = watcher
         statsRunner = StatsRunner(appState: appState)
         watcher.startWatching()
+        startEventCountsRefreshTimer()
         appState.log("App started — João's Photos v1.0")
+    }
+
+    private func startEventCountsRefreshTimer() {
+        guard eventCountsRefreshTask == nil else { return }
+        appState.refreshEventFolderMediaCounts()
+
+        eventCountsRefreshTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(600))
+                if Task.isCancelled { return }
+                appState.refreshEventFolderMediaCounts()
+            }
+        }
+    }
+
+    private func stopEventCountsRefreshTimer() {
+        eventCountsRefreshTask?.cancel()
+        eventCountsRefreshTask = nil
     }
 
     // MARK: - Auto-import overlay
