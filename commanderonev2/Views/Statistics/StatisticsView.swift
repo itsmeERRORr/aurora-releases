@@ -133,6 +133,12 @@ struct StatsViewAllSheetView: View {
         case .topEvents:
             let events = EventAggregator.build(appState: appState)
                 .sorted { $0.totalBytes > $1.totalBytes }
+                .map { aggregate in
+                    LatestEventDisplay(
+                        aggregate: aggregate,
+                        bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
+                    )
+                }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
                 TopEventRow(rank: idx + 1, event: event) {}
             }

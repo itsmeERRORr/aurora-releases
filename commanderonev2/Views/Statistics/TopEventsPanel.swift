@@ -155,6 +155,12 @@ struct TopEventsPanel: View {
             let sorted = EventAggregator.build(appState: appState)
                 .sorted { $0.totalBytes > $1.totalBytes }
                 .prefix(5)
+                .map { aggregate in
+                    LatestEventDisplay(
+                        aggregate: aggregate,
+                        bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
+                    )
+                }
 
             if sorted.isEmpty {
                 emptyState
@@ -162,7 +168,7 @@ struct TopEventsPanel: View {
                 VStack(spacing: 4) {
                     ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, event in
                         TopEventRow(rank: idx + 1, event: event) {
-                            onSelect(event)
+                            onSelect(event.aggregate)
                         }
                     }
                 }
@@ -266,7 +272,7 @@ struct LatestEventDisplay: Identifiable {
 
 struct TopEventRow: View {
     let rank: Int
-    let event: EventAggregate
+    let event: LatestEventDisplay
     var onTap: () -> Void
 
     @State private var hovering = false
@@ -275,20 +281,24 @@ struct TopEventRow: View {
         Button(action: onTap) {
             HStack(spacing: 12) {
                 RankBadge(rank: rank)
-                EventThumbnail(eventName: event.name, folderPath: event.id)
-                    .frame(width: 44, height: 34)
+                EventRowThumbnail(
+                    name: event.aggregate.name,
+                    folderPath: event.aggregate.id,
+                    bannerImagePath: event.bannerImagePath
+                )
+                .frame(width: 44, height: 34)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(event.name)
+                    Text(event.aggregate.name)
                         .font(.auroraEventName)
                         .foregroundStyle(Color.auroraTxt)
                         .lineLimit(1)
-                    let parts = AuroraFormat.bytesParts(event.totalBytes)
+                    let parts = AuroraFormat.bytesParts(event.aggregate.totalBytes)
                     Text("\(parts.value) \(parts.unit)")
                         .font(.manrope(11, weight: .semibold))
                         .foregroundStyle(Color.auroraFaint)
                 }
                 Spacer(minLength: 4)
-                SpeedPill(text: AuroraFormat.count(event.totalFiles), tint: .auroraCyan)
+                SpeedPill(text: AuroraFormat.count(event.aggregate.totalFiles), tint: .auroraCyan)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -299,6 +309,25 @@ struct TopEventRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+/// Shared thumbnail for event list rows. Uses the banner photo when available,
+/// otherwise falls back to the generated gradient thumbnail.
+struct EventRowThumbnail: View {
+    let name: String
+    let folderPath: String
+    let bannerImagePath: String?
+
+    var body: some View {
+        if let path = bannerImagePath, let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+            EventThumbnail(eventName: name, folderPath: folderPath)
+        }
     }
 }
 
@@ -313,8 +342,12 @@ struct LatestEventRow: View {
         Button(action: onTap) {
             HStack(spacing: 12) {
                 RankBadge(rank: rank)
-                latestThumbnail
-                    .frame(width: 44, height: 34)
+                EventRowThumbnail(
+                    name: event.aggregate.name,
+                    folderPath: event.aggregate.id,
+                    bannerImagePath: event.bannerImagePath
+                )
+                .frame(width: 44, height: 34)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(event.aggregate.name)
                         .font(.auroraEventName)
@@ -336,18 +369,6 @@ struct LatestEventRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-    }
-
-    @ViewBuilder
-    private var latestThumbnail: some View {
-        if let path = event.bannerImagePath, let image = NSImage(contentsOfFile: path) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        } else {
-            EventThumbnail(eventName: event.aggregate.name, folderPath: event.aggregate.id)
-        }
     }
 
     private var dateText: String {

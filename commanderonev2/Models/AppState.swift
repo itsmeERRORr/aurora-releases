@@ -880,6 +880,29 @@ final class AppState {
         log("Cleared event banner image")
     }
 
+    /// Returns the cached banner image path for the bookmark whose cached or previous
+    /// resolved path matches the given event path. Used by event list rows that only
+    /// know the event's folder path (not its bookmark index).
+    func bannerImagePath(forEventPath eventPath: String) -> String? {
+        guard !eventPath.isEmpty else { return nil }
+        let norm = normalizePath(eventPath)
+        for index in eventFolderBookmarks.indices {
+            let current = index < eventFolderCachedPaths.count
+                ? normalizePath(eventFolderCachedPaths[index]) : ""
+            let previous = index < eventFolderPreviousCachedPaths.count
+                ? normalizePath(eventFolderPreviousCachedPaths[index]) : ""
+            let matchesCurrent = !current.isEmpty &&
+                (current == norm || current.hasPrefix(norm + "/") || norm.hasPrefix(current + "/"))
+            let matchesPrevious = !previous.isEmpty &&
+                (previous == norm || previous.hasPrefix(norm + "/") || norm.hasPrefix(previous + "/"))
+            guard matchesCurrent || matchesPrevious else { continue }
+            guard index < eventFolderBannerImagePaths.count else { continue }
+            let path = eventFolderBannerImagePaths[index]
+            if !path.isEmpty { return path }
+        }
+        return nil
+    }
+
     func setEventFolderDisplayName(at index: Int, name: String) {
         guard index >= 0, index < eventFolderDisplayNames.count else { return }
         eventFolderDisplayNames[index] = name.trimmingCharacters(in: .whitespacesAndNewlines)
