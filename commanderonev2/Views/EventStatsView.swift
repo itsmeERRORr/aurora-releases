@@ -89,53 +89,51 @@ struct EventStatsView: View {
     }
 
     private var eventBannerCard: some View {
-        ZStack(alignment: .top) {
-            bannerCardBackground
-
-            // Strong dark gradient at the top guarantees the header text is readable
-            // no matter what the banner photo looks like underneath.
-            LinearGradient(
-                colors: [Color.black.opacity(0.78), Color.black.opacity(0.45), Color.black.opacity(0.0)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 120)
-            .frame(maxWidth: .infinity, alignment: .top)
-            .allowsHitTesting(false)
-
-            // Softer gradient at the bottom for the photos-imported caption.
-            LinearGradient(
-                colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 90)
-            .frame(maxWidth: .infinity, alignment: .bottom)
-            .allowsHitTesting(false)
-
-            VStack(spacing: 0) {
+        bannerCardBackground
+            .frame(maxWidth: .infinity)
+            .frame(height: 400)
+            .clipped()
+            // Header (gradient + title + controls) overlaid at the top
+            .overlay(alignment: .top) {
                 bannerHeader
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                Spacer(minLength: 0)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        LinearGradient(
+                            colors: [Color.black.opacity(0.78), Color.black.opacity(0.45), Color.black.opacity(0.0)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: 130)
+                        .frame(maxHeight: .infinity, alignment: .top)
+                        .allowsHitTesting(false)
+                    )
+            }
+            // Photos-imported caption overlaid at the bottom
+            .overlay(alignment: .bottomLeading) {
                 if let summary = importSummary {
-                    HStack {
-                        Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
-                            .font(.manrope(12, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.92))
-                        Spacer()
-                    }
-                    .padding(18)
+                    Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
+                        .font(.manrope(12, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .shadow(color: Color.black.opacity(0.6), radius: 6, x: 0, y: 2)
+                        .padding(18)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            LinearGradient(
+                                colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .allowsHitTesting(false)
+                        )
                 }
             }
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 400)
-        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
-                .strokeBorder(Color.auroraStroke, lineWidth: 1)
-        )
+            .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                    .strokeBorder(Color.auroraStroke, lineWidth: 1)
+            )
     }
 
     @ViewBuilder
