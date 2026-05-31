@@ -89,33 +89,48 @@ struct EventStatsView: View {
     }
 
     private var eventBannerCard: some View {
-        VStack(spacing: 0) {
-            bannerHeader
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity)
-                .background(Color.auroraPanel2)
+        ZStack(alignment: .top) {
+            bannerCardBackground
 
-            ZStack(alignment: .bottomLeading) {
-                bannerCardBackground
+            // Strong dark gradient at the top guarantees the header text is readable
+            // no matter what the banner photo looks like underneath.
+            LinearGradient(
+                colors: [Color.black.opacity(0.78), Color.black.opacity(0.45), Color.black.opacity(0.0)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 120)
+            .frame(maxWidth: .infinity, alignment: .top)
+            .allowsHitTesting(false)
 
-                LinearGradient(
-                    colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
+            // Softer gradient at the bottom for the photos-imported caption.
+            LinearGradient(
+                colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 90)
+            .frame(maxWidth: .infinity, alignment: .bottom)
+            .allowsHitTesting(false)
 
+            VStack(spacing: 0) {
+                bannerHeader
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                Spacer(minLength: 0)
                 if let summary = importSummary {
-                    Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
-                        .font(.manrope(12, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(18)
+                    HStack {
+                        Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
+                            .font(.manrope(12, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.92))
+                        Spacer()
+                    }
+                    .padding(18)
                 }
             }
-            .frame(height: 340)
-            .clipped()
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 400)
         .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
@@ -146,18 +161,21 @@ struct EventStatsView: View {
             Image(systemName: "folder.fill")
                 .foregroundStyle(Color.auroraViolet)
                 .font(.system(size: 18, weight: .bold))
+                .shadow(color: Color.black.opacity(0.55), radius: 6, x: 0, y: 2)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(eventName)
                     .font(.sora(21, weight: .bold))
                     .tracking(-0.3)
-                    .foregroundStyle(Color.auroraTxt)
+                    .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
                 if let date = scanDate {
                     Text("Last scan: \(date.formatted(date: .abbreviated, time: .omitted))")
                         .font(.manrope(11, weight: .semibold))
-                        .foregroundStyle(Color.auroraFaint)
+                        .foregroundStyle(.white.opacity(0.78))
+                        .shadow(color: Color.black.opacity(0.6), radius: 6, x: 0, y: 1)
                 }
             }
 
@@ -166,7 +184,7 @@ struct EventStatsView: View {
             if isLoading {
                 ProgressView()
                     .scaleEffect(0.8)
-                    .tint(Color.auroraTxt)
+                    .tint(Color.white)
             } else if diskIsReachable {
                 Button {
                     loadEventStats()
