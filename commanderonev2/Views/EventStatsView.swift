@@ -89,28 +89,33 @@ struct EventStatsView: View {
     }
 
     private var eventBannerCard: some View {
-        ZStack(alignment: .topLeading) {
-            bannerCardBackground
+        VStack(spacing: 0) {
+            bannerHeader
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity)
+                .background(Color.auroraPanel2)
 
-            LinearGradient(
-                colors: [Color.black.opacity(0.72), Color.black.opacity(0.12), Color.black.opacity(0.55)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+            ZStack(alignment: .bottomLeading) {
+                bannerCardBackground
 
-            VStack(alignment: .leading, spacing: 0) {
-                bannerHeader
-                Spacer()
+                LinearGradient(
+                    colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
                 if let summary = importSummary {
                     Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
                         .font(.manrope(12, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.82))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(18)
                 }
             }
-            .padding(18)
+            .frame(height: 340)
+            .clipped()
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 400)
         .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
@@ -146,13 +151,13 @@ struct EventStatsView: View {
                 Text(eventName)
                     .font(.sora(21, weight: .bold))
                     .tracking(-0.3)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color.auroraTxt)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let date = scanDate {
                     Text("Last scan: \(date.formatted(date: .abbreviated, time: .omitted))")
                         .font(.manrope(11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.68))
+                        .foregroundStyle(Color.auroraFaint)
                 }
             }
 
@@ -161,7 +166,7 @@ struct EventStatsView: View {
             if isLoading {
                 ProgressView()
                     .scaleEffect(0.8)
-                    .tint(Color.white)
+                    .tint(Color.auroraTxt)
             } else if diskIsReachable {
                 Button {
                     loadEventStats()
@@ -174,17 +179,6 @@ struct EventStatsView: View {
 
             bannerMenu
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.black.opacity(0.42))
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
-        )
     }
 
     @ViewBuilder
@@ -207,11 +201,9 @@ struct EventStatsView: View {
                     .padding(.vertical, 7)
                     .background(
                         Capsule()
-                            .fill(Color.auroraViolet.opacity(0.82))
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .fill(Color.auroraViolet.opacity(0.92))
                     )
                     .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
-                    .shadow(color: Color.black.opacity(0.35), radius: 10, x: 0, y: 5)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
