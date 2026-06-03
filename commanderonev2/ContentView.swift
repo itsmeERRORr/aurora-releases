@@ -27,7 +27,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                         if showProgressOverlay {
-                            Color.black.opacity(0.35).ignoresSafeArea()
+                            Color.black.opacity(0.55).ignoresSafeArea()
                             ProgressOverlayView(
                                 appState: appState,
                                 onPause: pauseImport,
@@ -36,7 +36,7 @@ struct ContentView: View {
                             )
                         }
                         if showAutoImportOverlay {
-                            Color.black.opacity(0.35).ignoresSafeArea()
+                            Color.black.opacity(0.55).ignoresSafeArea()
                             autoImportOverlay
                         }
                     }
@@ -193,7 +193,14 @@ struct ContentView: View {
         }
         .padding(24)
         .frame(width: 440)
-        .auroraStaticCard(radius: AuroraRadius.large)
+        .background(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .fill(Color.auroraBg2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke, lineWidth: 1)
+        )
         .shadow(color: .black.opacity(0.55), radius: 30, x: 0, y: 16)
     }
 

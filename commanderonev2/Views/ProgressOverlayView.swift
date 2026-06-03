@@ -31,7 +31,19 @@ struct ProgressOverlayView: View {
         }
         .padding(24)
         .frame(width: 520)
-        .auroraStaticCard(radius: AuroraRadius.large, paddingH: 22, paddingV: 22)
+        .background(
+            // Solid opaque modal background so the card actually obscures the
+            // app behind it. The default auroraStaticCard fill is
+            // Color.white.opacity(0.035) — meant for in-page panels sitting
+            // on top of the app background — and is effectively invisible
+            // when used as a free-floating modal over a scrim.
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .fill(Color.auroraBg2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke, lineWidth: 1)
+        )
         .shadow(color: .black.opacity(0.55), radius: 30, x: 0, y: 16)
     }
 
