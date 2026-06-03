@@ -6,5 +6,7 @@
 	<string>João's Photos</string>
 	<key>CFBundleName</key>
 	<string>João's Photos</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>João's Photos needs access to removable camera cards to detect and import RAW files.</string>
 </dict>
 </plist>
