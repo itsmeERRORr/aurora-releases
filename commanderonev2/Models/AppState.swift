@@ -37,6 +37,11 @@ struct VolumeInfo: Identifiable, Equatable, Hashable {
     var isActive: Bool = false
 }
 
+struct EventBannerOffset: Equatable, Codable {
+    var x: Double = 0
+    var y: Double = 0
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -112,17 +117,33 @@ final class AppState {
         didSet { saveFinalizedEventIDs() }
     }
 
+    /// Manual sidebar order. Values are bookmark indices; moving rows changes only this array.
+    var eventFolderOrder: [Int] = [] {
+        didSet { saveEventFolderOrder() }
+    }
+
     // MARK: - Import History
     var importHistory: [ImportHistoryEntry] = []
 
     /// All configured event folders, shown in the Events sidebar.
-    /// Same set as "Most Photos per event" in Statistics — all bookmarked folders, regardless of
-    /// whether they have import history. Sorted in two groups:
-    ///   1. Open (non-finalized) events, newest activity first.
-    ///   2. Finalized events, newest activity first (using snapshot date as fallback).
-    /// Within each group ties break by insertion order *descending* so the most recently
-    /// added bookmark comes first.
+    /// The order is user-controlled via drag/drop; new events are inserted at the top.
     var uniqueImportDestinations: [(path: String, name: String, bookmarkIndex: Int)] {
+        normalizedEventFolderOrder().compactMap { index in
+            guard index >= 0, index < eventFolderBookmarks.count else { return nil }
+            let folderPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+            let customName = index < eventFolderDisplayNames.count ? eventFolderDisplayNames[index] : ""
+            let folderName: String
+            if !folderPath.isEmpty {
+                folderName = URL(fileURLWithPath: folderPath).lastPathComponent
+            } else {
+                folderName = customName.isEmpty ? "Event \(index + 1)" : customName
+            }
+            let name = customName.isEmpty ? folderName : customName
+            return (path: folderPath, name: name, bookmarkIndex: index)
+        }
+    }
+
+    private func defaultEventFolderOrder() -> [Int] {
         var result: [(path: String, name: String, lastDate: Date, isFinalized: Bool, index: Int)] = []
 
         for index in eventFolderBookmarks.indices {
@@ -168,7 +189,25 @@ final class AppState {
                 // Tie-break: most recently added bookmark first.
                 return lhs.index > rhs.index
             }
-            .map { (path: $0.path, name: $0.name, bookmarkIndex: $0.index) }
+            .map(\.index)
+    }
+
+    private func normalizedEventFolderOrder() -> [Int] {
+        let count = eventFolderBookmarks.count
+        guard count > 0 else { return [] }
+
+        var seen = Set<Int>()
+        var order = (eventFolderOrder.isEmpty ? defaultEventFolderOrder() : eventFolderOrder)
+            .filter { index in
+                guard index >= 0, index < count, !seen.contains(index) else { return false }
+                seen.insert(index)
+                return true
+            }
+
+        for index in eventFolderBookmarks.indices where !seen.contains(index) {
+            order.append(index)
+        }
+        return order
     }
 
     var photosByMonth: [(month: String, count: Int)] {
@@ -385,6 +424,9 @@ final class AppState {
     var eventFolderBannerImagePaths: [String] = [] {
         didSet { saveBannerImagePaths() }
     }
+    var eventFolderBannerOffsets: [EventBannerOffset] = [] {
+        didSet { saveBannerOffsets() }
+    }
 
     // MARK: - Configuration
     /// RAW extensions: Sony ARW, Canon CR2/CR3, Adobe/Leica/Ricoh DNG
@@ -459,6 +501,10 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
             eventFolderBannerImagePaths = decoded
         }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderBannerOffsetsData"),
+           let decoded = try? PropertyListDecoder().decode([EventBannerOffset].self, from: data) {
+            eventFolderBannerOffsets = decoded
+        }
         // Load event folder bookmarks (o didSet chama syncDisplayNamesCount e syncPeakCounts)
         if let data = UserDefaults.standard.data(forKey: "eventFolderBookmarksData"),
            let decoded = try? PropertyListDecoder().decode([Data].self, from: data) {
@@ -472,11 +518,16 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
             eventFolderFinalizedEventID = decoded.map { $0.isEmpty ? nil : UUID(uuidString: $0) }
         }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderOrderData"),
+           let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
+            eventFolderOrder = decoded
+        }
 
         syncDisplayNamesCount()
         syncPeakCounts()
         syncCachedCounts()
         syncFinalizedEventIDs()
+        syncEventFolderOrder()
         refreshEventFolderCachedPaths()
         reconcileOrphanFinalizedEvents()
     }
@@ -493,8 +544,23 @@ final class AppState {
         var didChange = false
         for index in eventFolderBookmarks.indices {
             guard index < eventFolderCachedPaths.count else { continue }
+
+            // Skip finalized events entirely — their snapshot is canonical, so we
+            // gain nothing by re-resolving the bookmark, and resolution can
+            // prompt macOS to mount a network volume (e.g. NAS) the user is not
+            // currently connected to.
+            if index < eventFolderFinalizedEventID.count,
+               eventFolderFinalizedEventID[index] != nil {
+                continue
+            }
+
             let data = eventFolderBookmarks[index]
-            guard let url = BookmarkManager.resolveBookmark(data) else { continue }
+            // Use the no-mount variant so non-finalized bookmarks pointing to an
+            // offline volume don't trigger a "connect to server" prompt either.
+            // The cached path is already correct from when the user was last
+            // connected; refusing to refresh just leaves it as-is.
+            guard let url = BookmarkManager.resolveBookmarkWithoutMounting(data) else { continue }
+
             // Only overwrite when resolution succeeds — preserves last-known path on offline.
             if eventFolderCachedPaths[index] != url.path {
                 eventFolderCachedPaths[index] = url.path
@@ -580,6 +646,11 @@ final class AppState {
         } else if eventFolderBannerImagePaths.count < n {
             eventFolderBannerImagePaths += Array(repeating: "", count: n - eventFolderBannerImagePaths.count)
         }
+        if eventFolderBannerOffsets.count > n {
+            eventFolderBannerOffsets = Array(eventFolderBannerOffsets.prefix(n))
+        } else if eventFolderBannerOffsets.count < n {
+            eventFolderBannerOffsets += Array(repeating: EventBannerOffset(), count: n - eventFolderBannerOffsets.count)
+        }
     }
 
     private func syncFinalizedEventIDs() {
@@ -591,10 +662,39 @@ final class AppState {
         }
     }
 
+    private func syncEventFolderOrder() {
+        let normalized = normalizedEventFolderOrder()
+        if eventFolderOrder != normalized {
+            eventFolderOrder = normalized
+        }
+    }
+
+    func moveEventFolders(from source: IndexSet, to destination: Int) {
+        var order = normalizedEventFolderOrder()
+        order.move(fromOffsets: source, toOffset: destination)
+        eventFolderOrder = order
+    }
+
+    func moveEventFolder(bookmarkIndex: Int, before targetBookmarkIndex: Int) {
+        guard bookmarkIndex != targetBookmarkIndex else { return }
+        var order = normalizedEventFolderOrder()
+        guard let sourceIndex = order.firstIndex(of: bookmarkIndex) else { return }
+
+        let moving = order.remove(at: sourceIndex)
+        guard let targetIndex = order.firstIndex(of: targetBookmarkIndex) else { return }
+        order.insert(moving, at: targetIndex)
+        eventFolderOrder = order
+    }
+
     private func saveFinalizedEventIDs() {
         let strings: [String] = eventFolderFinalizedEventID.map { $0?.uuidString ?? "" }
         guard let data = try? PropertyListEncoder().encode(strings) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderFinalizedEventIDData")
+    }
+
+    private func saveEventFolderOrder() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderOrder) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderOrderData")
     }
 
     private func savePreviousCachedPaths() {
@@ -605,6 +705,11 @@ final class AppState {
     private func saveBannerImagePaths() {
         guard let data = try? PropertyListEncoder().encode(eventFolderBannerImagePaths) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderBannerImagePathsData")
+    }
+
+    private func saveBannerOffsets() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderBannerOffsets) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderBannerOffsetsData")
     }
 
     private func saveEventFolderBookmarks() {
@@ -676,7 +781,10 @@ final class AppState {
             var updates: [(index: Int, path: String, rawCount: Int, jpgCount: Int)] = []
 
             for item in items {
-                guard let url = BookmarkManager.resolveBookmark(item.bookmark) else { continue }
+                // Use no-mount resolution: this runs in the background on app activation
+                // and we don't want it triggering a "connect to server" dialog for an
+                // offline NAS bookmark.
+                guard let url = BookmarkManager.resolveBookmarkWithoutMounting(item.bookmark) else { continue }
                 let counts = await Task.detached(priority: .background) {
                     Self.countMediaFiles(at: url, rawExtensions: rawExtensions)
                 }.value
@@ -700,6 +808,57 @@ final class AppState {
             if !updates.isEmpty {
                 log("Updated media counts for \(updates.count) event folder\(updates.count == 1 ? "" : "s")")
             }
+        }
+    }
+
+    func refreshEventFolderMediaCount(at index: Int, refreshRAW: Bool, refreshJPG: Bool) {
+        guard !isRefreshingEventFolders, importState == .idle else { return }
+        guard index >= 0, index < eventFolderBookmarks.count else { return }
+        syncCachedCounts()
+        syncFinalizedEventIDs()
+        guard index < eventFolderFinalizedEventID.count, eventFolderFinalizedEventID[index] == nil else {
+            log("Skipped media refresh for finalized event", level: .warning)
+            return
+        }
+        guard refreshRAW || refreshJPG else { return }
+
+        isRefreshingEventFolders = true
+        let bookmark = eventFolderBookmarks[index]
+        let rawExtensions = supportedExtensions
+
+        Task {
+            // No-mount resolution: avoid prompting the user to connect to an
+            // offline server if the bookmark points to a network share.
+            guard let url = BookmarkManager.resolveBookmarkWithoutMounting(bookmark) else {
+                isRefreshingEventFolders = false
+                log("Could not resolve event folder bookmark", level: .warning)
+                return
+            }
+
+            let counts = await Task.detached(priority: .background) {
+                Self.countMediaFiles(at: url, rawExtensions: rawExtensions)
+            }.value
+
+            guard counts.isReachable else {
+                isRefreshingEventFolders = false
+                log("Event folder is not reachable: \(url.path)", level: .warning)
+                return
+            }
+
+            if refreshRAW, index < eventFolderCachedCounts.count {
+                eventFolderCachedCounts[index] = counts.rawCount
+                setEventFolderPeakIfHigher(at: index, count: counts.rawCount)
+            }
+            if refreshJPG, index < eventFolderCachedJPGCounts.count {
+                eventFolderCachedJPGCounts[index] = counts.jpgCount
+            }
+            if index < eventFolderCachedPaths.count {
+                eventFolderCachedPaths[index] = url.path
+            }
+
+            isRefreshingEventFolders = false
+            let kinds = [refreshRAW ? "RAW" : nil, refreshJPG ? "JPG" : nil].compactMap { $0 }.joined(separator: "/")
+            log("Updated \(kinds) count for event folder")
         }
     }
 
@@ -775,6 +934,10 @@ final class AppState {
 
     func addEventFolder(bookmark: Data) {
         eventFolderBookmarks.append(bookmark)
+        let newIndex = eventFolderBookmarks.count - 1
+        var order = normalizedEventFolderOrder().filter { $0 != newIndex }
+        order.insert(newIndex, at: 0)
+        eventFolderOrder = order
         // syncDisplayNamesCount() in didSet will append "" for the new folder.
         // Resolve immediately so the cached path is populated for this session
         // (otherwise EventStatsView thinks the folder is unreachable).
@@ -796,9 +959,14 @@ final class AppState {
             if !bannerPath.isEmpty { try? FileManager.default.removeItem(atPath: bannerPath) }
             eventFolderBannerImagePaths.remove(at: index)
         }
+        if index < eventFolderBannerOffsets.count { eventFolderBannerOffsets.remove(at: index) }
         if index < eventFolderDisplayNames.count { eventFolderDisplayNames.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
         if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
+        eventFolderOrder = eventFolderOrder.compactMap { orderedIndex in
+            if orderedIndex == index { return nil }
+            return orderedIndex > index ? orderedIndex - 1 : orderedIndex
+        }
         // Clean up scanning indicator: remove the deleted index and shift higher indices down by 1
         eventFolderScanningIndices.remove(index)
         eventFolderScanningIndices = Set(eventFolderScanningIndices.map { $0 > index ? $0 - 1 : $0 })
@@ -862,6 +1030,7 @@ final class AppState {
                 paths[index] = cachedURL.path
                 eventFolderBannerImagePaths = paths
             }
+            resetEventFolderBannerOffset(at: index)
             log("Updated event banner image")
             return true
         } catch {
@@ -877,7 +1046,38 @@ final class AppState {
         if !path.isEmpty { try? FileManager.default.removeItem(atPath: path) }
         paths[index] = ""
         eventFolderBannerImagePaths = paths
+        resetEventFolderBannerOffset(at: index)
         log("Cleared event banner image")
+    }
+
+    func bannerOffsetForEvent(at index: Int) -> EventBannerOffset {
+        guard index >= 0, index < eventFolderBannerOffsets.count else { return EventBannerOffset() }
+        return eventFolderBannerOffsets[index]
+    }
+
+    func adjustEventFolderBannerOffset(at index: Int, dx: Double, dy: Double) {
+        guard index >= 0, index < eventFolderBannerOffsets.count else { return }
+        var offsets = eventFolderBannerOffsets
+        offsets[index].x = min(500, max(-500, offsets[index].x + dx))
+        offsets[index].y = min(500, max(-500, offsets[index].y + dy))
+        eventFolderBannerOffsets = offsets
+    }
+
+    func setEventFolderBannerOffset(at index: Int, offset: EventBannerOffset) {
+        guard index >= 0, index < eventFolderBannerOffsets.count else { return }
+        var offsets = eventFolderBannerOffsets
+        offsets[index] = EventBannerOffset(
+            x: min(500, max(-500, offset.x)),
+            y: min(500, max(-500, offset.y))
+        )
+        eventFolderBannerOffsets = offsets
+    }
+
+    func resetEventFolderBannerOffset(at index: Int) {
+        guard index >= 0, index < eventFolderBannerOffsets.count else { return }
+        var offsets = eventFolderBannerOffsets
+        offsets[index] = EventBannerOffset()
+        eventFolderBannerOffsets = offsets
     }
 
     /// Returns the cached banner image path for the bookmark whose cached or previous
@@ -903,9 +1103,23 @@ final class AppState {
         return nil
     }
 
+    func displayNameForEvent(at index: Int) -> String? {
+        guard index >= 0, index < eventFolderBookmarks.count else { return nil }
+        let customName = index < eventFolderDisplayNames.count
+            ? eventFolderDisplayNames[index].trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        if !customName.isEmpty { return customName }
+
+        let path = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        if !path.isEmpty { return URL(fileURLWithPath: path).lastPathComponent }
+        return "Event \(index + 1)"
+    }
+
     func setEventFolderDisplayName(at index: Int, name: String) {
         guard index >= 0, index < eventFolderDisplayNames.count else { return }
-        eventFolderDisplayNames[index] = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var names = eventFolderDisplayNames
+        names[index] = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        eventFolderDisplayNames = names
     }
 
     // MARK: - Finalize / Reopen
