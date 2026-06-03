@@ -1,9 +1,12 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct AuroraSidebarView: View {
     @Binding var selectedItem: NavigationItem
     @Bindable var appState: AppState
+    @State private var draggedEventBookmarkIndex: Int?
+    @State private var dropTargetBookmarkIndex: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -114,8 +117,32 @@ struct AuroraSidebarView: View {
         } else {
             ScrollView {
                 VStack(spacing: 2) {
-                    ForEach(Array(events.enumerated()), id: \.offset) { idx, event in
+                    ForEach(Array(events.enumerated()), id: \.element.bookmarkIndex) { idx, event in
                         eventRow(idx: idx, event: event)
+                            .opacity(draggedEventBookmarkIndex == event.bookmarkIndex ? 0.45 : 1)
+                            .overlay(alignment: .top) {
+                                if dropTargetBookmarkIndex == event.bookmarkIndex,
+                                   draggedEventBookmarkIndex != event.bookmarkIndex {
+                                    Capsule()
+                                        .fill(Color.auroraCyan)
+                                        .frame(height: 2)
+                                        .padding(.horizontal, 12)
+                                }
+                            }
+                            .onDrag {
+                                draggedEventBookmarkIndex = event.bookmarkIndex
+                                return NSItemProvider(object: String(event.bookmarkIndex) as NSString)
+                            }
+                            .onDrop(
+                                of: [.plainText],
+                                delegate: EventSidebarDropDelegate(
+                                    targetBookmarkIndex: event.bookmarkIndex,
+                                    draggedBookmarkIndex: $draggedEventBookmarkIndex,
+                                    dropTargetBookmarkIndex: $dropTargetBookmarkIndex,
+                                    selectedItem: $selectedItem,
+                                    appState: appState
+                                )
+                            )
                     }
                 }
                 .padding(.horizontal, 10)
@@ -270,6 +297,56 @@ struct AuroraSidebarView: View {
     }
 }
 
+private struct EventSidebarDropDelegate: DropDelegate {
+    let targetBookmarkIndex: Int
+    @Binding var draggedBookmarkIndex: Int?
+    @Binding var dropTargetBookmarkIndex: Int?
+    @Binding var selectedItem: NavigationItem
+    let appState: AppState
+
+    func validateDrop(info: DropInfo) -> Bool {
+        draggedBookmarkIndex != nil
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedBookmarkIndex,
+              draggedBookmarkIndex != targetBookmarkIndex else { return }
+
+        let selectedBookmarkIndex = currentSelectedBookmarkIndex()
+        dropTargetBookmarkIndex = targetBookmarkIndex
+
+        withAnimation(.easeInOut(duration: 0.16)) {
+            appState.moveEventFolder(bookmarkIndex: draggedBookmarkIndex, before: targetBookmarkIndex)
+            restoreSelection(bookmarkIndex: selectedBookmarkIndex)
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetBookmarkIndex == targetBookmarkIndex {
+            dropTargetBookmarkIndex = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        dropTargetBookmarkIndex = nil
+        draggedBookmarkIndex = nil
+        return true
+    }
+
+    private func currentSelectedBookmarkIndex() -> Int? {
+        guard case .event(let index) = selectedItem else { return nil }
+        let events = appState.uniqueImportDestinations
+        guard index >= 0, index < events.count else { return nil }
+        return events[index].bookmarkIndex
+    }
+
+    private func restoreSelection(bookmarkIndex: Int?) {
+        guard let bookmarkIndex,
+              let newIndex = appState.uniqueImportDestinations.firstIndex(where: { $0.bookmarkIndex == bookmarkIndex }) else { return }
+        selectedItem = .event(index: newIndex)
+    }
+}
+
 // MARK: - Nav row component
 
 struct AuroraNavRow: View {
@@ -307,9 +384,14 @@ struct AuroraNavRow: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .help(showsTooltip ? label : "")
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: hovering)
         .animation(.easeOut(duration: 0.2), value: isActive)
+    }
+
+    private var showsTooltip: Bool {
+        compact && label.count > 22
     }
 
     private var textColor: Color {

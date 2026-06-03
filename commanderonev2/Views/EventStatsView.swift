@@ -17,6 +17,12 @@ struct EventStatsView: View {
     @State private var showAllCameras = false
     @State private var scanDate: Date? = nil      // when the last successful scan happened
     @State private var isCachedData = false       // true = currently showing cached (not fresh) data
+    @State private var isEditingEventName = false
+    @State private var eventNameDraft = ""
+    @State private var isRepositioningBanner = false
+    @State private var bannerOffsetDraft = EventBannerOffset()
+    @State private var bannerDragStartOffset: EventBannerOffset?
+    @FocusState private var eventNameFieldFocused: Bool
 
     // Import history summary — available instantly, no scan needed
     // Falls back to cached report data if folder has been moved and history can't be matched
@@ -77,6 +83,11 @@ struct EventStatsView: View {
             errorMessage = nil
             scanDate = nil
             isCachedData = false
+            isEditingEventName = false
+            eventNameDraft = ""
+            isRepositioningBanner = false
+            bannerOffsetDraft = EventBannerOffset()
+            bannerDragStartOffset = nil
             loadFromCacheThenScan()
         }
     }
@@ -134,19 +145,31 @@ struct EventStatsView: View {
                 RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
                     .strokeBorder(Color.auroraStroke, lineWidth: 1)
             )
+            .overlay {
+                if isRepositioningBanner {
+                    bannerRepositionOverlay
+                }
+            }
     }
 
     @ViewBuilder
     private var bannerCardBackground: some View {
         if let path = eventBannerImagePath, let img = NSImage(contentsOfFile: path) {
-            Image(nsImage: img)
-                .resizable()
-                .scaledToFill()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
+            GeometryReader { geo in
+                let imageSize = scaledBannerImageSize(imageSize: img.size, containerSize: geo.size)
+                let offset = clampedBannerOffset(activeBannerOffset, imageSize: img.size, containerSize: geo.size)
+
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: imageSize.width, height: imageSize.height)
+                    .offset(x: offset.x, y: offset.y)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
+            }
         } else {
             EventThumbnail(
-                eventName: eventName,
+                eventName: currentEventName,
                 folderPath: destinationPath,
                 cornerRadius: 0
             )
@@ -162,13 +185,7 @@ struct EventStatsView: View {
                 .shadow(color: Color.black.opacity(0.55), radius: 6, x: 0, y: 2)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(eventName)
-                    .font(.sora(21, weight: .bold))
-                    .tracking(-0.3)
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
+                editableEventTitle
                 if let date = scanDate {
                     Text("Last scan: \(date.formatted(date: .abbreviated, time: .omitted))")
                         .font(.manrope(11, weight: .semibold))
@@ -198,6 +215,71 @@ struct EventStatsView: View {
     }
 
     @ViewBuilder
+    private var editableEventTitle: some View {
+        if isEditingEventName, bookmarkIndex != nil {
+            TextField("Event name", text: $eventNameDraft)
+                .font(.sora(21, weight: .bold))
+                .tracking(-0.3)
+                .foregroundStyle(.white)
+                .textFieldStyle(.plain)
+                .focused($eventNameFieldFocused)
+                .onSubmit(commitEventNameEdit)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.black.opacity(0.45))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                )
+                .frame(maxWidth: 420, alignment: .leading)
+        } else {
+            Text(currentEventName)
+                .font(.sora(21, weight: .bold))
+                .tracking(-0.3)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: beginEventNameEdit)
+                .help(bookmarkIndex == nil ? "" : "Click to rename event")
+        }
+    }
+
+    private var currentEventName: String {
+        guard let bookmarkIndex,
+              bookmarkIndex >= 0,
+              bookmarkIndex < appState.eventFolderDisplayNames.count else { return eventName }
+        let displayName = appState.eventFolderDisplayNames[bookmarkIndex]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayName.isEmpty ? eventName : displayName
+    }
+
+    private func beginEventNameEdit() {
+        guard bookmarkIndex != nil else { return }
+        eventNameDraft = currentEventName
+        isEditingEventName = true
+        Task { @MainActor in eventNameFieldFocused = true }
+    }
+
+    private func commitEventNameEdit() {
+        guard let bookmarkIndex else { return }
+        let trimmed = eventNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            isEditingEventName = false
+            eventNameFieldFocused = false
+            return
+        }
+
+        appState.setEventFolderDisplayName(at: bookmarkIndex, name: trimmed)
+        isEditingEventName = false
+        eventNameFieldFocused = false
+    }
+
+    @ViewBuilder
     private var bannerMenu: some View {
         if let bookmarkIndex {
             Menu {
@@ -205,6 +287,12 @@ struct EventStatsView: View {
                     chooseBannerPhoto(for: bookmarkIndex)
                 }
                 if eventBannerImagePath != nil {
+                    Button("Reposition Banner") {
+                        beginBannerReposition()
+                    }
+                    Button("Reset Position") {
+                        appState.resetEventFolderBannerOffset(at: bookmarkIndex)
+                    }
                     Button("Remove Banner Photo") {
                         appState.clearEventFolderBanner(at: bookmarkIndex)
                     }
@@ -224,6 +312,106 @@ struct EventStatsView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
         }
+    }
+
+    private var bannerRepositionOverlay: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color.black.opacity(0.18))
+                .contentShape(Rectangle())
+                .gesture(bannerRepositionGesture)
+
+            VStack {
+                HStack {
+                    Label("Drag the banner to reposition", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                        .font(.manrope(12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.52))
+                                .background(.ultraThinMaterial, in: Capsule())
+                        )
+                    Spacer()
+                }
+                Spacer()
+                HStack {
+                    Spacer()
+                    Button("Done") {
+                        commitBannerReposition()
+                    }
+                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
+                }
+            }
+            .padding(18)
+            .allowsHitTesting(true)
+
+            Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 46, height: 46)
+                .background(
+                    Circle()
+                        .fill(Color.black.opacity(0.5))
+                        .background(.ultraThinMaterial, in: Circle())
+                )
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.45), radius: 12, x: 0, y: 6)
+                .offset(x: activeBannerOffset.x, y: activeBannerOffset.y)
+                .allowsHitTesting(false)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+    }
+
+    private var bannerRepositionGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if bannerDragStartOffset == nil {
+                    bannerDragStartOffset = bannerOffsetDraft
+                }
+                let start = bannerDragStartOffset ?? bannerOffsetDraft
+                bannerOffsetDraft = EventBannerOffset(
+                    x: min(500, max(-500, start.x + value.translation.width)),
+                    y: min(500, max(-500, start.y + value.translation.height))
+                )
+            }
+            .onEnded { _ in
+                bannerDragStartOffset = nil
+            }
+    }
+
+    private func beginBannerReposition() {
+        guard eventBannerImagePath != nil else { return }
+        bannerOffsetDraft = eventBannerOffset
+        bannerDragStartOffset = nil
+        isRepositioningBanner = true
+    }
+
+    private func commitBannerReposition() {
+        guard let bookmarkIndex else { return }
+        appState.setEventFolderBannerOffset(at: bookmarkIndex, offset: bannerOffsetDraft)
+        isRepositioningBanner = false
+        bannerDragStartOffset = nil
+    }
+
+    private func scaledBannerImageSize(imageSize: CGSize, containerSize: CGSize) -> CGSize {
+        guard imageSize.width > 0, imageSize.height > 0,
+              containerSize.width > 0, containerSize.height > 0 else { return containerSize }
+
+        let scale = max(containerSize.width / imageSize.width, containerSize.height / imageSize.height)
+        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+    }
+
+    private func clampedBannerOffset(_ offset: EventBannerOffset, imageSize: CGSize, containerSize: CGSize) -> EventBannerOffset {
+        let scaledSize = scaledBannerImageSize(imageSize: imageSize, containerSize: containerSize)
+        let maxX = max(0, (scaledSize.width - containerSize.width) / 2)
+        let maxY = max(0, (scaledSize.height - containerSize.height) / 2)
+
+        return EventBannerOffset(
+            x: min(Double(maxX), max(-Double(maxX), offset.x)),
+            y: min(Double(maxY), max(-Double(maxY), offset.y))
+        )
     }
 
     private func chooseBannerPhoto(for bookmarkIndex: Int) {
@@ -251,6 +439,15 @@ struct EventStatsView: View {
               bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
         let path = appState.eventFolderBannerImagePaths[bookmarkIndex]
         return path.isEmpty ? nil : path
+    }
+
+    private var eventBannerOffset: EventBannerOffset {
+        guard let bookmarkIndex else { return EventBannerOffset() }
+        return appState.bannerOffsetForEvent(at: bookmarkIndex)
+    }
+
+    private var activeBannerOffset: EventBannerOffset {
+        isRepositioningBanner ? bannerOffsetDraft : eventBannerOffset
     }
 
     // MARK: - Import History Card (instant — from ImportHistory, no scan)
@@ -329,14 +526,17 @@ struct EventStatsView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
+        let hasKnownRawFiles = (knownRawFileCount ?? 0) > 0
+        return VStack(spacing: 12) {
             Image(systemName: "photo.stack")
                 .font(.system(size: 48))
                 .foregroundStyle(Color.auroraFaint)
-            Text("No RAW files found")
+            Text(hasKnownRawFiles ? "Photo stats need a scan" : "No RAW files found")
                 .font(.manrope(15, weight: .bold))
                 .foregroundStyle(Color.auroraMuted)
-            Text("No ARW, CR2, CR3 or DNG files found in this folder")
+            Text(hasKnownRawFiles
+                 ? "RAW files are counted, but ISO, cameras, lenses and monthly stats need a fresh scan."
+                 : "No ARW, CR2, CR3 or DNG files found in this folder")
                 .font(.manrope(11, weight: .medium))
                 .foregroundStyle(Color.auroraFaint)
         }
@@ -394,13 +594,19 @@ struct EventStatsView: View {
             }
 
             LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 5),
+                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 6),
                 spacing: AuroraSpacing.gridGap
             ) {
                 PhotoStatCard(
                     icon: "photo.stack.fill",
                     accent: .auroraCyan,
-                    pages: [(label: "RAW Files", value: AuroraFormat.count(report.totalFilesAnalyzed))]
+                    pages: [(label: "RAW Files", value: AuroraFormat.count(rawFileCount(for: report)))]
+                )
+
+                PhotoStatCard(
+                    icon: "checkmark.rectangle.stack.fill",
+                    accent: .auroraHealthy,
+                    pages: [(label: "Photos Delivered", value: AuroraFormat.count(deliveredPhotoCount))]
                 )
 
                 PhotoStatCard(icon: "camera.aperture", accent: .auroraBlue, pages: isoPages(for: report))
@@ -410,6 +616,25 @@ struct EventStatsView: View {
             }
         }
         .auroraStaticCard()
+    }
+
+    private func rawFileCount(for report: StatsReport) -> Int {
+        knownRawFileCount ?? report.totalFilesAnalyzed
+    }
+
+    private var knownRawFileCount: Int? {
+        guard let bookmarkIndex,
+              bookmarkIndex >= 0,
+              bookmarkIndex < appState.eventFolderCachedCounts.count else { return nil }
+        let cachedRawCount = appState.eventFolderCachedCounts[bookmarkIndex]
+        return cachedRawCount >= 0 ? cachedRawCount : nil
+    }
+
+    private var deliveredPhotoCount: Int {
+        guard let bookmarkIndex,
+              bookmarkIndex >= 0,
+              bookmarkIndex < appState.eventFolderCachedJPGCounts.count else { return 0 }
+        return max(appState.eventFolderCachedJPGCounts[bookmarkIndex], 0)
     }
 
     private func datePages(first: Date, last: Date) -> [(label: String, value: String)] {
@@ -653,6 +878,10 @@ struct EventStatsView: View {
                 let now = Date()
                 scanDate = now
                 EventStatsCache.save(r, forPath: destinationPath, scanDate: now)
+                if let bookmarkIndex {
+                    appState.updateEventFolderCache(at: bookmarkIndex, count: r.totalFilesAnalyzed, path: destinationPath)
+                    appState.setEventFolderPeakIfHigher(at: bookmarkIndex, count: r.totalFilesAnalyzed)
+                }
                 appState.log("Event stats scanned & cached: \(eventName) — \(r.totalFilesAnalyzed) photos")
             } else {
                 // Scan returned nothing — keep showing cached data if available
