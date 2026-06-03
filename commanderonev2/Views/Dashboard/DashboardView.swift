@@ -272,7 +272,6 @@ struct WaitingCard: View {
     let onCancel: () -> Void
 
     @State private var pulse = false
-
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
@@ -384,14 +383,6 @@ struct WaitingCard: View {
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
                 .frame(maxWidth: .infinity)
                 .frame(height: 96)
-            .background(
-                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
-                    .fill(Color.auroraPanel2)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
-                    .strokeBorder(Color.auroraStroke, lineWidth: 1)
-            )
         }
     }
 
@@ -498,6 +489,7 @@ struct FileBrowserRow: View {
     @State private var destFiles: [URL] = []
     @State private var isLoadingSource = false
     @State private var isLoadingDest = false
+    @State private var showAdvanced = false
 
     var body: some View {
         HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
@@ -507,7 +499,8 @@ struct FileBrowserRow: View {
                 color: .auroraCyan,
                 files: sourceFiles,
                 isLoading: isLoadingSource,
-                emptyHint: appState.activeVolume == nil ? "No card detected" : "No RAW files found"
+                emptyHint: appState.activeVolume == nil ? "No card detected" : "No RAW files found",
+                onAdvanced: sourceFiles.isEmpty ? nil : { showAdvanced = true }
             )
             filePanel(
                 title: "Destination Files",
@@ -517,6 +510,11 @@ struct FileBrowserRow: View {
                 isLoading: isLoadingDest,
                 emptyHint: appState.destinationURL == nil ? "No destination set" : "No files found"
             )
+        }
+        .sheet(isPresented: $showAdvanced) {
+            AdvancedView(appState: appState) {
+                showAdvanced = false
+            }
         }
         .onChange(of: appState.activeVolume) { _, volume in
             loadSourceFiles(from: volume)
@@ -530,7 +528,15 @@ struct FileBrowserRow: View {
         }
     }
 
-    private func filePanel(title: String, icon: String, color: Color, files: [URL], isLoading: Bool, emptyHint: String) -> some View {
+    private func filePanel(
+        title: String,
+        icon: String,
+        color: Color,
+        files: [URL],
+        isLoading: Bool,
+        emptyHint: String,
+        onAdvanced: (() -> Void)? = nil
+    ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 IconChip(systemName: icon, color: color, size: 26, iconScale: 0.5)
@@ -538,6 +544,10 @@ struct FileBrowserRow: View {
                     .font(.manrope(13, weight: .bold))
                     .foregroundStyle(Color.auroraTxt)
                 Spacer()
+                if let onAdvanced {
+                    Button("Advanced", action: onAdvanced)
+                        .buttonStyle(AuroraGhostButtonStyle())
+                }
                 if !files.isEmpty {
                     Text("\(files.count)")
                         .font(.manrope(11, weight: .bold))
@@ -548,7 +558,7 @@ struct FileBrowserRow: View {
                 }
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .frame(height: 52)
 
             Rectangle()
                 .fill(Color.auroraStroke)
@@ -609,6 +619,7 @@ struct FileBrowserRow: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 233)
         .background(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
                 .fill(Color.auroraPanel)
