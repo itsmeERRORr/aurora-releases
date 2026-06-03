@@ -15,6 +15,7 @@ struct GeneralStatsGrid: View {
                 strokeStops: [.auroraCyan, .auroraCyanDeep],
                 label: "Data Transferred",
                 value: data.value, unit: data.unit,
+                secondaryStats: dataSecondaryStats,
                 sparkValues: dataSpark
             )
             GeneralStatCard(
@@ -31,6 +32,7 @@ struct GeneralStatsGrid: View {
                 strokeStops: [.auroraMagenta, .auroraMagentaDeep],
                 label: "Time Wasted Importing",
                 value: time.value, unit: time.unit,
+                secondaryStats: timeSecondaryStats,
                 sparkValues: timeSpark
             )
             GeneralStatCard(
@@ -39,6 +41,7 @@ struct GeneralStatsGrid: View {
                 strokeStops: [.auroraBlue, .auroraBlueDeep],
                 label: "Total Imports",
                 value: imports.value, unit: imports.unit,
+                secondaryStats: importsSecondaryStats,
                 sparkValues: importsSpark
             )
         }
@@ -56,6 +59,34 @@ struct GeneralStatsGrid: View {
                 ?? appState.importHistory.reduce(0) { $0 + $1.totalBytes }
             if bytes == 0 { return ("—", "") }
             return AuroraFormat.bytesParts(bytes)
+        }
+    }
+
+    private var dataSecondaryStats: [(label: String, value: String)] {
+        switch mode {
+        case .lastImport:
+            guard let report = appState.lastImportReport else { return [] }
+            let parts = AuroraFormat.bytesParts(report.totalBytes)
+            return [
+                (label: "Avg / Import", value: "\(parts.value) \(parts.unit)"),
+                (label: "Avg / Day", value: "\(parts.value) \(parts.unit)")
+            ]
+        case .total:
+            let history = appState.importHistory
+            guard !history.isEmpty else { return [] }
+
+            let totalBytes = appState.totalStatsReport?.totalBytes
+                ?? history.reduce(Int64(0)) { $0 + $1.totalBytes }
+            guard totalBytes > 0 else { return [] }
+
+            let avgImport = AuroraFormat.bytesParts(totalBytes / Int64(max(history.count, 1)))
+            let days = Set(history.map { Calendar.current.startOfDay(for: $0.date) })
+            let avgDay = AuroraFormat.bytesParts(totalBytes / Int64(max(days.count, 1)))
+
+            return [
+                (label: "Avg / Import", value: "\(avgImport.value) \(avgImport.unit)"),
+                (label: "Avg / Day", value: "\(avgDay.value) \(avgDay.unit)")
+            ]
         }
     }
 
@@ -81,6 +112,21 @@ struct GeneralStatsGrid: View {
         }
     }
 
+    private var timeSecondaryStats: [(label: String, value: String)] {
+        switch mode {
+        case .lastImport:
+            guard let report = appState.lastImportReport else { return [] }
+            let parts = AuroraFormat.durationParts(Int(report.duration))
+            return [(label: "Avg / Import", value: "\(parts.value) \(parts.unit)")]
+        case .total:
+            guard let report = appState.totalStatsReport,
+                  report.totalDuration > 0,
+                  !appState.importHistory.isEmpty else { return [] }
+            let parts = AuroraFormat.durationParts(report.totalDuration / max(appState.importHistory.count, 1))
+            return [(label: "Avg / Import", value: "\(parts.value) \(parts.unit)")]
+        }
+    }
+
     private var imports: (value: String, unit: String) {
         switch mode {
         case .lastImport:
@@ -89,6 +135,20 @@ struct GeneralStatsGrid: View {
             let n = appState.importHistory.count
             if n == 0 { return ("—", "") }
             return ("\(n)", "")
+        }
+    }
+
+    private var importsSecondaryStats: [(label: String, value: String)] {
+        switch mode {
+        case .lastImport:
+            return appState.lastImportReport == nil ? [] : [(label: "Avg / Day", value: "1")]
+        case .total:
+            let history = appState.importHistory
+            guard !history.isEmpty else { return [] }
+            let days = Set(history.map { Calendar.current.startOfDay(for: $0.date) })
+            let avg = Double(history.count) / Double(max(days.count, 1))
+            let value = avg >= 10 ? String(format: "%.0f", avg) : String(format: "%.1f", avg)
+            return [(label: "Avg / Day", value: value)]
         }
     }
 
@@ -140,6 +200,7 @@ struct GeneralStatCard: View {
     let label: String
     let value: String
     let unit: String
+    var secondaryStats: [(label: String, value: String)] = []
     let sparkValues: [Double]
 
     var body: some View {
@@ -162,6 +223,23 @@ struct GeneralStatCard: View {
                         .foregroundStyle(Color.auroraMuted)
                 }
             }
+            HStack(spacing: 10) {
+                ForEach(secondaryStats, id: \.label) { stat in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(stat.value)
+                            .font(.sora(11.5, weight: .bold))
+                            .foregroundStyle(Color.auroraTxt)
+                            .lineLimit(1)
+                        Text(stat.label)
+                            .font(.manrope(9.5, weight: .semibold))
+                            .foregroundStyle(Color.auroraFaint)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(height: 30, alignment: .topLeading)
+            .opacity(secondaryStats.isEmpty ? 0 : 1)
             if !sparkValues.isEmpty, sparkValues.max() ?? 0 > 0 {
                 Sparkline(values: sparkValues, stroke: strokeStops, fill: accent)
                     .frame(height: 30)
@@ -171,6 +249,7 @@ struct GeneralStatCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 200, alignment: .topLeading)
         .auroraCard()
     }
 }

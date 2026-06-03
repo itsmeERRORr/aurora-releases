@@ -155,6 +155,7 @@ private struct ChartCanvas: View {
 
 struct DeliverablesPerEventChart: View {
     @Bindable var appState: AppState
+    var onViewAll: () -> Void = {}
 
     struct DeliverableEntry: Identifiable {
         let id: String      // event folder path
@@ -165,9 +166,9 @@ struct DeliverablesPerEventChart: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Most Deliverable Photos per Event")
+            AuroraPanelHeader(title: "Most Deliverable Photos per Event", actionLabel: "View all →", action: onViewAll)
 
-            let entries = deliverableEntries()
+            let entries = Self.deliverableEntries(appState: appState)
             if appState.isRefreshingEventFolders && entries.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().scaleEffect(0.75)
@@ -205,7 +206,8 @@ struct DeliverablesPerEventChart: View {
         .padding(.vertical, 24)
     }
 
-    private func deliverableEntries() -> [DeliverableEntry] {
+    @MainActor
+    static func deliverableEntries(appState: AppState) -> [DeliverableEntry] {
         appState.uniqueImportDestinations.compactMap { destination in
             guard destination.bookmarkIndex < appState.eventFolderCachedJPGCounts.count else { return nil }
             let count = max(appState.eventFolderCachedJPGCounts[destination.bookmarkIndex], 0)
@@ -240,12 +242,14 @@ private struct DeliverableChartCanvas: View {
             let w = geo.size.width
             let h = geo.size.height
             let topInset: CGFloat = 50
-            let bottomInset: CGFloat = 36
+            let bottomInset: CGFloat = 56
+            let horizontalInset: CGFloat = 40
+            let labelWidth: CGFloat = min(190, max(130, (w - 40) / 3.1))
             let drawingHeight = h - topInset - bottomInset
 
             let xs: [CGFloat] = entries.indices.map { i in
                 let frac: CGFloat = entries.count == 1 ? 0.5 : CGFloat(i) / CGFloat(entries.count - 1)
-                return frac * (w - 80) + 40
+                return frac * (w - horizontalInset * 2) + horizontalInset
             }
             let maxV = max(CGFloat(entries.map(\.jpgCount).max() ?? 1), 1)
             let ys: [CGFloat] = entries.map { e in
@@ -276,25 +280,24 @@ private struct DeliverableChartCanvas: View {
                 }
 
                 ForEach(Array(entries.enumerated()), id: \.element.id) { idx, entry in
-                    nodeLabel(entry: entry, rank: rankFor(idx: idx),
-                              x: xs[idx], y: ys[idx], h: h, bottomInset: bottomInset)
+                    nodeLabel(entry: entry, rank: rank(for: entry),
+                              x: xs[idx], y: ys[idx], h: h, bottomInset: bottomInset, labelWidth: labelWidth, chartWidth: w)
                 }
             }
         }
     }
 
-    private func rankFor(idx: Int) -> Int {
-        switch (entries.count, idx) {
-        case (3, 1): return 1
-        case (3, 0): return 2
-        case (3, 2): return 3
-        default: return idx + 1
-        }
+    private func rank(for entry: DeliverablesPerEventChart.DeliverableEntry) -> Int {
+        entries
+            .sorted { $0.jpgCount > $1.jpgCount }
+            .firstIndex { $0.id == entry.id }
+            .map { $0 + 1 } ?? 1
     }
 
     private func nodeLabel(entry: DeliverablesPerEventChart.DeliverableEntry, rank: Int,
-                           x: CGFloat, y: CGFloat, h: CGFloat, bottomInset: CGFloat) -> some View {
-        VStack(spacing: 4) {
+                           x: CGFloat, y: CGFloat, h: CGFloat, bottomInset: CGFloat, labelWidth: CGFloat, chartWidth: CGFloat) -> some View {
+        let labelX = min(max(x, labelWidth / 2), max(labelWidth / 2, chartWidth - labelWidth / 2))
+        return VStack(spacing: 4) {
             Text(AuroraFormat.count(entry.jpgCount))
                 .font(.sora(15, weight: .bold))
                 .foregroundStyle(Color.auroraTxt)
@@ -305,9 +308,11 @@ private struct DeliverableChartCanvas: View {
             Text(entry.name)
                 .font(.manrope(12, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
-                .lineLimit(1)
-                .frame(maxWidth: 200)
-                .position(x: x, y: h - bottomInset + 14)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(width: labelWidth)
+                .multilineTextAlignment(.center)
+                .position(x: labelX, y: h - bottomInset + 24)
         )
     }
 

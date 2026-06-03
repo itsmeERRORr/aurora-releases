@@ -27,7 +27,8 @@ enum EventAggregator {
             } else {
                 effectiveName = destination.name
             }
-            guard !isInvalidEventName(effectiveName) else { return nil }
+            let displayName = appState.displayNameForEvent(at: destination.bookmarkIndex) ?? effectiveName
+            guard !isInvalidEventName(displayName) else { return nil }
 
             let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
             let finalized = appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)
@@ -46,7 +47,7 @@ enum EventAggregator {
 
             return EventAggregate(
                 id: destination.path,
-                name: effectiveName,
+                name: displayName,
                 totalFiles: files,
                 totalBytes: bytes,
                 averageSpeed: avgSpeed,
@@ -117,7 +118,7 @@ enum EventAggregator {
         let numericParts = folder
             .split { !$0.isNumber }
             .map(String.init)
-        guard numericParts.count >= 2 else { return false }
+        guard numericParts.count >= 3 else { return false }
 
         let hasYear = numericParts.contains { $0.count == 4 }
         let hasShortDateParts = numericParts.contains { part in
@@ -125,6 +126,12 @@ enum EventAggregator {
             return value >= 1 && value <= 31
         }
         return hasYear && hasShortDateParts
+    }
+
+    static func sortByPhotoCount(_ lhs: EventAggregate, _ rhs: EventAggregate) -> Bool {
+        if lhs.totalFiles != rhs.totalFiles { return lhs.totalFiles > rhs.totalFiles }
+        if lhs.totalBytes != rhs.totalBytes { return lhs.totalBytes > rhs.totalBytes }
+        return lhs.lastDate > rhs.lastDate
     }
 
     /// True for container folders that should never surface as event names
@@ -153,7 +160,7 @@ struct TopEventsPanel: View {
             AuroraPanelHeader(title: "Top Events", actionLabel: "View all →", action: onViewAll)
 
             let sorted = EventAggregator.build(appState: appState)
-                .sorted { $0.totalBytes > $1.totalBytes }
+                .sorted(by: EventAggregator.sortByPhotoCount)
                 .prefix(5)
                 .map { aggregate in
                     LatestEventDisplay(

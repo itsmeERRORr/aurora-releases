@@ -6,11 +6,13 @@ struct PhotoStatsGrid: View {
 
     var body: some View {
         LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 5),
+            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 6),
             spacing: AuroraSpacing.gridGap
         ) {
             PhotoStatCard(icon: "photo.stack.fill", accent: .auroraCyan,
-                          pages: [(label: "Photos Added", value: photosAdded)])
+                          pages: photosAddedPages)
+            PhotoStatCard(icon: "checkmark.rectangle.stack.fill", accent: .auroraHealthy,
+                          pages: photosDeliveredPages)
             PhotoStatCard(icon: "camera.aperture", accent: .auroraBlue,
                           pages: isoPages)
             PhotoStatCard(icon: "circle.dotted", accent: .auroraViolet,
@@ -31,6 +33,40 @@ struct PhotoStatsGrid: View {
     private var photosAdded: String {
         guard let r = report, r.totalFilesAnalyzed > 0 else { return "—" }
         return AuroraFormat.count(r.totalFilesAnalyzed)
+    }
+
+    private var photosAddedPages: [(label: String, value: String)] {
+        guard let r = report, r.totalFilesAnalyzed > 0 else { return [("Photos Added", "—")] }
+
+        switch mode {
+        case .lastImport:
+            return [
+                ("Photos Added", AuroraFormat.count(r.totalFilesAnalyzed)),
+                ("Avg / Import", AuroraFormat.count(r.totalFilesAnalyzed)),
+                ("Avg / Day", AuroraFormat.count(r.totalFilesAnalyzed))
+            ]
+        case .total:
+            let history = appState.importHistory
+            guard !history.isEmpty else { return [("Photos Added", AuroraFormat.count(r.totalFilesAnalyzed))] }
+            let avgImport = r.totalFilesAnalyzed / max(history.count, 1)
+            let days = Set(history.map { Calendar.current.startOfDay(for: $0.date) })
+            let avgDay = r.totalFilesAnalyzed / max(days.count, 1)
+            return [
+                ("Photos Added", AuroraFormat.count(r.totalFilesAnalyzed)),
+                ("Avg / Import", AuroraFormat.count(avgImport)),
+                ("Avg / Day", AuroraFormat.count(avgDay))
+            ]
+        }
+    }
+
+    private var photosDeliveredPages: [(label: String, value: String)] {
+        switch mode {
+        case .lastImport:
+            return [("Photos Delivered", "—")]
+        case .total:
+            let total = appState.eventFolderCachedJPGCounts.reduce(0) { $0 + max($1, 0) }
+            return [("Photos Delivered", total > 0 ? AuroraFormat.count(total) : "—")]
+        }
     }
 
     private var isoPages: [(label: String, value: String)] {

@@ -155,6 +155,14 @@ struct StorageView: View {
 
     private func eventRow(name: String, path: String, bookmarkIndex: Int) -> some View {
         let agg = appState.importStatsForEventFolder(at: bookmarkIndex)
+        let rawCount = bookmarkIndex < appState.eventFolderCachedCounts.count
+            ? max(appState.eventFolderCachedCounts[bookmarkIndex], 0)
+            : 0
+        let jpgCount = bookmarkIndex < appState.eventFolderCachedJPGCounts.count
+            ? max(appState.eventFolderCachedJPGCounts[bookmarkIndex], 0)
+            : 0
+        let isFinalized = appState.finalizedEvent(forBookmarkIndex: bookmarkIndex) != nil
+        let canRefresh = !isFinalized && !appState.isRefreshingEventFolders && appState.importState == .idle && !path.isEmpty
         return HStack(spacing: 12) {
             IconChip(systemName: "folder.fill", color: .auroraViolet)
             VStack(alignment: .leading, spacing: 2) {
@@ -167,16 +175,35 @@ struct StorageView: View {
                     .lineLimit(1)
             }
             Spacer()
-            if let agg = agg {
-                let parts = AuroraFormat.bytesParts(agg.totalBytes)
-                VStack(alignment: .trailing, spacing: 2) {
+            VStack(alignment: .trailing, spacing: 6) {
+                if let agg = agg {
+                    let parts = AuroraFormat.bytesParts(agg.totalBytes)
                     Text("\(parts.value) \(parts.unit)")
                         .font(.sora(13, weight: .bold))
                         .foregroundStyle(Color.auroraTxt)
-                    Text("\(AuroraFormat.count(agg.photoCount)) photos")
+                    Text("\(AuroraFormat.count(agg.photoCount)) imported · \(AuroraFormat.count(rawCount)) RAW · \(AuroraFormat.count(jpgCount)) JPG")
+                        .font(.manrope(11, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
+                } else {
+                    Text("\(AuroraFormat.count(rawCount)) RAW · \(AuroraFormat.count(jpgCount)) JPG")
                         .font(.manrope(11, weight: .semibold))
                         .foregroundStyle(Color.auroraFaint)
                 }
+
+                HStack(spacing: 8) {
+                    Button("Refresh RAW") {
+                        appState.refreshEventFolderMediaCount(at: bookmarkIndex, refreshRAW: true, refreshJPG: false)
+                    }
+                    .buttonStyle(AuroraGhostButtonStyle())
+                    .disabled(!canRefresh)
+
+                    Button("Refresh JPGs") {
+                        appState.refreshEventFolderMediaCount(at: bookmarkIndex, refreshRAW: false, refreshJPG: true)
+                    }
+                    .buttonStyle(AuroraGhostButtonStyle())
+                    .disabled(!canRefresh)
+                }
+                .opacity(canRefresh ? 1 : 0.45)
             }
         }
         .padding(8)

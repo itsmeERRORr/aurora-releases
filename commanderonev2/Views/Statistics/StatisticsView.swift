@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct StatisticsView: View {
     @Bindable var appState: AppState
@@ -19,9 +20,9 @@ struct StatisticsView: View {
 
                 PhotoStatsGrid(appState: appState, mode: mode)
 
-                eventsRow
-
                 camerasAndLensesRow
+
+                eventsRow
 
                 chartsRow
 
@@ -65,7 +66,7 @@ struct StatisticsView: View {
             HStack(alignment: .top, spacing: gap) {
                 PhotosPerEventChart(appState: appState, onViewAll: { viewAllSheet = .photosPerEvent })
                     .frame(width: unit)
-                DeliverablesPerEventChart(appState: appState)
+                DeliverablesPerEventChart(appState: appState, onViewAll: { viewAllSheet = .deliverablesPerEvent })
                     .frame(width: unit)
             }
         }
@@ -84,6 +85,7 @@ enum StatsViewAllSheet: String, Identifiable {
     case topCameras
     case topLenses
     case photosPerEvent
+    case deliverablesPerEvent
 
     var id: String { rawValue }
 
@@ -94,6 +96,7 @@ enum StatsViewAllSheet: String, Identifiable {
         case .topCameras: return "Top Cameras"
         case .topLenses: return "Top Lenses"
         case .photosPerEvent: return "Most Photos per Event"
+        case .deliverablesPerEvent: return "Most Deliverable Photos per Event"
         }
     }
 }
@@ -125,6 +128,7 @@ struct StatsViewAllSheetView: View {
         .padding(20)
         .frame(minWidth: 560, minHeight: 520)
         .background(Color.auroraBg)
+        .background(OutsideSheetClickDismissor { dismiss() })
     }
 
     @ViewBuilder
@@ -132,7 +136,7 @@ struct StatsViewAllSheetView: View {
         switch kind {
         case .topEvents:
             let events = EventAggregator.build(appState: appState)
-                .sorted { $0.totalBytes > $1.totalBytes }
+                .sorted(by: EventAggregator.sortByPhotoCount)
                 .map { aggregate in
                     LatestEventDisplay(
                         aggregate: aggregate,
@@ -161,6 +165,12 @@ struct StatsViewAllSheetView: View {
                 .sorted { $0.totalFiles > $1.totalFiles }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
                 PhotosPerEventListRow(rank: idx + 1, event: event, appState: appState)
+            }
+        case .deliverablesPerEvent:
+            let entries = DeliverablesPerEventChart.deliverableEntries(appState: appState)
+                .sorted { $0.jpgCount > $1.jpgCount }
+            ForEach(Array(entries.enumerated()), id: \.element.id) { idx, entry in
+                DeliverableEventListRow(rank: idx + 1, entry: entry, appState: appState)
             }
         }
     }
@@ -227,5 +237,85 @@ private struct PhotosPerEventListRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+}
+
+private struct DeliverableEventListRow: View {
+    let rank: Int
+    let entry: DeliverablesPerEventChart.DeliverableEntry
+    @Bindable var appState: AppState
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RankBadge(rank: rank)
+            EventThumbnail(
+                eventName: entry.name,
+                folderPath: entry.id,
+                bannerImagePath: appState.bannerImagePath(forEventPath: entry.id)
+            )
+            .frame(width: 44, height: 34)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.name)
+                    .font(.auroraEventName)
+                    .foregroundStyle(Color.auroraTxt)
+                    .lineLimit(1)
+                Text(entry.lastDate == .distantPast ? "—" : AuroraFormat.dateCompact(entry.lastDate))
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(Color.auroraFaint)
+            }
+            Spacer(minLength: 4)
+            SpeedPill(text: AuroraFormat.count(entry.jpgCount), tint: .auroraMagenta)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct OutsideSheetClickDismissor: NSViewRepresentable {
+    let onOutsideClick: () -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.view = view
+        context.coordinator.onOutsideClick = onOutsideClick
+        context.coordinator.startMonitoring()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.view = nsView
+        context.coordinator.onOutsideClick = onOutsideClick
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.stopMonitoring()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        weak var view: NSView?
+        var onOutsideClick: (() -> Void)?
+        private var monitor: Any?
+
+        func startMonitoring() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+                guard let self, let sheetWindow = self.view?.window else { return event }
+                if event.window !== sheetWindow {
+                    DispatchQueue.main.async { self.onOutsideClick?() }
+                }
+                return event
+            }
+        }
+
+        func stopMonitoring() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            monitor = nil
+        }
     }
 }
