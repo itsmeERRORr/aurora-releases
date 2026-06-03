@@ -196,7 +196,13 @@ final class StatsRunner {
                 "-LensModel", "-LensID",
                 "-Make", "-Model",
                 "-ExposureTime", "-ShutterSpeedValue",
-                "-FocalLength", "-FNumber", "-ISO",
+                "-FocalLength", "-FNumber",
+                // ISO + Sony's alternate ISO fields. On Sony bodies the EXIF
+                // `ISO` tag can be capped at a reference value (often 400)
+                // while the real ISO used is written to ISOSpeed or
+                // RecommendedExposureIndex (SensitivityType=3). Read all
+                // three so the parser can pick the largest as the effective ISO.
+                "-ISO", "-ISOSpeed", "-RecommendedExposureIndex",
                 "-DateTimeOriginal", "-CreateDate", "-DateCreated"
             ]
             let argfileContents = (flags + rawFiles).joined(separator: "\n")
@@ -257,7 +263,11 @@ final class StatsRunner {
             "-LensModel", "-LensID",
             "-Make", "-Model",
             "-ExposureTime", "-ShutterSpeedValue",
-            "-FocalLength", "-FNumber", "-ISO",
+            "-FocalLength", "-FNumber",
+            // See the bulk-scan path for why we read all three ISO-ish tags
+            // (Sony writes the real ISO to RecommendedExposureIndex when the
+            // standard ISO field is capped at a reference value).
+            "-ISO", "-ISOSpeed", "-RecommendedExposureIndex",
             "-DateTimeOriginal", "-CreateDate", "-DateCreated"
         ]
 
@@ -385,19 +395,17 @@ final class StatsRunner {
                 minShutterSpeed = min(minShutterSpeed ?? shutter, shutter)
             }
 
-            // ISO
-            if let iso = entry["ISO"] as? Int {
-                let isoDouble = Double(iso)
-                isoSum += isoDouble
+            // ISO — take the largest of ISO / ISOSpeed / RecommendedExposureIndex.
+            // Sony bodies cap the standard `ISO` tag at a reference value
+            // (often 400) for shots taken with SensitivityType=3 and write
+            // the real ISO into RecommendedExposureIndex; ISOSpeed is the
+            // EXIF 2.3 canonical field. We pick the max so a single capped
+            // tag doesn't pull the highest-ISO stat down to the reference.
+            if let iso = Self.effectiveISO(from: entry) {
+                isoSum += iso
                 isoCount += 1
-                maxISO = max(maxISO ?? isoDouble, isoDouble)
-                minISO = min(minISO ?? isoDouble, isoDouble)
-            } else if let isoStr = entry["ISO"] as? String, let iso = Int(isoStr) {
-                let isoDouble = Double(iso)
-                isoSum += isoDouble
-                isoCount += 1
-                maxISO = max(maxISO ?? isoDouble, isoDouble)
-                minISO = min(minISO ?? isoDouble, isoDouble)
+                maxISO = max(maxISO ?? iso, iso)
+                minISO = min(minISO ?? iso, iso)
             }
 
             // Aperture (FNumber) — skip 0 (no-lens shots report FNumber=0)
@@ -584,6 +592,27 @@ final class StatsRunner {
             }
         }
         return Double(str)
+    }
+
+    /// Reads an integer-ish exiftool JSON field that may be Int, Double, or String.
+    private nonisolated static func parseISOField(_ value: Any?) -> Double? {
+        if let i = value as? Int { return Double(i) }
+        if let d = value as? Double { return d }
+        if let s = value as? String, let i = Int(s) { return Double(i) }
+        if let s = value as? String, let d = Double(s) { return d }
+        return nil
+    }
+
+    /// Returns the effective ISO for a photo, picking the max across the three
+    /// ISO-related EXIF tags Sony bodies may write to. Returns nil if none are
+    /// present or all are <= 0.
+    private nonisolated static func effectiveISO(from entry: [String: Any]) -> Double? {
+        let candidates = [
+            parseISOField(entry["ISO"]),
+            parseISOField(entry["ISOSpeed"]),
+            parseISOField(entry["RecommendedExposureIndex"])
+        ].compactMap { $0 }.filter { $0 > 0 }
+        return candidates.max()
     }
 
     private nonisolated static func runMdlsStats(files: [String]) -> StatsReport {
