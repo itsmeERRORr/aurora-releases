@@ -12,15 +12,12 @@ final class SecurityBookmarkManager {
 
     // Save a security-scoped bookmark for a URL
     func saveBookmark(for url: URL) {
-        guard url.startAccessingSecurityScopedResource() else {
-            print("⚠️ Failed to access security scoped resource")
-            return
-        }
-        defer { url.stopAccessingSecurityScopedResource() }
+        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        defer { if didStartAccessing { url.stopAccessingSecurityScopedResource() } }
 
         do {
             let bookmarkData = try url.bookmarkData(
-                options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+                options: [.withSecurityScope],
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )

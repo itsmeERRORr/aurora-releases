@@ -134,6 +134,9 @@ final class VolumeWatcher {
 
         if panel.runModal() == .OK, let url = panel.url {
             let rawCount = countRawFiles(at: url)
+            if rawCount > 0 {
+                SecurityBookmarkManager.shared.saveBookmark(for: url)
+            }
             let info = VolumeInfo(
                 id: url.path,
                 name: url.lastPathComponent,
@@ -153,8 +156,10 @@ final class VolumeWatcher {
         let resourceValues = try? url.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey])
         let name = resourceValues?.volumeName ?? url.lastPathComponent
 
-        // Count RAW files
         let rawCount = countRawFiles(at: url)
+        if rawCount > 0 {
+            SecurityBookmarkManager.shared.saveBookmark(for: url)
+        }
 
         return VolumeInfo(
             id: url.path,
@@ -173,6 +178,8 @@ final class VolumeWatcher {
     /// - Parameter modifiedOnOrAfter: if non-nil, only count files with contentModificationDate >= this date (e.g. last 12 months).
     static func countRawFiles(at url: URL, extensions: Set<String>, modifiedOnOrAfter: Date? = nil) -> Int {
         let fm = FileManager.default
+        let securityScoped = SecurityBookmarkManager.shared.requestAccess(for: url)
+        defer { if securityScoped { SecurityBookmarkManager.shared.stopAccessing(url) } }
         guard (try? url.checkResourceIsReachable()) ?? false else { return 0 }
         let keys: Set<URLResourceKey> = modifiedOnOrAfter != nil ? [.isRegularFileKey, .contentModificationDateKey] : [.isRegularFileKey]
         guard let enumerator = fm.enumerator(
@@ -196,6 +203,8 @@ final class VolumeWatcher {
 
     func listRawFiles(at url: URL) -> [URL] {
         let fm = FileManager.default
+        let securityScoped = SecurityBookmarkManager.shared.requestAccess(for: url)
+        defer { if securityScoped { SecurityBookmarkManager.shared.stopAccessing(url) } }
 
         // Check if volume is accessible before enumerating
         guard (try? url.checkResourceIsReachable()) ?? false else {
@@ -225,6 +234,8 @@ final class VolumeWatcher {
     /// List RAW files recursively in a folder. Thread-safe; can be called from any context.
     static func listRawFiles(at url: URL, extensions: Set<String>) -> [URL] {
         let fm = FileManager.default
+        let securityScoped = SecurityBookmarkManager.shared.requestAccess(for: url)
+        defer { if securityScoped { SecurityBookmarkManager.shared.stopAccessing(url) } }
         guard (try? url.checkResourceIsReachable()) ?? false else { return [] }
         guard let enumerator = fm.enumerator(
             at: url,
