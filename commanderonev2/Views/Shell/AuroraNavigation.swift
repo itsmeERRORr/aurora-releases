@@ -23,8 +23,8 @@ enum NavigationItem: Equatable, Identifiable, Hashable {
 
     var label: String {
         switch self {
-        case .dashboard: return "Dashboard"
-        case .statistics: return "Statistics"
+        case .dashboard: return "Import"
+        case .statistics: return "Dashboard"
         case .activity: return "Activity"
         case .storage: return "Storage"
         case .settings: return "Settings"
