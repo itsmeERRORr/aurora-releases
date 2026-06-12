@@ -3,6 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @Bindable var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var volumeWatcher: VolumeWatcher?
     @State private var importEngine = ImportEngine()
@@ -13,6 +14,7 @@ struct ContentView: View {
     @State private var autoImportCountdown = 5
     @State private var autoImportTask: Task<Void, Never>?
     @State private var eventCountsRefreshTask: Task<Void, Never>?
+    @State private var telegramDailySummaryTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -54,7 +56,10 @@ struct ContentView: View {
         .background(TransparentTitleBar())
         #endif
         .onAppear { setupServices() }
-        .onDisappear { stopEventCountsRefreshTimer() }
+        .onDisappear {
+            stopEventCountsRefreshTimer()
+            stopTelegramDailySummaryScheduler()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .cardDetected)) { _ in
             selectedNavItem = .dashboard
         }
@@ -63,6 +68,13 @@ struct ContentView: View {
         }
         .onChange(of: appState.autoImport) { _, isEnabled in
             if !isEnabled { cancelAutoImportCountdown() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                startEventCountsRefreshTimer()
+            } else {
+                stopEventCountsRefreshTimer()
+            }
         }
     }
 
@@ -135,7 +147,8 @@ struct ContentView: View {
         statsRunner = StatsRunner(appState: appState)
         watcher.startWatching()
         startEventCountsRefreshTimer()
-        appState.log("App started — João's Photos v1.0")
+        startTelegramDailySummaryScheduler()
+        appState.log("App started — Aurora v1.0")
     }
 
     private func startEventCountsRefreshTimer() {
@@ -154,6 +167,45 @@ struct ContentView: View {
     private func stopEventCountsRefreshTimer() {
         eventCountsRefreshTask?.cancel()
         eventCountsRefreshTask = nil
+    }
+
+    private func startTelegramDailySummaryScheduler() {
+        guard telegramDailySummaryTask == nil else { return }
+        telegramDailySummaryTask = Task {
+            await attemptTelegramDailySummarySend()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(300))
+                if Task.isCancelled { return }
+                await attemptTelegramDailySummarySend()
+            }
+        }
+    }
+
+    private func stopTelegramDailySummaryScheduler() {
+        telegramDailySummaryTask?.cancel()
+        telegramDailySummaryTask = nil
+    }
+
+    private func attemptTelegramDailySummarySend() async {
+        do {
+            try await TelegramDailySummaryService.sendDailySummaryIfDue()
+            await MainActor.run {
+                appState.log("Telegram daily summary sent")
+            }
+        } catch let error as TelegramDailySummaryService.SummaryError {
+            switch error {
+            case .tooEarly, .alreadySent, .noImportsToday, .disabledOrIncomplete:
+                break
+            case .invalidURL, .telegramRejected:
+                await MainActor.run {
+                    appState.log("Telegram daily summary failed: \(error.localizedDescription)", level: .warning)
+                }
+            }
+        } catch {
+            await MainActor.run {
+                appState.log("Telegram daily summary failed: \(error.localizedDescription)", level: .warning)
+            }
+        }
     }
 
     // MARK: - Auto-import overlay
@@ -351,7 +403,18 @@ struct ContentView: View {
                     )
                     ImportHistoryStorage.add(historyEntry)
                     appState.importHistory = ImportHistoryStorage.load()
+                    appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: result.destinationPath)
+                    appState.recordTelegramDailyImport(
+                        sourceName: source.name,
+                        destinationPath: result.destinationPath,
+                        fileCount: result.importedFiles.count,
+                        totalBytes: lastStats.totalBytes,
+                        duration: result.duration,
+                        report: lastStats
+                    )
+                    Task { await attemptTelegramDailySummarySend() }
                 }
+                appState.requestLightroomSync(forImportFolder: result.destinationPath)
 
                 try? await Task.sleep(for: .seconds(1))
                 showProgressOverlay = false

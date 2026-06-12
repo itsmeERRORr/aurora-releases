@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import QuickLookThumbnailing
 
 struct AdvancedView: View {
     @Bindable var appState: AppState
@@ -9,6 +10,7 @@ struct AdvancedView: View {
     @State private var selectedFiles: Set<URL> = []
     @State private var selectedFile: URL?
     @State private var lastSelectedIndex: Int?
+    @State private var selectionAnchorIndex: Int?
     @State private var thumbnailStates: [URL: ThumbnailState] = [:]
     @State private var previewImage: NSImage?
     @State private var isLoadingFiles = false
@@ -19,6 +21,12 @@ struct AdvancedView: View {
     @State private var showNoDestinationAlert = false
     @State private var importEngine = ImportEngine()
     @State private var gridWidth: CGFloat = 0
+    @State private var loadFilesTask: Task<Void, Never>?
+    @State private var thumbnailTasks: [URL: Task<Void, Never>] = [:]
+    @State private var previewTask: Task<Void, Never>?
+    @State private var modifierEventMonitor: Any?
+    @State private var currentModifierFlags: NSEvent.ModifierFlags = []
+    @State private var mouseDownModifierFlags: NSEvent.ModifierFlags = []
 
     @FocusState private var isGalleryFocused: Bool
     @FocusState private var isPreviewFocused: Bool
@@ -99,13 +107,21 @@ struct AdvancedView: View {
         }
         .frame(minWidth: 980, minHeight: 720)
         .onAppear {
+            startModifierMonitor()
             loadFiles()
             isGalleryFocused = true
+        }
+        .onDisappear {
+            cancelPreviewAndThumbnailWork()
+            stopModifierMonitor()
         }
         .onChange(of: ratingFilter) { _, _ in
             selectedFiles = selectedFiles.intersection(displayedFiles)
             if let selectedFile, !displayedFiles.contains(selectedFile) {
                 self.selectedFile = displayedFiles.first
+            }
+            if let anchor = selectionAnchorIndex, !displayedFiles.indices.contains(anchor) {
+                selectionAnchorIndex = displayedFiles.firstIndex { selectedFiles.contains($0) }
             }
         }
         .alert("Import selected photos?", isPresented: $showImportConfirmation) {
@@ -161,7 +177,7 @@ struct AdvancedView: View {
                     .disabled(selectedFilesInView.isEmpty || appState.destinationURL == nil)
                     .opacity(selectedFilesInView.isEmpty || appState.destinationURL == nil ? 0.45 : 1)
 
-                    Button("Close", action: onClose)
+                    Button("Close", action: closeAdvanced)
                         .buttonStyle(AuroraGhostButtonStyle())
                 }
 
@@ -280,6 +296,7 @@ struct AdvancedView: View {
                 selectedFiles = Set(displayedFiles)
                 selectedFile = displayedFiles.first
                 lastSelectedIndex = displayedFiles.isEmpty ? nil : 0
+                selectionAnchorIndex = lastSelectedIndex
             }
             .onKeyPress("1") { rateSelection(1); return .handled }
             .onKeyPress("2") { rateSelection(2); return .handled }
@@ -394,59 +411,151 @@ struct AdvancedView: View {
             files = []
             return
         }
+        loadFilesTask?.cancel()
         isLoadingFiles = true
         let path = volume.path
         let extensions = appState.supportedExtensions
-        Task {
-            let sourceFiles = VolumeWatcher.listRawFiles(at: path, extensions: extensions)
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        loadFilesTask = Task {
+            let sourceFiles = await Task.detached(priority: .userInitiated) {
+                VolumeWatcher.listRawFiles(at: path, extensions: extensions)
+                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            }.value
+            guard !Task.isCancelled else { return }
             await MainActor.run {
+                loadFilesTask = nil
                 appState.updateSourceFiles(sourceFiles)
                 files = appState.sortedSourceFiles.isEmpty ? sourceFiles : appState.sortedSourceFiles
                 selectedFiles = selectedFiles.intersection(files)
+                if let anchor = selectionAnchorIndex, !files.indices.contains(anchor) {
+                    selectionAnchorIndex = files.firstIndex { selectedFiles.contains($0) }
+                }
                 isLoadingFiles = false
+                prefetchInitialThumbnails()
             }
         }
     }
 
+    private func closeAdvanced() {
+        cancelPreviewAndThumbnailWork()
+        stopModifierMonitor()
+        onClose()
+    }
+
+    private func startModifierMonitor() {
+        guard modifierEventMonitor == nil else { return }
+        modifierEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .leftMouseDown]) { event in
+            let relevantFlags = relevantModifierFlags(event.modifierFlags)
+            currentModifierFlags = relevantFlags
+            if event.type == .leftMouseDown {
+                mouseDownModifierFlags = relevantFlags
+            }
+            return event
+        }
+    }
+
+    private func stopModifierMonitor() {
+        if let monitor = modifierEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            modifierEventMonitor = nil
+        }
+        currentModifierFlags = []
+        mouseDownModifierFlags = []
+    }
+
+    private func cancelPreviewAndThumbnailWork() {
+        loadFilesTask?.cancel()
+        loadFilesTask = nil
+        previewTask?.cancel()
+        previewTask = nil
+        for task in thumbnailTasks.values {
+            task.cancel()
+        }
+        thumbnailTasks.removeAll()
+    }
+
     private func loadThumbnailIfNeeded(for file: URL) {
-        guard thumbnailStates[file] == nil else { return }
+        guard thumbnailStates[file] == nil, thumbnailTasks[file] == nil else { return }
         if let cached = ThumbnailCache.shared.get(for: file) {
             thumbnailStates[file] = .loaded(cached)
             return
         }
         thumbnailStates[file] = .loading
-        Task {
-            guard let data = await extractJPEG(from: file, tag: "PreviewImage"),
-                  let image = makeImage(from: data, maxPixel: 420) else {
-                thumbnailStates[file] = .failed
-                return
+        thumbnailTasks[file] = Task {
+            let image = await thumbnailImage(for: file)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                thumbnailTasks[file] = nil
+                guard let image else {
+                    thumbnailStates[file] = .failed
+                    return
+                }
+                ThumbnailCache.shared.set(image, for: file)
+                thumbnailStates[file] = .loaded(image)
             }
-            ThumbnailCache.shared.set(image, for: file)
-            thumbnailStates[file] = .loaded(image)
+        }
+    }
+
+    private func prefetchInitialThumbnails(limit: Int = 18) {
+        for file in displayedFiles.prefix(limit) {
+            loadThumbnailIfNeeded(for: file)
         }
     }
 
     private func openPreview(_ file: URL) {
+        previewTask?.cancel()
         selectedFile = file
         previewImage = nil
         isLoadingPreview = true
         isGalleryFocused = false
-        Task {
-            let rawPreview = await extractJPEG(from: file, tag: "JpgFromRaw")
-            let fallbackPreview = rawPreview == nil ? await extractJPEG(from: file, tag: "PreviewImage") : nil
-            guard let data = rawPreview ?? fallbackPreview,
-                  let image = makeImage(from: data, maxPixel: 2400) else {
+        previewTask = Task {
+            let image = await fullPreviewImage(for: file)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                previewTask = nil
+                guard selectedFile == file, let image else {
+                    isLoadingPreview = false
+                    return
+                }
+                previewImage = image
                 isLoadingPreview = false
-                return
+                isPreviewFocused = true
             }
-            previewImage = image
-            isLoadingPreview = false
-            isPreviewFocused = true
         }
     }
 
+    private func thumbnailImage(for file: URL) async -> NSImage? {
+        if Task.isCancelled { return nil }
+        if let image = await quickLookImage(for: file, maxPixel: 320, scale: 1) {
+            return image
+        }
+
+        for tag in ["PreviewImage", "ThumbnailImage", "JpgFromRaw"] {
+            if Task.isCancelled { return nil }
+            guard let data = await extractJPEG(from: file, tag: tag) else { continue }
+            if Task.isCancelled { return nil }
+            if let image = makeImage(from: data, maxPixel: 320) {
+                return image
+            }
+        }
+        return nil
+    }
+
+    private func fullPreviewImage(for file: URL) async -> NSImage? {
+        for tag in ["JpgFromRaw", "PreviewImage", "ThumbnailImage"] {
+            if Task.isCancelled { return nil }
+            guard let data = await extractJPEG(from: file, tag: tag) else { continue }
+            if Task.isCancelled { return nil }
+            if let image = makeImage(from: data, maxPixel: 2400) {
+                return image
+            }
+        }
+        if Task.isCancelled { return nil }
+        return await quickLookImage(for: file, maxPixel: 1800)
+    }
+
     private func closePreview() {
+        previewTask?.cancel()
+        previewTask = nil
         previewImage = nil
         isLoadingPreview = false
         isPreviewFocused = false
@@ -461,11 +570,12 @@ struct AdvancedView: View {
     }
 
     private func handleSelection(_ file: URL, index: Int) {
-        let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+        let modifiers = selectionModifierFlags()
         let isShift = modifiers.contains(.shift)
         let isCommand = modifiers.contains(.command)
 
-        if isShift, let anchor = lastSelectedIndex {
+        if isShift {
+            let anchor = selectionAnchorIndex ?? lastSelectedIndex ?? index
             let bounds = min(anchor, index)...max(anchor, index)
             let rangeFiles = Set(bounds.map { displayedFiles[$0] })
             selectedFiles = isCommand ? selectedFiles.union(rangeFiles) : rangeFiles
@@ -475,13 +585,26 @@ struct AdvancedView: View {
             } else {
                 selectedFiles.insert(file)
             }
+            selectionAnchorIndex = index
         } else {
             selectedFiles = [file]
+            selectionAnchorIndex = index
         }
 
         selectedFile = selectedFiles.contains(file) ? file : selectedFiles.first
         lastSelectedIndex = index
+        mouseDownModifierFlags = []
         isGalleryFocused = true
+    }
+
+    private func selectionModifierFlags() -> NSEvent.ModifierFlags {
+        let mouseFlags = relevantModifierFlags(mouseDownModifierFlags)
+        if !mouseFlags.isEmpty { return mouseFlags }
+
+        let currentFlags = relevantModifierFlags(currentModifierFlags)
+        if !currentFlags.isEmpty { return currentFlags }
+
+        return relevantModifierFlags(NSApp.currentEvent?.modifierFlags ?? [])
     }
 
     private func moveSelection(by offset: Int) {
@@ -587,7 +710,17 @@ struct AdvancedView: View {
                             totalBytes: lastStats.totalBytes
                         ))
                         appState.importHistory = ImportHistoryStorage.load()
+                        appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: result.destinationPath)
+                        appState.recordTelegramDailyImport(
+                            sourceName: source.name,
+                            destinationPath: result.destinationPath,
+                            fileCount: result.importedFiles.count,
+                            totalBytes: lastStats.totalBytes,
+                            duration: result.duration,
+                            report: lastStats
+                        )
                     }
+                    appState.requestLightroomSync(forImportFolder: result.destinationPath)
                     selectedFiles.subtract(filesToImport)
                     files.removeAll { filesToImport.contains($0) }
                     appState.updateSourceFiles(files)
@@ -630,8 +763,12 @@ struct AdvancedView: View {
     private func extractJPEG(from file: URL, tag: String) async -> Data? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                guard let exiftoolPath = exiftoolPath() else {
+                    continuation.resume(returning: nil)
+                    return
+                }
                 let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/exiftool")
+                process.executableURL = URL(fileURLWithPath: exiftoolPath)
                 process.arguments = ["-b", "-\(tag)", file.path]
                 let pipe = Pipe()
                 process.standardOutput = pipe
@@ -649,8 +786,23 @@ struct AdvancedView: View {
         }
     }
 
-    private func makeImage(from data: Data, maxPixel: CGFloat) -> NSImage? {
-        guard let image = NSImage(data: data) else { return nil }
+    private func quickLookImage(for file: URL, maxPixel: CGFloat, scale: CGFloat = 2) async -> NSImage? {
+        let request = QLThumbnailGenerator.Request(
+            fileAt: file,
+            size: CGSize(width: maxPixel, height: maxPixel),
+            scale: scale,
+            representationTypes: .thumbnail
+        )
+
+        do {
+            let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+            return makeImage(from: representation.nsImage, maxPixel: maxPixel)
+        } catch {
+            return nil
+        }
+    }
+
+    private func makeImage(from image: NSImage, maxPixel: CGFloat) -> NSImage? {
         let width = max(image.size.width, 1)
         let height = max(image.size.height, 1)
         let scale = min(1, maxPixel / max(width, height))
@@ -663,6 +815,20 @@ struct AdvancedView: View {
         resized.unlockFocus()
         return resized
     }
+
+    private func makeImage(from data: Data, maxPixel: CGFloat) -> NSImage? {
+        guard let image = NSImage(data: data) else { return nil }
+        return makeImage(from: image, maxPixel: maxPixel)
+    }
+}
+
+private func relevantModifierFlags(_ flags: NSEvent.ModifierFlags) -> NSEvent.ModifierFlags {
+    flags.intersection([.shift, .command, .option, .control])
+}
+
+private func exiftoolPath() -> String? {
+    ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
+        .first { FileManager.default.fileExists(atPath: $0) }
 }
 
 private struct AdvancedPhotoTile: View {

@@ -6,7 +6,7 @@ struct PhotoStatsGrid: View {
 
     var body: some View {
         LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 6),
+            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 7),
             spacing: AuroraSpacing.gridGap
         ) {
             PhotoStatCard(icon: "photo.stack.fill", accent: .auroraCyan,
@@ -21,6 +21,8 @@ struct PhotoStatsGrid: View {
                           pages: focalPages)
             PhotoStatCard(icon: "timer", accent: .auroraPurple,
                           pages: shutterPages)
+            PhotoStatCard(icon: "rectangle.portrait.fill", accent: .auroraLive,
+                          pages: orientationPages)
         }
     }
 
@@ -62,10 +64,14 @@ struct PhotoStatsGrid: View {
     private var photosDeliveredPages: [(label: String, value: String)] {
         switch mode {
         case .lastImport:
-            return [("Photos Delivered", "—")]
+            return [("Photos Delivered", "—"), ("Keep Rate", "—")]
         case .total:
-            let total = appState.eventFolderCachedJPGCounts.reduce(0) { $0 + max($1, 0) }
-            return [("Photos Delivered", total > 0 ? AuroraFormat.count(total) : "—")]
+            let delivered = appState.eventFolderCachedJPGCounts.reduce(0) { $0 + max($1, 0) }
+            let rawCount = report?.totalFilesAnalyzed ?? 0
+            return [
+                ("Photos Delivered", delivered > 0 ? AuroraFormat.count(delivered) : "—"),
+                ("Keep Rate", keepRate(delivered: delivered, rawCount: rawCount))
+            ]
         }
     }
 
@@ -74,6 +80,7 @@ struct PhotoStatsGrid: View {
         var pages: [(String, String)] = [("Avg ISO", value(r.avgISO, AuroraFormat.iso))]
         if let v = r.maxISO, v > 0 { pages.append(("Highest ISO", AuroraFormat.iso(v))) }
         if let v = r.minISO, v > 0 { pages.append(("Lowest ISO", AuroraFormat.iso(v))) }
+        pages.append(("Most Used ISO", value(r.mostUsedISO, AuroraFormat.iso)))
         return pages
     }
 
@@ -82,6 +89,7 @@ struct PhotoStatsGrid: View {
         var pages: [(String, String)] = [("Avg Aperture", value(r.avgAperture, AuroraFormat.aperture))]
         if let v = r.maxAperture, v > 0 { pages.append(("Highest Aperture", AuroraFormat.aperture(v))) }
         if let v = r.minAperture, v > 0 { pages.append(("Lowest Aperture", AuroraFormat.aperture(v))) }
+        pages.append(("Most Used Aperture", value(r.mostUsedAperture, AuroraFormat.aperture)))
         return pages
     }
 
@@ -90,6 +98,7 @@ struct PhotoStatsGrid: View {
         var pages: [(String, String)] = [("Avg Focal", value(r.avgFocalLength, AuroraFormat.focal))]
         if let v = r.maxFocalLength, v > 0 { pages.append(("Highest Focal", AuroraFormat.focal(v))) }
         if let v = r.minFocalLength, v > 0 { pages.append(("Lowest Focal", AuroraFormat.focal(v))) }
+        pages.append(("Most Used Focal", value(r.mostUsedFocalLength, AuroraFormat.focal)))
         return pages
     }
 
@@ -100,12 +109,28 @@ struct PhotoStatsGrid: View {
         // "longest" = bigger seconds. Match the human-friendly framing.
         if let v = r.minShutterSpeed, v > 0 { pages.append(("Fastest Shutter", AuroraFormat.shutter(v))) }
         if let v = r.maxShutterSpeed, v > 0 { pages.append(("Longest Shutter", AuroraFormat.shutter(v))) }
+        pages.append(("Most Used Shutter", value(r.mostUsedShutterSpeed, AuroraFormat.shutter)))
         return pages
+    }
+
+    private var orientationPages: [(label: String, value: String)] {
+        guard let r = report, r.portraitCount + r.landscapeCount > 0 else {
+            return [("Portraits", "—"), ("Landscapes", "—")]
+        }
+        return [
+            ("Portraits", AuroraFormat.count(r.portraitCount)),
+            ("Landscapes", AuroraFormat.count(r.landscapeCount))
+        ]
     }
 
     private func value(_ v: Double?, _ format: (Double) -> String) -> String {
         guard let v = v, v > 0 else { return "—" }
         return format(v)
+    }
+
+    private func keepRate(delivered: Int, rawCount: Int) -> String {
+        guard delivered > 0, rawCount > 0 else { return "—" }
+        return String(format: "%.1f%%", Double(delivered) / Double(rawCount) * 100)
     }
 }
 
@@ -152,6 +177,10 @@ struct PhotoStatCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .auroraCard()
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.medium, style: .continuous)
+                .strokeBorder(accent.opacity(0.22), lineWidth: 1)
+        )
         .onHover { hovering = $0 }
         .onTapGesture {
             guard pages.count > 1 else { return }

@@ -5,9 +5,11 @@ import UniformTypeIdentifiers
 struct HeroEventCard: View {
     @Bindable var appState: AppState
     var onViewEvent: (Int) -> Void
+    @State private var isEmptyStateExpanded = false
 
     var body: some View {
         let info = resolveLatestEvent()
+        let isCollapsedEmptyState = !info.hasData && !isEmptyStateExpanded
 
         ZStack {
             cardBannerBackground(info: info)
@@ -16,16 +18,21 @@ struct HeroEventCard: View {
                 HStack(spacing: 0) {
                     leftPanel(info: info)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    rightPanel(info: info)
-                        .frame(maxWidth: .infinity)
-                        .padding(8)
+                    if !isCollapsedEmptyState {
+                        rightPanel(info: info)
+                            .frame(maxWidth: .infinity)
+                            .padding(8)
+                    }
                 }
-                .frame(height: 198)
-                bottomStrip(info: info)
-                    .frame(height: 52)
+                .frame(height: isCollapsedEmptyState ? 88 : 198)
+                if !isCollapsedEmptyState {
+                    bottomStrip(info: info)
+                        .frame(height: 52)
+                }
             }
+
         }
-        .frame(height: 250)
+        .frame(height: isCollapsedEmptyState ? 88 : 250)
         .background(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
                 .fill(Color.auroraPanel)
@@ -35,6 +42,15 @@ struct HeroEventCard: View {
                 .strokeBorder(Color.auroraStroke, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+        .overlay(alignment: .topTrailing) {
+            if !info.hasData {
+                emptyStateToggleButton
+                    .padding(.top, 12)
+                    .padding(.trailing, 16)
+                    .zIndex(10)
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: isCollapsedEmptyState)
     }
 
     // MARK: - Left
@@ -70,7 +86,9 @@ struct HeroEventCard: View {
                     .foregroundStyle(Color.auroraMuted)
             }
 
-            Spacer(minLength: 4)
+            if info.hasData || isEmptyStateExpanded {
+                Spacer(minLength: 4)
+            }
 
             if info.hasData {
                 Button {
@@ -87,7 +105,7 @@ struct HeroEventCard: View {
                 .buttonStyle(HeroEventActionButtonStyle())
                 .disabled(info.bookmarkIndex == nil)
                 .padding(.bottom, 10)
-            } else {
+            } else if isEmptyStateExpanded {
                 Button {
                     // No-op; placeholder for "Connect a card" prompt.
                 } label: {
@@ -103,6 +121,28 @@ struct HeroEventCard: View {
         }
         .padding(.horizontal, AuroraSpacing.heroPaddingH)
         .padding(.vertical, 14)
+    }
+
+    private var emptyStateToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isEmptyStateExpanded.toggle()
+            }
+        } label: {
+            Image(systemName: isEmptyStateExpanded ? "chevron.up" : "chevron.down")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
+                .frame(width: 30, height: 24)
+                .background(
+                    Capsule()
+                        .fill(Color.auroraBg.opacity(0.58))
+                        .background(.ultraThinMaterial, in: Capsule())
+                )
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(isEmptyStateExpanded ? "Minimize" : "Expand")
     }
 
     // MARK: - Right
@@ -283,6 +323,10 @@ struct HeroEventCard: View {
             return openEvent
         }
 
+        if appState.uniqueImportDestinations.contains(where: { appState.finalizedEvent(forBookmarkIndex: $0.bookmarkIndex) != nil }) {
+            return waitingForNextEventInfo()
+        }
+
         guard let report = appState.lastImportReport else {
             return LatestEventInfo(
                 name: "No imports yet",
@@ -339,6 +383,21 @@ struct HeroEventCard: View {
             ),
             hasData: true,
             isFinalized: isFinalized
+        )
+    }
+
+    private func waitingForNextEventInfo() -> LatestEventInfo {
+        LatestEventInfo(
+            name: "Waiting for next event",
+            folderPath: nil,
+            bookmarkIndex: nil,
+            bannerImagePath: nil,
+            meta: "All current events are finalized",
+            description: "Create a new event folder to start the next import.",
+            badge: "Idle",
+            strip: HeroStrip(rawFiles: "—", data: "—", avgISO: "—", topLens: "—", date: "—"),
+            hasData: false,
+            isFinalized: false
         )
     }
 

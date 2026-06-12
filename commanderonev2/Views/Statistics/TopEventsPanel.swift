@@ -41,6 +41,7 @@ enum EventAggregator {
             let lastDate = summary?.lastDate
                 ?? finalized?.lastImportDate
                 ?? finalized?.finalizedAt
+            let displayDate = appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: lastDate)
                 ?? .distantPast
 
             guard files > 0 else { return nil }
@@ -51,7 +52,7 @@ enum EventAggregator {
                 totalFiles: files,
                 totalBytes: bytes,
                 averageSpeed: avgSpeed,
-                lastDate: lastDate
+                lastDate: displayDate
             )
         }
     }
@@ -152,7 +153,7 @@ enum EventAggregator {
 
 struct TopEventsPanel: View {
     @Bindable var appState: AppState
-    var onSelect: (EventAggregate) -> Void = { _ in }
+    var onSelect: (Int) -> Void = { _ in }
     var onViewAll: () -> Void = {}
 
     var body: some View {
@@ -163,10 +164,11 @@ struct TopEventsPanel: View {
                 .sorted(by: EventAggregator.sortByPhotoCount)
                 .prefix(5)
                 .map { aggregate in
-                    LatestEventDisplay(
-                        aggregate: aggregate,
-                        bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
-                    )
+                        LatestEventDisplay(
+                            aggregate: aggregate,
+                            bookmarkIndex: bookmarkIndex(for: aggregate.id),
+                            bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
+                        )
                 }
 
             if sorted.isEmpty {
@@ -175,7 +177,9 @@ struct TopEventsPanel: View {
                 VStack(spacing: 4) {
                     ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, event in
                         TopEventRow(rank: idx + 1, event: event) {
-                            onSelect(event.aggregate)
+                            if let bookmarkIndex = event.bookmarkIndex {
+                                onSelect(bookmarkIndex)
+                            }
                         }
                     }
                 }
@@ -196,11 +200,25 @@ struct TopEventsPanel: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
+
+    private func bookmarkIndex(for path: String) -> Int? {
+        let eventPath = normalize(path)
+        return appState.uniqueImportDestinations.first { destination in
+            let destinationPath = normalize(destination.path)
+            return destinationPath == eventPath
+                || destinationPath.hasPrefix(eventPath + "/")
+                || eventPath.hasPrefix(destinationPath + "/")
+        }?.bookmarkIndex
+    }
+
+    private func normalize(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
 }
 
 struct LatestEventsPanel: View {
     @Bindable var appState: AppState
-    var onSelect: (EventAggregate) -> Void = { _ in }
+    var onSelect: (Int) -> Void = { _ in }
     var onViewAll: () -> Void = {}
 
     var body: some View {
@@ -208,16 +226,19 @@ struct LatestEventsPanel: View {
             AuroraPanelHeader(title: "Latest Events", actionLabel: "View all →", action: onViewAll)
 
             let sorted = appState.uniqueImportDestinations
-                .prefix(5)
                 .compactMap(latestEventDisplay)
+                .sorted(by: latestEventSort)
+                .prefix(5)
 
             if sorted.isEmpty {
                 emptyState
             } else {
                 VStack(spacing: 4) {
                     ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, event in
-                        LatestEventRow(rank: idx + 1, event: event) {
-                            onSelect(event.aggregate)
+                        LatestEventRow(rank: idx + 1, event: event, appState: appState) {
+                            if let bookmarkIndex = event.bookmarkIndex {
+                                onSelect(bookmarkIndex)
+                            }
                         }
                     }
                 }
@@ -239,6 +260,13 @@ struct LatestEventsPanel: View {
         .padding(.vertical, 24)
     }
 
+    private func latestEventSort(_ lhs: LatestEventDisplay, _ rhs: LatestEventDisplay) -> Bool {
+        if lhs.aggregate.lastDate != rhs.aggregate.lastDate {
+            return lhs.aggregate.lastDate > rhs.aggregate.lastDate
+        }
+        return (lhs.bookmarkIndex ?? -1) > (rhs.bookmarkIndex ?? -1)
+    }
+
     private func latestEventDisplay(
         for destination: (path: String, name: String, bookmarkIndex: Int)
     ) -> LatestEventDisplay? {
@@ -257,7 +285,7 @@ struct LatestEventsPanel: View {
             totalFiles: totalFiles,
             totalBytes: summary?.totalBytes ?? 0,
             averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
-            lastDate: summary?.lastDate ?? .distantPast
+            lastDate: appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: summary?.lastDate) ?? .distantPast
         )
         let bannerPath: String? = if destination.bookmarkIndex < appState.eventFolderBannerImagePaths.count {
             appState.eventFolderBannerImagePaths[destination.bookmarkIndex].isEmpty
@@ -266,12 +294,13 @@ struct LatestEventsPanel: View {
         } else {
             nil
         }
-        return LatestEventDisplay(aggregate: aggregate, bannerImagePath: bannerPath)
+        return LatestEventDisplay(aggregate: aggregate, bookmarkIndex: destination.bookmarkIndex, bannerImagePath: bannerPath)
     }
 }
 
 struct LatestEventDisplay: Identifiable {
     let aggregate: EventAggregate
+    let bookmarkIndex: Int?
     let bannerImagePath: String?
 
     var id: String { aggregate.id }
@@ -322,45 +351,111 @@ struct TopEventRow: View {
 struct LatestEventRow: View {
     let rank: Int
     let event: LatestEventDisplay
+    @Bindable var appState: AppState
     var onTap: () -> Void
 
     @State private var hovering = false
+    @State private var isEditingDate = false
+    @State private var draftDate = Date()
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 12) {
-                RankBadge(rank: rank)
-                EventThumbnail(
-                    eventName: event.aggregate.name,
-                    folderPath: event.aggregate.id,
-                    bannerImagePath: event.bannerImagePath
-                )
-                .frame(width: 44, height: 34)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(event.aggregate.name)
-                        .font(.auroraEventName)
-                        .foregroundStyle(Color.auroraTxt)
-                        .lineLimit(1)
-                    Text(dateText)
-                        .font(.manrope(11, weight: .semibold))
-                        .foregroundStyle(Color.auroraFaint)
-                }
-                Spacer(minLength: 4)
-                SpeedPill(text: AuroraFormat.count(event.aggregate.totalFiles), tint: .auroraViolet)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(hovering ? Color.auroraPanel2 : Color.clear)
+        HStack(spacing: 12) {
+            RankBadge(rank: rank)
+            EventThumbnail(
+                eventName: event.aggregate.name,
+                folderPath: event.aggregate.id,
+                bannerImagePath: event.bannerImagePath
             )
+            .frame(width: 44, height: 34)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.aggregate.name)
+                    .font(.auroraEventName)
+                    .foregroundStyle(Color.auroraTxt)
+                    .lineLimit(1)
+                Text(dateText)
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(Color.auroraFaint)
+                    .contentShape(Rectangle())
+                    .help(dateHelpText)
+                    .highPriorityGesture(TapGesture().onEnded {
+                        guard event.bookmarkIndex != nil else { return }
+                        draftDate = editableDate
+                        isEditingDate = true
+                    })
+            }
+            Spacer(minLength: 4)
+            SpeedPill(text: AuroraFormat.count(event.aggregate.totalFiles), tint: .auroraViolet)
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(hovering ? Color.auroraPanel2 : Color.clear)
+        )
         .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
         .onHover { hovering = $0 }
+        .popover(isPresented: $isEditingDate, arrowEdge: .bottom) {
+            manualDateEditor
+        }
     }
 
     private var dateText: String {
         event.aggregate.lastDate == .distantPast ? "—" : AuroraFormat.dateCompact(event.aggregate.lastDate)
+    }
+
+    private var dateHelpText: String {
+        event.bookmarkIndex == nil ? "" : "Click to set a manual event date"
+    }
+
+    private var editableDate: Date {
+        if let bookmarkIndex = event.bookmarkIndex,
+           let manual = appState.manualDateForEvent(at: bookmarkIndex) {
+            return manual
+        }
+        return event.aggregate.lastDate == .distantPast ? Date() : event.aggregate.lastDate
+    }
+
+    private var manualDateEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Manual Event Date")
+                .font(.manrope(13, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
+            HStack {
+                Spacer(minLength: 0)
+                AuroraManualDatePicker(selection: $draftDate)
+                    .frame(width: 190)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                Button("Clear") {
+                    if let bookmarkIndex = event.bookmarkIndex {
+                        appState.setManualDateForEvent(at: bookmarkIndex, date: nil)
+                    }
+                    isEditingDate = false
+                }
+                .buttonStyle(AuroraGhostButtonStyle())
+                Spacer()
+                Button("Save") {
+                    if let bookmarkIndex = event.bookmarkIndex {
+                        appState.setManualDateForEvent(at: bookmarkIndex, date: draftDate)
+                    }
+                    isEditingDate = false
+                }
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            }
+        }
+        .padding(16)
+        .frame(width: 252)
+        .background(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .fill(Color.auroraBg2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke2, lineWidth: 1)
+        )
     }
 }
 

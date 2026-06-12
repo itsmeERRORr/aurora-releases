@@ -27,6 +27,8 @@ struct StatisticsView: View {
                 chartsRow
 
                 photosPerMonthRow
+
+                rawImportsTimelineRow
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
             .padding(.vertical, AuroraSpacing.mainPaddingV)
@@ -34,16 +36,16 @@ struct StatisticsView: View {
         }
         .scrollIndicators(.hidden)
         .sheet(item: $viewAllSheet) { sheet in
-            StatsViewAllSheetView(kind: sheet, appState: appState)
+            StatsViewAllSheetView(kind: sheet, appState: appState, onSelectEvent: onSelectEvent)
         }
     }
 
     // 1 : 1 — Top Events + Latest Events
     private var eventsRow: some View {
         HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
-            TopEventsPanel(appState: appState, onViewAll: { viewAllSheet = .topEvents })
+            TopEventsPanel(appState: appState, onSelect: onSelectEvent, onViewAll: { viewAllSheet = .topEvents })
                 .frame(maxWidth: .infinity)
-            LatestEventsPanel(appState: appState, onViewAll: { viewAllSheet = .latestEvents })
+            LatestEventsPanel(appState: appState, onSelect: onSelectEvent, onViewAll: { viewAllSheet = .latestEvents })
                 .frame(maxWidth: .infinity)
         }
     }
@@ -71,6 +73,11 @@ struct StatisticsView: View {
             }
         }
         .frame(minHeight: 360)
+    }
+
+    // Full width — RAW imports by day/week/month
+    private var rawImportsTimelineRow: some View {
+        RAWImportsTimelineChart(appState: appState)
     }
 
     // Full width — Photos per Month
@@ -104,31 +111,136 @@ enum StatsViewAllSheet: String, Identifiable {
 struct StatsViewAllSheetView: View {
     let kind: StatsViewAllSheet
     @Bindable var appState: AppState
+    var onSelectEvent: (Int) -> Void = { _ in }
     @Environment(\.dismiss) private var dismiss
+    @State private var dateEditor: ManualEventDateEditorState?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text(kind.title.uppercased())
-                    .font(.auroraSectionLabel)
-                    .tracking(1.6)
-                    .foregroundStyle(Color.auroraFaint)
-                Spacer()
-                Button("Done") { dismiss() }
-                    .buttonStyle(AuroraGhostButtonStyle())
-            }
-
-            ScrollView {
-                VStack(spacing: 4) {
-                    content
+        ZStack {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text(kind.title.uppercased())
+                        .font(.auroraSectionLabel)
+                        .tracking(1.6)
+                        .foregroundStyle(Color.auroraFaint)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                        .buttonStyle(AuroraGhostButtonStyle())
                 }
+
+                ScrollView {
+                    VStack(spacing: 4) {
+                        content
+                    }
+                }
+                .scrollIndicators(.hidden)
             }
-            .scrollIndicators(.hidden)
+            .padding(20)
+            .frame(minWidth: 560, minHeight: 520)
+            .background(Color.auroraBg)
+            .background(OutsideSheetClickDismissor { dismiss() })
+
+            if dateEditor != nil {
+                Color.black.opacity(0.36)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                    .onTapGesture { dateEditor = nil }
+                manualDateEditor
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
         }
-        .padding(20)
-        .frame(minWidth: 560, minHeight: 520)
-        .background(Color.auroraBg)
-        .background(OutsideSheetClickDismissor { dismiss() })
+        .animation(.easeOut(duration: 0.16), value: dateEditor?.id)
+    }
+
+    private var manualDateEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Manual Event Date")
+                .font(.manrope(13, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
+            HStack {
+                Spacer(minLength: 0)
+                AuroraManualDatePicker(selection: dateEditorDateBinding)
+                    .frame(width: 190)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                Button("Clear") {
+                    if let dateEditor {
+                        appState.setManualDateForEvent(at: dateEditor.bookmarkIndex, date: nil)
+                    }
+                    self.dateEditor = nil
+                }
+                .buttonStyle(AuroraGhostButtonStyle())
+                Spacer()
+                Button("Save") {
+                    if let dateEditor {
+                        appState.setManualDateForEvent(at: dateEditor.bookmarkIndex, date: dateEditor.date)
+                    }
+                    self.dateEditor = nil
+                }
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            }
+        }
+        .padding(16)
+        .frame(width: 252)
+        .background(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .fill(Color.auroraBg2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke2, lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.45), radius: 24, x: 0, y: 14)
+    }
+
+    private var dateEditorDateBinding: Binding<Date> {
+        Binding(
+            get: { dateEditor?.date ?? Date() },
+            set: { newDate in
+                guard var dateEditor else { return }
+                dateEditor.date = newDate
+                self.dateEditor = dateEditor
+            }
+        )
+    }
+
+    private func openDateEditor(bookmarkIndex: Int, date: Date) {
+        dateEditor = ManualEventDateEditorState(bookmarkIndex: bookmarkIndex, date: date)
+    }
+
+    private func latestEventSort(
+        _ lhs: (path: String, name: String, bookmarkIndex: Int),
+        _ rhs: (path: String, name: String, bookmarkIndex: Int)
+    ) -> Bool {
+        let lhsDate = latestDate(for: lhs)
+        let rhsDate = latestDate(for: rhs)
+        if lhsDate != rhsDate { return lhsDate > rhsDate }
+        return lhs.bookmarkIndex > rhs.bookmarkIndex
+    }
+
+    private func latestDate(for event: (path: String, name: String, bookmarkIndex: Int)) -> Date {
+        let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
+        return appState.displayDateForEvent(at: event.bookmarkIndex, automaticDate: summary?.lastDate) ?? .distantPast
+    }
+
+    private func bookmarkIndex(for path: String) -> Int? {
+        let eventPath = normalize(path)
+        return appState.uniqueImportDestinations.first { destination in
+            let destinationPath = normalize(destination.path)
+            return destinationPath == eventPath
+                || destinationPath.hasPrefix(eventPath + "/")
+                || eventPath.hasPrefix(destinationPath + "/")
+        }?.bookmarkIndex
+    }
+
+    private func selectEvent(_ bookmarkIndex: Int) {
+        dismiss()
+        onSelectEvent(bookmarkIndex)
+    }
+
+    private func normalize(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     @ViewBuilder
@@ -140,15 +252,25 @@ struct StatsViewAllSheetView: View {
                 .map { aggregate in
                     LatestEventDisplay(
                         aggregate: aggregate,
+                        bookmarkIndex: bookmarkIndex(for: aggregate.id),
                         bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
                     )
                 }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
-                TopEventRow(rank: idx + 1, event: event) {}
+                TopEventRow(rank: idx + 1, event: event) {
+                    if let bookmarkIndex = event.bookmarkIndex {
+                        selectEvent(bookmarkIndex)
+                    }
+                }
             }
         case .latestEvents:
-            ForEach(Array(appState.uniqueImportDestinations.enumerated()), id: \.element.bookmarkIndex) { idx, event in
-                LatestSidebarOrderRow(rank: idx + 1, event: event, appState: appState)
+            let events = appState.uniqueImportDestinations.sorted(by: latestEventSort)
+            ForEach(Array(events.enumerated()), id: \.element.bookmarkIndex) { idx, event in
+                LatestSidebarOrderRow(rank: idx + 1, event: event, appState: appState) { bookmarkIndex, date in
+                    openDateEditor(bookmarkIndex: bookmarkIndex, date: date)
+                } onSelect: {
+                    selectEvent(event.bookmarkIndex)
+                }
             }
         case .topCameras:
             let cameras = appState.totalStatsReport?.allCameras ?? []
@@ -176,13 +298,29 @@ struct StatsViewAllSheetView: View {
     }
 }
 
+private struct ManualEventDateEditorState: Identifiable, Equatable {
+    let id = UUID()
+    let bookmarkIndex: Int
+    var date: Date
+}
+
 private struct LatestSidebarOrderRow: View {
     let rank: Int
     let event: (path: String, name: String, bookmarkIndex: Int)
     @Bindable var appState: AppState
+    var onEditDate: (Int, Date) -> Void
+    var onSelect: () -> Void = {}
 
     var body: some View {
         let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
+        let finalized = appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex)
+        let peak = event.bookmarkIndex < appState.eventFolderPeakRawCounts.count
+            ? appState.eventFolderPeakRawCounts[event.bookmarkIndex]
+            : 0
+        let cached = event.bookmarkIndex < appState.eventFolderCachedCounts.count
+            ? max(appState.eventFolderCachedCounts[event.bookmarkIndex], 0)
+            : 0
+        let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
         let bannerPath: String? = {
             guard event.bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
             let path = appState.eventFolderBannerImagePaths[event.bookmarkIndex]
@@ -192,21 +330,45 @@ private struct LatestSidebarOrderRow: View {
             RankBadge(rank: rank)
             EventThumbnail(eventName: event.name, folderPath: event.path, bannerImagePath: bannerPath)
                 .frame(width: 44, height: 34)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onSelect)
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.name)
                     .font(.auroraEventName)
                     .foregroundStyle(Color.auroraTxt)
                     .lineLimit(1)
-                Text(summary?.lastDate.map(AuroraFormat.dateCompact) ?? "—")
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onSelect)
+                Text(displayDate(summary?.lastDate, bookmarkIndex: event.bookmarkIndex).map(AuroraFormat.dateCompact) ?? "—")
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
+                    .contentShape(Rectangle())
+                    .help("Click to set a manual event date")
+                    .onTapGesture {
+                        onEditDate(event.bookmarkIndex, editableDate(automaticDate: summary?.lastDate))
+                    }
             }
             Spacer(minLength: 4)
-            SpeedPill(text: AuroraFormat.count(summary?.photoCount ?? 0), tint: .auroraViolet)
+            SpeedPill(text: AuroraFormat.count(totalFiles), tint: .auroraViolet)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
     }
+
+    private func displayDate(_ automaticDate: Date?, bookmarkIndex: Int) -> Date? {
+        appState.displayDateForEvent(at: bookmarkIndex, automaticDate: automaticDate)
+    }
+
+    private func editableDate(automaticDate: Date?) -> Date {
+        if let manual = appState.manualDateForEvent(at: event.bookmarkIndex) {
+            return manual
+        }
+        if let automaticDate, automaticDate != .distantPast {
+            return automaticDate
+        }
+        return Date()
+    }
+
 }
 
 private struct PhotosPerEventListRow: View {

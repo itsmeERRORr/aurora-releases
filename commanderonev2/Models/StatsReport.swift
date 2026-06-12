@@ -35,6 +35,58 @@ struct StatsReport: Equatable, Codable {
         return weightedSum / Double(totalWeight)
     }
 
+    func recalculatingISOFromRawOutput() -> StatsReport {
+        guard let data = rawOutput.data(using: .utf8),
+              let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return self
+        }
+
+        let values = entries.compactMap(Self.effectiveISO(from:))
+        guard !values.isEmpty else { return self }
+
+        var report = self
+        report.isoSum = values.reduce(0, +)
+        report.isoCount = values.count
+        report.avgISO = report.isoSum / Double(values.count)
+        report.maxISO = values.max()
+        report.minISO = values.min()
+        return report
+    }
+
+    private static func effectiveISO(from entry: [String: Any]) -> Double? {
+        let candidates = [
+            parseISOField(entry["ISO"]),
+            parseISOField(entry["ISOSpeed"]),
+            parseISOField(entry["RecommendedExposureIndex"]),
+            parseISOField(entry["ISOSetting"]),
+            parseISOField(entry["SonyISO"])
+        ].compactMap { $0 }.filter { $0 > 0 }
+        return candidates.max()
+    }
+
+    private static func parseISOField(_ value: Any?) -> Double? {
+        if let i = value as? Int { return Double(i) }
+        if let d = value as? Double { return d }
+        if let array = value as? [Any] {
+            return array.compactMap(parseISOField).max()
+        }
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let direct = Double(trimmed.replacingOccurrences(of: ",", with: "")) {
+            return direct
+        }
+
+        var token = ""
+        for char in trimmed {
+            if char.isNumber || char == "." || char == "," {
+                token.append(char)
+            } else if !token.isEmpty {
+                break
+            }
+        }
+        return Double(token.replacingOccurrences(of: ",", with: ""))
+    }
+
     var allCameras: [CameraStat] {
         let sorted = cameraCounts.sorted { $0.value > $1.value }
         return sorted.map { key, count in
@@ -76,6 +128,10 @@ struct StatsReport: Equatable, Codable {
     var lensCounts: [String: Int]
     var cameraCounts: [String: Int]
     var shutterCounts: [Double: Int]
+    var isoCounts: [String: Int]
+    var apertureCounts: [String: Int]
+    var focalCounts: [String: Int]
+    var orientationCounts: [String: Int]
     var maxShutterSpeed: Double?
     var minShutterSpeed: Double?
     var isoSum: Double
@@ -110,6 +166,10 @@ struct StatsReport: Equatable, Codable {
         lensCounts: [String: Int] = [:],
         cameraCounts: [String: Int] = [:],
         shutterCounts: [Double: Int] = [:],
+        isoCounts: [String: Int] = [:],
+        apertureCounts: [String: Int] = [:],
+        focalCounts: [String: Int] = [:],
+        orientationCounts: [String: Int] = [:],
         maxShutterSpeed: Double? = nil,
         minShutterSpeed: Double? = nil,
         isoSum: Double = 0,
@@ -143,6 +203,10 @@ struct StatsReport: Equatable, Codable {
         self.lensCounts = lensCounts
         self.cameraCounts = cameraCounts
         self.shutterCounts = shutterCounts
+        self.isoCounts = isoCounts
+        self.apertureCounts = apertureCounts
+        self.focalCounts = focalCounts
+        self.orientationCounts = orientationCounts
         self.maxShutterSpeed = maxShutterSpeed
         self.minShutterSpeed = minShutterSpeed
         self.isoSum = isoSum
@@ -154,6 +218,45 @@ struct StatsReport: Equatable, Codable {
         self.monthCounts = monthCounts
         self.weekCounts = weekCounts
         self.yearCounts = yearCounts
+    }
+
+    var mostUsedISO: Double? {
+        mostUsedNumericKey(in: isoCounts)
+    }
+
+    var mostUsedAperture: Double? {
+        mostUsedNumericKey(in: apertureCounts)
+    }
+
+    var mostUsedFocalLength: Double? {
+        mostUsedNumericKey(in: focalCounts)
+    }
+
+    var mostUsedShutterSpeed: Double? {
+        shutterCounts.sorted { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value > rhs.value }
+            return lhs.key < rhs.key
+        }.first?.key
+    }
+
+    private func mostUsedNumericKey(in counts: [String: Int]) -> Double? {
+        counts.compactMap { key, count -> (value: Double, count: Int)? in
+            guard let value = Double(key), value > 0 else { return nil }
+            return (value, count)
+        }
+        .sorted { lhs, rhs in
+            if lhs.count != rhs.count { return lhs.count > rhs.count }
+            return lhs.value < rhs.value
+        }
+        .first?.value
+    }
+
+    var portraitCount: Int {
+        orientationCounts["portrait", default: 0]
+    }
+
+    var landscapeCount: Int {
+        orientationCounts["landscape", default: 0]
     }
 
     struct LensStat: Equatable, Identifiable, Codable {
@@ -252,7 +355,7 @@ struct StatsReport: Equatable, Codable {
         case avgAperture, maxAperture, minAperture
         case avgFocalLength, maxFocalLength, minFocalLength
         case totalBytes, totalDuration, importCount, firstImportDate
-        case lensCounts, cameraCounts, shutterCounts, maxShutterSpeed, minShutterSpeed
+        case lensCounts, cameraCounts, shutterCounts, isoCounts, apertureCounts, focalCounts, orientationCounts, maxShutterSpeed, minShutterSpeed
         case isoSum, isoCount, apertureSum, apertureCount, focalSum, focalCount, monthCounts, weekCounts, yearCounts
     }
 
@@ -281,6 +384,10 @@ struct StatsReport: Equatable, Codable {
         // Encode [Double: Int] as [String: Int]
         let stringKeyedShutter = Dictionary(uniqueKeysWithValues: shutterCounts.map { (String($0.key), $0.value) })
         try container.encode(stringKeyedShutter, forKey: .shutterCounts)
+        try container.encode(isoCounts, forKey: .isoCounts)
+        try container.encode(apertureCounts, forKey: .apertureCounts)
+        try container.encode(focalCounts, forKey: .focalCounts)
+        try container.encode(orientationCounts, forKey: .orientationCounts)
         try container.encodeIfPresent(maxShutterSpeed, forKey: .maxShutterSpeed)
         try container.encodeIfPresent(minShutterSpeed, forKey: .minShutterSpeed)
         try container.encode(isoSum, forKey: .isoSum)
@@ -326,6 +433,10 @@ struct StatsReport: Equatable, Codable {
             // Old data may have stored shutterCounts as an array — discard it
             shutterCounts = [:]
         }
+        isoCounts = try container.decodeIfPresent([String: Int].self, forKey: .isoCounts) ?? [:]
+        apertureCounts = try container.decodeIfPresent([String: Int].self, forKey: .apertureCounts) ?? [:]
+        focalCounts = try container.decodeIfPresent([String: Int].self, forKey: .focalCounts) ?? [:]
+        orientationCounts = try container.decodeIfPresent([String: Int].self, forKey: .orientationCounts) ?? [:]
         maxShutterSpeed = try container.decodeIfPresent(Double.self, forKey: .maxShutterSpeed)
         minShutterSpeed = try container.decodeIfPresent(Double.self, forKey: .minShutterSpeed)
         isoSum = try container.decodeIfPresent(Double.self, forKey: .isoSum) ?? 0
@@ -367,6 +478,26 @@ struct StatsReport: Equatable, Codable {
         var combinedShutterCounts = report1.shutterCounts
         for (shutter, count) in report2.shutterCounts {
             combinedShutterCounts[shutter, default: 0] += count
+        }
+
+        var combinedISOCounts = report1.isoCounts
+        for (iso, count) in report2.isoCounts {
+            combinedISOCounts[iso, default: 0] += count
+        }
+
+        var combinedApertureCounts = report1.apertureCounts
+        for (aperture, count) in report2.apertureCounts {
+            combinedApertureCounts[aperture, default: 0] += count
+        }
+
+        var combinedFocalCounts = report1.focalCounts
+        for (focal, count) in report2.focalCounts {
+            combinedFocalCounts[focal, default: 0] += count
+        }
+
+        var combinedOrientationCounts = report1.orientationCounts
+        for (orientation, count) in report2.orientationCounts {
+            combinedOrientationCounts[orientation, default: 0] += count
         }
 
         var combinedMonthCounts = report1.monthCounts
@@ -465,6 +596,10 @@ struct StatsReport: Equatable, Codable {
             lensCounts: combinedLensCounts,
             cameraCounts: combinedCameraCounts,
             shutterCounts: combinedShutterCounts,
+            isoCounts: combinedISOCounts,
+            apertureCounts: combinedApertureCounts,
+            focalCounts: combinedFocalCounts,
+            orientationCounts: combinedOrientationCounts,
             maxShutterSpeed: maxShutterSpeed,
             minShutterSpeed: minShutterSpeed,
             isoSum: combinedIsoSum,
@@ -477,5 +612,130 @@ struct StatsReport: Equatable, Codable {
             weekCounts: combinedWeekCounts,
             yearCounts: combinedYearCounts
         )
+    }
+
+    func removing(_ removed: StatsReport) -> StatsReport? {
+        let remainingFileCount = max(0, totalFilesAnalyzed - removed.totalFilesAnalyzed)
+        guard remainingFileCount > 0 else { return nil }
+
+        let remainingLensCounts = Self.subtractCounts(lensCounts, removing: removed.lensCounts)
+            .filter { !Self.isNoLensKey($0.key) }
+        let remainingCameraCounts = Self.subtractCounts(cameraCounts, removing: removed.cameraCounts)
+        let remainingShutterCounts = Self.subtractCounts(shutterCounts, removing: removed.shutterCounts)
+        let remainingISOCounts = Self.subtractCounts(isoCounts, removing: removed.isoCounts)
+        let remainingApertureCounts = Self.subtractCounts(apertureCounts, removing: removed.apertureCounts)
+        let remainingFocalCounts = Self.subtractCounts(focalCounts, removing: removed.focalCounts)
+        let remainingOrientationCounts = Self.subtractCounts(orientationCounts, removing: removed.orientationCounts)
+        let remainingMonthCounts = Self.subtractCounts(monthCounts, removing: removed.monthCounts)
+        let remainingWeekCounts = Self.subtractCounts(weekCounts, removing: removed.weekCounts)
+        let remainingYearCounts = Self.subtractCounts(yearCounts, removing: removed.yearCounts)
+
+        let remainingIsoSum = max(0, isoSum - removed.isoSum)
+        let remainingIsoCount = max(0, isoCount - removed.isoCount)
+        let remainingApertureSum = max(0, apertureSum - removed.apertureSum)
+        let remainingApertureCount = max(0, apertureCount - removed.apertureCount)
+        let remainingFocalSum = max(0, focalSum - removed.focalSum)
+        let remainingFocalCount = max(0, focalCount - removed.focalCount)
+
+        return StatsReport(
+            topLenses: Self.topLenses(from: remainingLensCounts),
+            mostUsedCamera: Self.topCamera(from: remainingCameraCounts),
+            shutterSpeeds: Self.topShutters(from: remainingShutterCounts),
+            totalFilesAnalyzed: remainingFileCount,
+            rawOutput: "Adjusted stats from \(remainingFileCount) files",
+            avgISO: remainingIsoCount > 0 ? remainingIsoSum / Double(remainingIsoCount) : nil,
+            maxISO: Self.numericMaximum(in: remainingISOCounts),
+            minISO: Self.numericMinimum(in: remainingISOCounts),
+            avgAperture: remainingApertureCount > 0 ? remainingApertureSum / Double(remainingApertureCount) : nil,
+            maxAperture: Self.numericMaximum(in: remainingApertureCounts),
+            minAperture: Self.numericMinimum(in: remainingApertureCounts),
+            avgFocalLength: remainingFocalCount > 0 ? remainingFocalSum / Double(remainingFocalCount) : nil,
+            maxFocalLength: Self.numericMaximum(in: remainingFocalCounts),
+            minFocalLength: Self.numericMinimum(in: remainingFocalCounts),
+            totalBytes: max(0, totalBytes - removed.totalBytes),
+            totalDuration: max(0, totalDuration - removed.totalDuration),
+            importCount: max(0, importCount - removed.importCount),
+            firstImportDate: firstImportDate,
+            lensCounts: remainingLensCounts,
+            cameraCounts: remainingCameraCounts,
+            shutterCounts: remainingShutterCounts,
+            isoCounts: remainingISOCounts,
+            apertureCounts: remainingApertureCounts,
+            focalCounts: remainingFocalCounts,
+            orientationCounts: remainingOrientationCounts,
+            maxShutterSpeed: remainingShutterCounts.keys.max(),
+            minShutterSpeed: remainingShutterCounts.keys.min(),
+            isoSum: remainingIsoSum,
+            isoCount: remainingIsoCount,
+            apertureSum: remainingApertureSum,
+            apertureCount: remainingApertureCount,
+            focalSum: remainingFocalSum,
+            focalCount: remainingFocalCount,
+            monthCounts: remainingMonthCounts,
+            weekCounts: remainingWeekCounts,
+            yearCounts: remainingYearCounts
+        )
+    }
+
+    private static func subtractCounts<Key: Hashable>(_ counts: [Key: Int], removing removed: [Key: Int]) -> [Key: Int] {
+        var result = counts
+        for (key, removedCount) in removed {
+            let remaining = result[key, default: 0] - removedCount
+            if remaining > 0 {
+                result[key] = remaining
+            } else {
+                result.removeValue(forKey: key)
+            }
+        }
+        return result
+    }
+
+    private static func topLenses(from counts: [String: Int]) -> [LensStat] {
+        counts
+            .filter { !isNoLensKey($0.key) }
+            .sorted { $0.value > $1.value }
+            .prefix(3)
+            .enumerated()
+            .map { idx, pair in
+                let parts = pair.key.split(separator: "|", maxSplits: 1)
+                return LensStat(
+                    make: String(parts.first ?? ""),
+                    model: String(parts.last ?? ""),
+                    count: pair.value,
+                    rank: idx + 1
+                )
+            }
+    }
+
+    private static func topCamera(from counts: [String: Int]) -> CameraStat? {
+        guard let topCamera = counts.max(by: { $0.value < $1.value }) else { return nil }
+        let parts = topCamera.key.split(separator: "|", maxSplits: 1)
+        return CameraStat(
+            make: String(parts.first ?? ""),
+            model: String(parts.last ?? ""),
+            count: topCamera.value
+        )
+    }
+
+    private static func topShutters(from counts: [Double: Int]) -> [ShutterStat] {
+        counts
+            .sorted { $0.value > $1.value }
+            .prefix(5)
+            .map { ShutterStat(rawValue: $0.key, count: $0.value) }
+    }
+
+    private static func numericMaximum(in counts: [String: Int]) -> Double? {
+        counts.keys.compactMap(Double.init).filter { $0 > 0 }.max()
+    }
+
+    private static func numericMinimum(in counts: [String: Int]) -> Double? {
+        counts.keys.compactMap(Double.init).filter { $0 > 0 }.min()
+    }
+
+    private static func isNoLensKey(_ key: String) -> Bool {
+        let parts = key.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2 else { return false }
+        let model = String(parts.last ?? "").trimmingCharacters(in: .whitespaces)
+        return !model.isEmpty && model.allSatisfy { $0 == "-" }
     }
 }

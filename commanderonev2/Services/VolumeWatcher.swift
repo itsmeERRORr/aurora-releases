@@ -5,6 +5,8 @@ import AppKit
 final class VolumeWatcher {
     private let appState: AppState
     private var isWatching = false
+    private var mountObserver: NSObjectProtocol?
+    private var unmountObserver: NSObjectProtocol?
 
     init(appState: AppState) {
         self.appState = appState
@@ -17,7 +19,7 @@ final class VolumeWatcher {
 
         let center = NSWorkspace.shared.notificationCenter
 
-        center.addObserver(
+        mountObserver = center.addObserver(
             forName: NSWorkspace.didMountNotification,
             object: nil,
             queue: .main
@@ -28,7 +30,7 @@ final class VolumeWatcher {
             }
         }
 
-        center.addObserver(
+        unmountObserver = center.addObserver(
             forName: NSWorkspace.didUnmountNotification,
             object: nil,
             queue: .main
@@ -43,9 +45,24 @@ final class VolumeWatcher {
     }
 
     func stopWatching() {
+        guard isWatching else { return }
         isWatching = false
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        let center = NSWorkspace.shared.notificationCenter
+        if let mountObserver {
+            center.removeObserver(mountObserver)
+            self.mountObserver = nil
+        }
+        if let unmountObserver {
+            center.removeObserver(unmountObserver)
+            self.unmountObserver = nil
+        }
         appState.log("Volume watcher stopped")
+    }
+
+    deinit {
+        let center = NSWorkspace.shared.notificationCenter
+        if let mountObserver { center.removeObserver(mountObserver) }
+        if let unmountObserver { center.removeObserver(unmountObserver) }
     }
 
     private func scanExistingVolumes() {
@@ -176,7 +193,7 @@ final class VolumeWatcher {
 
     /// Count RAW files recursively in a folder (including subfolders). Thread-safe; can be called from background.
     /// - Parameter modifiedOnOrAfter: if non-nil, only count files with contentModificationDate >= this date (e.g. last 12 months).
-    static func countRawFiles(at url: URL, extensions: Set<String>, modifiedOnOrAfter: Date? = nil) -> Int {
+    nonisolated static func countRawFiles(at url: URL, extensions: Set<String>, modifiedOnOrAfter: Date? = nil) -> Int {
         let fm = FileManager.default
         let securityScoped = SecurityBookmarkManager.shared.requestAccess(for: url)
         defer { if securityScoped { SecurityBookmarkManager.shared.stopAccessing(url) } }
@@ -232,7 +249,7 @@ final class VolumeWatcher {
     }
 
     /// List RAW files recursively in a folder. Thread-safe; can be called from any context.
-    static func listRawFiles(at url: URL, extensions: Set<String>) -> [URL] {
+    nonisolated static func listRawFiles(at url: URL, extensions: Set<String>) -> [URL] {
         let fm = FileManager.default
         let securityScoped = SecurityBookmarkManager.shared.requestAccess(for: url)
         defer { if securityScoped { SecurityBookmarkManager.shared.stopAccessing(url) } }

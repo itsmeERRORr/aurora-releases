@@ -14,25 +14,35 @@ final class EventStatsCache {
         let report: StatsReport
         let scanDate: Date
         let folderPath: String
+        let rawFileCountAtScan: Int?
     }
 
-    static func save(_ report: StatsReport, forPath path: String, scanDate: Date = Date()) {
+    static func save(_ report: StatsReport, forPath path: String, scanDate: Date = Date(), rawFileCountAtScan: Int? = nil) {
         let fm = FileManager.default
         try? fm.createDirectory(at: storageDir, withIntermediateDirectories: true)
         let url = storageDir.appendingPathComponent(cacheFilename(for: path))
-        let entry = CacheEntry(report: report, scanDate: scanDate, folderPath: path)
+        let entry = CacheEntry(
+            report: report,
+            scanDate: scanDate,
+            folderPath: path,
+            rawFileCountAtScan: rawFileCountAtScan
+        )
         if let data = try? JSONEncoder().encode(entry) {
             try? data.write(to: url, options: .atomic)
         }
     }
 
-    static func load(forPath path: String) -> (report: StatsReport, scanDate: Date)? {
+    static func load(forPath path: String) -> (report: StatsReport, scanDate: Date, rawFileCountAtScan: Int?)? {
         let url = storageDir.appendingPathComponent(cacheFilename(for: path))
         guard let data = try? Data(contentsOf: url),
               let entry = try? JSONDecoder().decode(CacheEntry.self, from: data) else {
             return nil
         }
-        return (report: entry.report, scanDate: entry.scanDate)
+        return (
+            report: entry.report.recalculatingISOFromRawOutput(),
+            scanDate: entry.scanDate,
+            rawFileCountAtScan: entry.rawFileCountAtScan
+        )
     }
 
     static func clear(forPath path: String) {

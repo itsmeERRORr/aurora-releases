@@ -27,7 +27,30 @@ enum ImportHistoryStorage {
         save(history)
     }
 
+    @discardableResult
+    static func removeEntries(matchingAnyOf paths: [String]) -> [ImportHistoryEntry] {
+        let normalizedPaths = Set(paths.map(normalizePath).filter { !$0.isEmpty })
+        guard !normalizedPaths.isEmpty else { return [] }
+
+        let history = load()
+        var removed: [ImportHistoryEntry] = []
+        let kept = history.filter { entry in
+            let destination = normalizePath(entry.destinationPath)
+            let matches = normalizedPaths.contains { path in
+                destination == path || destination.hasPrefix(path + "/")
+            }
+            if matches { removed.append(entry) }
+            return !matches
+        }
+        save(kept)
+        return removed
+    }
+
     static func clear() {
         UserDefaults.standard.removeObject(forKey: storageKey)
+    }
+
+    private static func normalizePath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 }

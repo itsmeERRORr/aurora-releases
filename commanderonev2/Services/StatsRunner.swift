@@ -201,8 +201,10 @@ final class StatsRunner {
                 // `ISO` tag can be capped at a reference value (often 400)
                 // while the real ISO used is written to ISOSpeed or
                 // RecommendedExposureIndex (SensitivityType=3). Read all
-                // three so the parser can pick the largest as the effective ISO.
-                "-ISO", "-ISOSpeed", "-RecommendedExposureIndex",
+                // three plus Sony MakerNote variants so the parser can pick
+                // the largest as the effective ISO.
+                "-ISO", "-ISOSpeed", "-RecommendedExposureIndex", "-ISOSetting", "-SonyISO",
+                "-ImageWidth", "-ImageHeight", "-ExifImageWidth", "-ExifImageHeight", "-Orientation",
                 "-DateTimeOriginal", "-CreateDate", "-DateCreated"
             ]
             let argfileContents = (flags + rawFiles).joined(separator: "\n")
@@ -267,7 +269,8 @@ final class StatsRunner {
             // See the bulk-scan path for why we read all three ISO-ish tags
             // (Sony writes the real ISO to RecommendedExposureIndex when the
             // standard ISO field is capped at a reference value).
-            "-ISO", "-ISOSpeed", "-RecommendedExposureIndex",
+            "-ISO", "-ISOSpeed", "-RecommendedExposureIndex", "-ISOSetting", "-SonyISO",
+            "-ImageWidth", "-ImageHeight", "-ExifImageWidth", "-ExifImageHeight", "-Orientation",
             "-DateTimeOriginal", "-CreateDate", "-DateCreated"
         ]
 
@@ -315,6 +318,10 @@ final class StatsRunner {
         var lensCounts: [String: Int] = [:]
         var cameraCounts: [String: Int] = [:]
         var shutterCounts: [Double: Int] = [:]
+        var isoCounts: [String: Int] = [:]
+        var apertureCounts: [String: Int] = [:]
+        var focalCounts: [String: Int] = [:]
+        var orientationCounts: [String: Int] = [:]
         var monthCounts: [String: Int] = [:]
         var weekCounts: [String: Int] = [:]
         var yearCounts: [String: Int] = [:]
@@ -395,7 +402,12 @@ final class StatsRunner {
                 minShutterSpeed = min(minShutterSpeed ?? shutter, shutter)
             }
 
-            // ISO — take the largest of ISO / ISOSpeed / RecommendedExposureIndex.
+            if let orientation = Self.imageOrientation(from: entry) {
+                orientationCounts[orientation, default: 0] += 1
+            }
+
+            // ISO — take the largest of ISO / ISOSpeed / RecommendedExposureIndex
+            // plus Sony MakerNote variants.
             // Sony bodies cap the standard `ISO` tag at a reference value
             // (often 400) for shots taken with SensitivityType=3 and write
             // the real ISO into RecommendedExposureIndex; ISOSpeed is the
@@ -404,6 +416,7 @@ final class StatsRunner {
             if let iso = Self.effectiveISO(from: entry) {
                 isoSum += iso
                 isoCount += 1
+                isoCounts[String(Int(iso.rounded())), default: 0] += 1
                 maxISO = max(maxISO ?? iso, iso)
                 minISO = min(minISO ?? iso, iso)
             }
@@ -412,11 +425,13 @@ final class StatsRunner {
             if let fnum = entry["FNumber"] as? Double, fnum > 0 {
                 apertureSum += fnum
                 apertureCount += 1
+                apertureCounts[Self.histogramKey(fnum, decimals: 1), default: 0] += 1
                 maxAperture = max(maxAperture ?? fnum, fnum)
                 minAperture = min(minAperture ?? fnum, fnum)
             } else if let fnumStr = entry["FNumber"] as? String, let fnum = Double(fnumStr), fnum > 0 {
                 apertureSum += fnum
                 apertureCount += 1
+                apertureCounts[Self.histogramKey(fnum, decimals: 1), default: 0] += 1
                 maxAperture = max(maxAperture ?? fnum, fnum)
                 minAperture = min(minAperture ?? fnum, fnum)
             }
@@ -425,6 +440,7 @@ final class StatsRunner {
             if let focal = entry["FocalLength"] as? Double, focal > 0 {
                 focalSum += focal
                 focalCount += 1
+                focalCounts[String(Int(focal.rounded())), default: 0] += 1
                 maxFocalLength = max(maxFocalLength ?? focal, focal)
                 minFocalLength = min(minFocalLength ?? focal, focal)
             } else if let focalStr = entry["FocalLength"] as? String {
@@ -433,6 +449,7 @@ final class StatsRunner {
                 if let focal = Double(cleaned), focal > 0 {
                     focalSum += focal
                     focalCount += 1
+                    focalCounts[String(Int(focal.rounded())), default: 0] += 1
                     maxFocalLength = max(maxFocalLength ?? focal, focal)
                     minFocalLength = min(minFocalLength ?? focal, focal)
                 }
@@ -570,6 +587,10 @@ final class StatsRunner {
             lensCounts: lensCounts,
             cameraCounts: cameraCounts,
             shutterCounts: shutterCounts,
+            isoCounts: isoCounts,
+            apertureCounts: apertureCounts,
+            focalCounts: focalCounts,
+            orientationCounts: orientationCounts,
             maxShutterSpeed: maxShutterSpeed,
             minShutterSpeed: minShutterSpeed,
             isoSum: isoSum,
@@ -594,13 +615,64 @@ final class StatsRunner {
         return Double(str)
     }
 
+    private nonisolated static func histogramKey(_ value: Double, decimals: Int) -> String {
+        String(format: "%.*f", decimals, value)
+    }
+
+    private nonisolated static func imageOrientation(from entry: [String: Any]) -> String? {
+        let width = parseDimensionField(entry["ImageWidth"]) ?? parseDimensionField(entry["ExifImageWidth"])
+        let height = parseDimensionField(entry["ImageHeight"]) ?? parseDimensionField(entry["ExifImageHeight"])
+        guard var width, var height, width > 0, height > 0 else { return nil }
+
+        if orientationRotatesDimensions(entry["Orientation"]) {
+            swap(&width, &height)
+        }
+
+        if height > width { return "portrait" }
+        if width > height { return "landscape" }
+        return "square"
+    }
+
+    private nonisolated static func orientationRotatesDimensions(_ value: Any?) -> Bool {
+        if let intValue = value as? Int { return [5, 6, 7, 8].contains(intValue) }
+        if let doubleValue = value as? Double { return [5, 6, 7, 8].contains(Int(doubleValue)) }
+        guard let string = value as? String else { return false }
+        let lower = string.lowercased()
+        if lower.contains("90") || lower.contains("270") || lower.contains("rotate cw") || lower.contains("rotate ccw") {
+            return true
+        }
+        if let numeric = Int(lower.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return [5, 6, 7, 8].contains(numeric)
+        }
+        return false
+    }
+
+    private nonisolated static func parseDimensionField(_ value: Any?) -> Int? {
+        if let i = value as? Int { return i }
+        if let d = value as? Double { return Int(d.rounded()) }
+        guard let s = value as? String else { return nil }
+        let digits = s.prefix { $0.isNumber }
+        return Int(digits)
+    }
+
     /// Reads an integer-ish exiftool JSON field that may be Int, Double, or String.
     private nonisolated static func parseISOField(_ value: Any?) -> Double? {
         if let i = value as? Int { return Double(i) }
         if let d = value as? Double { return d }
-        if let s = value as? String, let i = Int(s) { return Double(i) }
-        if let s = value as? String, let d = Double(s) { return d }
-        return nil
+        if let array = value as? [Any] { return array.compactMap(parseISOField).max() }
+        guard let s = value as? String else { return nil }
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let d = Double(trimmed.replacingOccurrences(of: ",", with: "")) { return d }
+
+        var token = ""
+        for char in trimmed {
+            if char.isNumber || char == "." || char == "," {
+                token.append(char)
+            } else if !token.isEmpty {
+                break
+            }
+        }
+        return Double(token.replacingOccurrences(of: ",", with: ""))
     }
 
     /// Returns the effective ISO for a photo, picking the max across the three
@@ -610,7 +682,9 @@ final class StatsRunner {
         let candidates = [
             parseISOField(entry["ISO"]),
             parseISOField(entry["ISOSpeed"]),
-            parseISOField(entry["RecommendedExposureIndex"])
+            parseISOField(entry["RecommendedExposureIndex"]),
+            parseISOField(entry["ISOSetting"]),
+            parseISOField(entry["SonyISO"])
         ].compactMap { $0 }.filter { $0 > 0 }
         return candidates.max()
     }

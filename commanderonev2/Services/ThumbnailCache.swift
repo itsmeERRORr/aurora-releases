@@ -9,11 +9,11 @@ final class ThumbnailCache {
     private let queue = DispatchQueue(label: "com.joaosphotos.thumbnailcache", attributes: .concurrent)
 
     private init() {
-        // Configure cache limits for high-speed camera batches
-        cache.countLimit = 10000 // Max 10000 thumbnails in memory
-        cache.totalCostLimit = 1024 * 1024 * 1024 // 1 GB max memory usage
+        // Keep enough previews hot without letting large imports consume laptop memory.
+        cache.countLimit = 2500
+        cache.totalCostLimit = 256 * 1024 * 1024
         
-        print("📦 ThumbnailCache initialized: max 10000 items, 1GB limit")
+        print("ThumbnailCache initialized: max 2500 items, 256MB limit")
     }
 
     /// Get cached thumbnail if available

@@ -46,7 +46,7 @@ enum StatsStorage {
             print("StatsStorage.load: ✅ Found data of \(data.count) bytes")
 
             let decoder = JSONDecoder()
-            let stats = try decoder.decode(StatsReport.self, from: data)
+            let stats = try decoder.decode(StatsReport.self, from: data).recalculatingISOFromRawOutput()
             print("StatsStorage.load: ✅ Successfully loaded stats with \(stats.totalFilesAnalyzed) files")
             return stats
         } catch {
@@ -83,11 +83,15 @@ enum StatsStorage {
         do {
             let data = try Data(contentsOf: lastImportURL)
             let decoder = JSONDecoder()
-            return try decoder.decode(StatsReport.self, from: data)
+            return try decoder.decode(StatsReport.self, from: data).recalculatingISOFromRawOutput()
         } catch {
             print("StatsStorage.loadLastImport: Failed - \(error)")
             try? FileManager.default.removeItem(at: lastImportURL)
             return nil
         }
+    }
+
+    static func clearLastImport() {
+        try? FileManager.default.removeItem(at: lastImportURL)
     }
 }

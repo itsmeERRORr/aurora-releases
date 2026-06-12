@@ -6,6 +6,8 @@ struct DashboardView: View {
     let volumeWatcher: VolumeWatcher?
     let statsRunner: StatsRunner?
 
+    @State private var isCreatingEvent = false
+
     let onImportNow: () -> Void
     let onPause: () -> Void
     let onResume: () -> Void
@@ -28,6 +30,11 @@ struct DashboardView: View {
             .padding(.vertical, AuroraSpacing.mainPaddingV)
         }
         .scrollIndicators(.hidden)
+        .sheet(isPresented: $isCreatingEvent) {
+            CreateEventSheet { name, folderURL in
+                createEvent(name: name, folderURL: folderURL)
+            }
+        }
     }
 
     // MARK: - Topbar
@@ -40,7 +47,7 @@ struct DashboardView: View {
                 .tracking(-0.4)
                 .foregroundStyle(Color.auroraTxt)
             Spacer()
-            Button(action: addFolder) {
+            Button(action: beginCreateEvent) {
                 HStack(spacing: 6) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .bold))
@@ -76,11 +83,17 @@ struct DashboardView: View {
             AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →", action: onViewAllEvents)
 
             let items = appState.uniqueImportDestinations
-                .prefix(4)
-                .compactMap { destination -> (EventAggregate, String?)? in
+                .compactMap { destination -> (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool)? in
                     guard let event = recentEventDisplay(for: destination) else { return nil }
-                    return (event, bannerImagePath(for: destination.bookmarkIndex))
+                    return (
+                        event: event,
+                        bannerPath: bannerImagePath(for: destination.bookmarkIndex),
+                        bookmarkIndex: destination.bookmarkIndex,
+                        isFinalized: appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex) != nil
+                    )
                 }
+                .sorted(by: recentEventSort)
+                .prefix(4)
 
             if items.isEmpty {
                 emptyEvents
@@ -89,14 +102,23 @@ struct DashboardView: View {
                     columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
                     spacing: AuroraSpacing.gridGap
                 ) {
-                    ForEach(items, id: \.0.id) { event, bannerPath in
-                        RecentEventThumb(event: event, bannerImagePath: bannerPath) {
-                            onSelectEvent(event)
+                    ForEach(Array(items), id: \.event.id) { item in
+                        RecentEventThumb(event: item.event, bannerImagePath: item.bannerPath) {
+                            onSelectEvent(item.event)
                         }
                     }
                 }
             }
         }
+    }
+
+    private func recentEventSort(
+        _ lhs: (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool),
+        _ rhs: (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool)
+    ) -> Bool {
+        if lhs.event.lastDate != rhs.event.lastDate { return lhs.event.lastDate > rhs.event.lastDate }
+        if lhs.isFinalized != rhs.isFinalized { return !lhs.isFinalized }
+        return lhs.bookmarkIndex > rhs.bookmarkIndex
     }
 
     private func bannerImagePath(for bookmarkIndex: Int) -> String? {
@@ -119,9 +141,7 @@ struct DashboardView: View {
             : 0
         let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
         let totalBytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
-        let lastDate = summary?.lastDate
-            ?? finalized?.lastImportDate
-            ?? finalized?.finalizedAt
+        let displayDate = appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: summary?.lastDate)
             ?? .distantPast
 
         return EventAggregate(
@@ -130,7 +150,7 @@ struct DashboardView: View {
             totalFiles: totalFiles,
             totalBytes: totalBytes,
             averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
-            lastDate: lastDate
+            lastDate: displayDate
         )
     }
 
@@ -158,18 +178,144 @@ struct DashboardView: View {
 
     // MARK: - Actions
 
-    private func addFolder() {
+    private func beginCreateEvent() {
+        isCreatingEvent = true
+    }
+
+    private func createEvent(name: String, folderURL: URL) -> String? {
+        guard let bookmark = BookmarkManager.saveBookmark(for: folderURL) else {
+            return "Aurora could not save access to this folder. Choose a different folder and try again."
+        }
+        appState.addEventFolder(bookmark: bookmark, displayName: name)
+        return nil
+    }
+}
+
+private struct CreateEventSheet: View {
+    let onCreate: (String, URL) -> String?
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var eventName = ""
+    @State private var folderURL: URL?
+    @State private var errorMessage: String?
+    @FocusState private var nameFocused: Bool
+
+    private var trimmedName: String {
+        eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canChooseFolder: Bool {
+        !trimmedName.isEmpty
+    }
+
+    private var canCreate: Bool {
+        canChooseFolder && folderURL != nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                IconChip(systemName: "folder.badge.plus", color: .auroraCyan, size: 38, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Create Event")
+                        .font(.sora(20, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    Text("Name the event first, then choose its main folder.")
+                        .font(.manrope(12, weight: .medium))
+                        .foregroundStyle(Color.auroraMuted)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Event Name")
+                    .font(.manrope(11, weight: .bold))
+                    .tracking(0.8)
+                    .textCase(.uppercase)
+                    .foregroundStyle(Color.auroraFaint)
+                TextField("R6 SLC Major 2026", text: $eventName)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($nameFocused)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Main Folder")
+                    .font(.manrope(11, weight: .bold))
+                    .tracking(0.8)
+                    .textCase(.uppercase)
+                    .foregroundStyle(Color.auroraFaint)
+
+                HStack(spacing: 10) {
+                    IconChip(systemName: "folder.fill", color: .auroraViolet, size: 32, iconScale: 0.5)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(folderURL?.lastPathComponent ?? "No folder selected")
+                            .font(.manrope(13, weight: .bold))
+                            .foregroundStyle(folderURL == nil ? Color.auroraMuted : Color.auroraTxt)
+                            .lineLimit(1)
+                        Text(folderURL?.path ?? "Choose where this event's photos will live")
+                            .font(.manrope(11, weight: .medium))
+                            .foregroundStyle(Color.auroraFaint)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button(folderURL == nil ? "Choose…" : "Change…", action: chooseFolder)
+                        .buttonStyle(AuroraGhostButtonStyle())
+                        .disabled(!canChooseFolder)
+                        .opacity(canChooseFolder ? 1 : 0.45)
+                }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                        .fill(Color.auroraPanel2)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                        .strokeBorder(folderURL == nil ? Color.auroraStroke : Color.auroraViolet.opacity(0.45), lineWidth: 1)
+                )
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(Color.auroraLive)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(AuroraGhostButtonStyle())
+                Button("Create Event") { createEvent() }
+                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
+                    .disabled(!canCreate)
+                    .opacity(canCreate ? 1 : 0.45)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+        .background(Color.auroraBg2)
+        .onAppear { nameFocused = true }
+    }
+
+    private func chooseFolder() {
+        guard canChooseFolder else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a folder to host a new event"
+        panel.message = "Choose the main folder for \(trimmedName)"
         panel.prompt = "Select Folder"
-        guard panel.runModal() == .OK, let url = panel.url,
-              let bookmark = BookmarkManager.saveBookmark(for: url) else { return }
-        appState.addEventFolder(bookmark: bookmark)
-        let idx = appState.eventFolderBookmarks.count - 1
-        appState.setEventFolderDisplayName(at: idx, name: url.lastPathComponent)
+        if panel.runModal() == .OK, let url = panel.url {
+            folderURL = url
+            errorMessage = nil
+        }
+    }
+
+    private func createEvent() {
+        guard let folderURL, canCreate else { return }
+        if let error = onCreate(trimmedName, folderURL) {
+            errorMessage = error
+            return
+        }
+        dismiss()
     }
 }
 
@@ -272,6 +418,7 @@ struct WaitingCard: View {
     let onCancel: () -> Void
 
     @State private var pulse = false
+    @State private var importBorderSpin = false
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
@@ -300,6 +447,8 @@ struct WaitingCard: View {
                 Spacer()
             }
 
+            currentEventPicker
+
             destinationPicker
 
             Spacer(minLength: 4)
@@ -319,9 +468,37 @@ struct WaitingCard: View {
         )
         .frame(minHeight: 260)
         .onAppear {
+            updateAnimations()
+        }
+        .onDisappear {
+            pulse = false
+            importBorderSpin = false
+        }
+        .onChange(of: shouldPulseWaitingCard) { _, _ in
+            updateAnimations()
+        }
+        .onChange(of: shouldEmphasizeImportNow) { _, _ in
+            updateAnimations()
+        }
+    }
+
+    private func updateAnimations() {
+        if shouldPulseWaitingCard {
+            pulse = false
             withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) {
                 pulse = true
             }
+        } else {
+            pulse = false
+        }
+
+        if shouldEmphasizeImportNow {
+            importBorderSpin = false
+            withAnimation(.linear(duration: 1.15).repeatForever(autoreverses: false)) {
+                importBorderSpin = true
+            }
+        } else {
+            importBorderSpin = false
         }
     }
 
@@ -348,6 +525,56 @@ struct WaitingCard: View {
         }
         if appState.activeVolume != nil { return "Inserted card detected" }
         return "Plug in a reader to start an import"
+    }
+
+    @ViewBuilder
+    private var currentEventPicker: some View {
+        if !openEvents.isEmpty {
+            HStack(spacing: 10) {
+                IconChip(systemName: "flag.checkered", color: .auroraCyan, size: 30, iconScale: 0.48)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Current Event")
+                        .font(.manrope(10.5, weight: .bold))
+                        .foregroundStyle(Color.auroraFaint)
+                        .textCase(.uppercase)
+                        .tracking(0.8)
+                    Text(activeEvent?.name ?? "No event selected")
+                        .font(.manrope(13, weight: .bold))
+                        .foregroundStyle(activeEvent == nil ? Color.auroraMuted : Color.auroraTxt)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Menu {
+                    ForEach(openEvents, id: \.bookmarkIndex) { event in
+                        Button {
+                            chooseDestination(for: event)
+                        } label: {
+                            if activeEvent?.bookmarkIndex == event.bookmarkIndex {
+                                Label(event.name, systemImage: "checkmark")
+                            } else {
+                                Text(event.name)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(activeEvent == nil ? "Choose Event" : "Switch")
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                }
+                .buttonStyle(AuroraGhostButtonStyle())
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .fill(Color.auroraPanel2)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: AuroraRadius.small, style: .continuous)
+                    .strokeBorder(activeEvent == nil ? Color.auroraStroke : Color.auroraCyan.opacity(0.45), lineWidth: 1)
+            )
+        }
     }
 
     @ViewBuilder
@@ -397,6 +624,44 @@ struct WaitingCard: View {
               let data = BookmarkManager.saveBookmark(for: url) else { return }
         appState.destinationURL = url
         appState.destinationBookmarkData = data
+        appState.activeEventFolderIndex = eventContainingDestination(url.path)?.bookmarkIndex
+    }
+
+    private var openEvents: [(path: String, name: String, bookmarkIndex: Int)] {
+        appState.uniqueImportDestinations.filter { event in
+            !event.path.isEmpty && appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) == nil
+        }
+    }
+
+    private var activeEvent: (path: String, name: String, bookmarkIndex: Int)? {
+        if let index = appState.activeEventFolderIndex,
+           let event = openEvents.first(where: { $0.bookmarkIndex == index }) {
+            return event
+        }
+        guard let destination = appState.destinationURL else { return nil }
+        let destinationPath = normalizedPath(destination.path)
+        return eventContainingDestination(destinationPath)
+    }
+
+    private func eventContainingDestination(_ path: String) -> (path: String, name: String, bookmarkIndex: Int)? {
+        let destinationPath = normalizedPath(path)
+        return openEvents
+            .sorted { $0.path.count > $1.path.count }
+            .first { event in
+                let eventPath = normalizedPath(event.path)
+                return destinationPath == eventPath || destinationPath.hasPrefix(eventPath + "/")
+            }
+    }
+
+    private func chooseDestination(for event: (path: String, name: String, bookmarkIndex: Int)) {
+        appState.activeEventFolderIndex = event.bookmarkIndex
+        let url = URL(fileURLWithPath: event.path)
+        appState.destinationURL = url
+        appState.destinationBookmarkData = BookmarkManager.saveBookmark(for: url)
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     private var actions: some View {
@@ -420,6 +685,39 @@ struct WaitingCard: View {
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
                 .disabled(appState.activeVolume == nil)
                 .opacity(appState.activeVolume == nil ? 0.5 : 1)
+                .overlay {
+                    if shouldEmphasizeImportNow {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: AuroraRadius.badge, style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.28), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: AuroraRadius.badge, style: .continuous)
+                                .strokeBorder(
+                                    AngularGradient(
+                                        gradient: Gradient(stops: [
+                                            .init(color: .white.opacity(0.05), location: 0.00),
+                                            .init(color: .white.opacity(0.05), location: 0.62),
+                                            .init(color: .auroraCyan, location: 0.74),
+                                            .init(color: .white, location: 0.82),
+                                            .init(color: .auroraMagenta, location: 0.90),
+                                            .init(color: .white.opacity(0.05), location: 1.00)
+                                        ]),
+                                        center: .center,
+                                        startAngle: .degrees(importBorderSpin ? 360 : 0),
+                                        endAngle: .degrees(importBorderSpin ? 720 : 360)
+                                    ),
+                                    lineWidth: 2.4
+                                )
+                        }
+                        .padding(-3)
+                        .allowsHitTesting(false)
+                    }
+                }
+                .shadow(
+                    color: shouldEmphasizeImportNow ? Color.auroraCyan.opacity(0.35) : .clear,
+                    radius: shouldEmphasizeImportNow ? 14 : 0,
+                    x: 0,
+                    y: 0
+                )
 
                 Toggle("Auto-import", isOn: $appState.autoImport)
                     .toggleStyle(.switch)
@@ -428,6 +726,26 @@ struct WaitingCard: View {
                     .font(.manrope(12, weight: .semibold))
                     .foregroundStyle(Color.auroraMuted)
             }
+        }
+    }
+
+    private var shouldEmphasizeImportNow: Bool {
+        guard let volume = appState.activeVolume, volume.rawFileCount > 0 else { return false }
+        switch appState.importState {
+        case .idle, .done, .ejectingDone:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var shouldPulseWaitingCard: Bool {
+        guard appState.activeVolume == nil else { return false }
+        switch appState.importState {
+        case .idle, .done, .ejectingDone:
+            return true
+        default:
+            return false
         }
     }
 }

@@ -5,8 +5,8 @@ import UniformTypeIdentifiers
 struct AuroraSidebarView: View {
     @Binding var selectedItem: NavigationItem
     @Bindable var appState: AppState
-    @State private var draggedEventBookmarkIndex: Int?
-    @State private var dropTargetBookmarkIndex: Int?
+    @State private var draggedSidebarItem: EventSidebarItemReference?
+    @State private var hoveringCreateFolder = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -28,7 +28,7 @@ struct AuroraSidebarView: View {
             }
             .padding(.horizontal, 10)
 
-            sectionLabel("Events")
+            eventsHeader
                 .padding(.horizontal, 18)
                 .padding(.top, 22)
                 .padding(.bottom, 6)
@@ -71,10 +71,10 @@ struct AuroraSidebarView: View {
         HStack(spacing: 12) {
             GradientIconChip(systemName: "camera.aperture", size: 38)
             VStack(alignment: .leading, spacing: 0) {
-                Text("João's Photos")
+                Text("Aurora")
                     .font(.auroraBrand)
                     .foregroundStyle(Color.auroraTxt)
-                Text("Import Manager")
+                Text("RAW speed. Smart stats.")
                     .font(.manrope(11, weight: .medium))
                     .foregroundStyle(Color.auroraFaint)
             }
@@ -88,6 +88,24 @@ struct AuroraSidebarView: View {
             .font(.auroraSectionLabel)
             .tracking(1.7)
             .foregroundStyle(Color.auroraFaint)
+    }
+
+    private var eventsHeader: some View {
+        HStack(spacing: 8) {
+            sectionLabel("Events")
+            Spacer()
+            Button(action: createRootFolder) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.auroraCyan.opacity(hoveringCreateFolder ? 1 : 0.42))
+                    .shadow(color: Color.auroraCyan.opacity(hoveringCreateFolder ? 0.75 : 0), radius: 8, x: 0, y: 0)
+                    .scaleEffect(hoveringCreateFolder ? 1.08 : 1)
+            }
+            .buttonStyle(.plain)
+            .help("Create folder")
+            .onHover { hoveringCreateFolder = $0 }
+            .animation(.easeOut(duration: 0.15), value: hoveringCreateFolder)
+        }
     }
 
     // MARK: - Nav row (main menu / logs)
@@ -106,8 +124,7 @@ struct AuroraSidebarView: View {
 
     @ViewBuilder
     private var eventsList: some View {
-        let events = appState.uniqueImportDestinations
-        if events.isEmpty {
+        if appState.eventSidebarNodes.isEmpty {
             Text("No events yet")
                 .font(.manrope(12.5, weight: .medium))
                 .foregroundStyle(Color.auroraFaint)
@@ -117,33 +134,10 @@ struct AuroraSidebarView: View {
         } else {
             ScrollView {
                 VStack(spacing: 2) {
-                    ForEach(Array(events.enumerated()), id: \.element.bookmarkIndex) { idx, event in
-                        eventRow(idx: idx, event: event)
-                            .opacity(draggedEventBookmarkIndex == event.bookmarkIndex ? 0.45 : 1)
-                            .overlay(alignment: .top) {
-                                if dropTargetBookmarkIndex == event.bookmarkIndex,
-                                   draggedEventBookmarkIndex != event.bookmarkIndex {
-                                    Capsule()
-                                        .fill(Color.auroraCyan)
-                                        .frame(height: 2)
-                                        .padding(.horizontal, 12)
-                                }
-                            }
-                            .onDrag {
-                                draggedEventBookmarkIndex = event.bookmarkIndex
-                                return NSItemProvider(object: String(event.bookmarkIndex) as NSString)
-                            }
-                            .onDrop(
-                                of: [.plainText],
-                                delegate: EventSidebarDropDelegate(
-                                    targetBookmarkIndex: event.bookmarkIndex,
-                                    draggedBookmarkIndex: $draggedEventBookmarkIndex,
-                                    dropTargetBookmarkIndex: $dropTargetBookmarkIndex,
-                                    selectedItem: $selectedItem,
-                                    appState: appState
-                                )
-                            )
+                    ForEach(appState.eventSidebarNodes) { node in
+                        sidebarNodeRow(node, depth: 0)
                     }
+                    rootDropArea
                 }
                 .padding(.horizontal, 10)
             }
@@ -151,18 +145,131 @@ struct AuroraSidebarView: View {
         }
     }
 
+    private var rootDropArea: some View {
+        Color.clear
+            .frame(height: 26)
+            .contentShape(Rectangle())
+            .onDrop(of: [.plainText], isTargeted: nil) { _ in
+                guard let draggedSidebarItem else { return false }
+                let selectedBookmarkIndex = currentSelectedBookmarkIndex()
+                appState.moveEventSidebarItem(draggedSidebarItem, intoFolder: nil)
+                self.draggedSidebarItem = nil
+                restoreSelection(bookmarkIndex: selectedBookmarkIndex)
+                return true
+            }
+    }
+
+    private func sidebarNodeRow(_ node: EventSidebarNode, depth: Int) -> AnyView {
+        switch node.kind {
+        case .folder:
+            return AnyView(VStack(spacing: 2) {
+                folderRow(node, depth: depth)
+                if node.isExpanded {
+                    ForEach(node.children) { child in
+                        sidebarNodeRow(child, depth: depth + 1)
+                    }
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .top)),
+                            removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
+                        )
+                    )
+                }
+            })
+        case .event:
+            if let bookmarkIndex = node.eventIndex,
+               let event = eventDetails(bookmarkIndex: bookmarkIndex),
+               let displayIndex = appState.uniqueImportDestinations.firstIndex(where: { $0.bookmarkIndex == bookmarkIndex }) {
+                return AnyView(eventRow(idx: displayIndex, event: event, depth: depth)
+                    .opacity(draggedSidebarItem == .event(bookmarkIndex) ? 0.45 : 1)
+                    .onDrag {
+                        draggedSidebarItem = .event(bookmarkIndex)
+                        return NSItemProvider(object: "event:\(bookmarkIndex)" as NSString)
+                    }
+                    .onDrop(of: [.plainText], isTargeted: nil) { _ in
+                        guard let draggedSidebarItem else { return false }
+                        let selectedBookmarkIndex = currentSelectedBookmarkIndex()
+                        appState.moveEventSidebarItem(draggedSidebarItem, before: .event(bookmarkIndex))
+                        self.draggedSidebarItem = nil
+                        restoreSelection(bookmarkIndex: selectedBookmarkIndex)
+                        return true
+                    })
+            }
+            return AnyView(EmptyView())
+        }
+    }
+
+    private func folderRow(_ node: EventSidebarNode, depth: Int) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                appState.toggleEventSidebarFolder(id: node.id)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 10)
+                    .foregroundStyle(Color.auroraFaint)
+                    .rotationEffect(.degrees(node.isExpanded ? 90 : 0))
+                Image(systemName: node.isExpanded ? "folder.fill" : "folder")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 16)
+                    .foregroundStyle(Color.auroraViolet)
+                Text(node.name)
+                    .font(.auroraNavItem)
+                    .lineLimit(1)
+                    .foregroundStyle(Color.auroraMuted)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, CGFloat(depth) * 12)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: AuroraRadius.badge, style: .continuous)
+                    .fill(Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .help(shouldShowFolderTooltip(node.name, depth: depth) ? node.name : "")
+        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: node.isExpanded)
+        .contextMenu {
+            Button("Create Folder Inside…") { createFolder(inside: node.id) }
+            Button("Rename Folder…") { renameFolder(id: node.id, currentName: node.name) }
+            Divider()
+            Button("Remove Folder…", role: .destructive) { confirmRemoveFolder(id: node.id, name: node.name) }
+        }
+        .opacity(draggedSidebarItem == .folder(node.id) ? 0.45 : 1)
+        .onDrag {
+            draggedSidebarItem = .folder(node.id)
+            return NSItemProvider(object: "folder:\(node.id.uuidString)" as NSString)
+        }
+        .onDrop(of: [.plainText], isTargeted: nil) { _ in
+            guard let draggedSidebarItem else { return false }
+            let selectedBookmarkIndex = currentSelectedBookmarkIndex()
+            appState.moveEventSidebarItem(draggedSidebarItem, intoFolder: node.id)
+            self.draggedSidebarItem = nil
+            restoreSelection(bookmarkIndex: selectedBookmarkIndex)
+            return true
+        }
+    }
+
     @ViewBuilder
-    private func eventRow(idx: Int, event: (path: String, name: String, bookmarkIndex: Int)) -> some View {
+    private func eventRow(idx: Int, event: (path: String, name: String, bookmarkIndex: Int), depth: Int) -> some View {
         let isFinalized = appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) != nil
 
         AuroraNavRow(
             label: event.name,
             systemIcon: isFinalized ? "lock" : "folder",
             isActive: selectedItem == .event(index: idx),
-            compact: true
+            compact: true,
+            tooltip: shouldShowEventTooltip(event.name, depth: depth) ? event.name : nil
         ) {
             selectedItem = .event(index: idx)
         }
+        .padding(.leading, CGFloat(depth) * 12)
         .contextMenu {
             Button("Relink Event Folder…") {
                 relinkEvent(bookmarkIndex: event.bookmarkIndex, name: event.name)
@@ -176,6 +283,12 @@ struct AuroraSidebarView: View {
                 Button("Finalize Event…") {
                     confirmFinalize(bookmarkIndex: event.bookmarkIndex, name: event.name)
                 }
+            }
+
+            Divider()
+
+            Button("Remove Event from Aurora…", role: .destructive) {
+                confirmRemove(bookmarkIndex: event.bookmarkIndex, name: event.name)
             }
         }
     }
@@ -225,6 +338,100 @@ struct AuroraSidebarView: View {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         appState.reopenEvent(at: bookmarkIndex)
+    }
+
+    private func confirmRemove(bookmarkIndex: Int, name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(name) from Aurora?"
+        alert.informativeText = "This removes the event, its cached stats, and its import history from Aurora. Files on disk will not be deleted."
+        alert.addButton(withTitle: "Remove from Aurora")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if appState.removeEventFolderAndStats(at: bookmarkIndex) {
+            selectedItem = .dashboard
+        } else {
+            let warn = NSAlert()
+            warn.messageText = "Could not remove event"
+            warn.informativeText = "The selected event is no longer available."
+            warn.addButton(withTitle: "OK")
+            warn.runModal()
+        }
+    }
+
+    private func createRootFolder() {
+        createFolder(inside: nil)
+    }
+
+    private func createFolder(inside parentID: UUID?) {
+        guard let name = promptForFolderName(title: "Create Folder", message: "Name this sidebar folder.", defaultValue: "") else { return }
+        appState.createEventSidebarFolder(named: name, inside: parentID)
+    }
+
+    private func renameFolder(id: UUID, currentName: String) {
+        guard let name = promptForFolderName(title: "Rename Folder", message: "Choose a new folder name.", defaultValue: currentName) else { return }
+        appState.renameEventSidebarFolder(id: id, name: name)
+    }
+
+    private func confirmRemoveFolder(id: UUID, name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(name)?"
+        alert.informativeText = "This removes only the sidebar folder. Events and subfolders inside it move up one level. Files on disk are not touched."
+        alert.addButton(withTitle: "Remove Folder")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        appState.removeEventSidebarFolder(id: id)
+    }
+
+    private func promptForFolderName(title: String, message: String, defaultValue: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = defaultValue
+        field.placeholderString = "Folder name"
+        alert.accessoryView = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func eventDetails(bookmarkIndex: Int) -> (path: String, name: String, bookmarkIndex: Int)? {
+        appState.uniqueImportDestinations.first { $0.bookmarkIndex == bookmarkIndex }
+    }
+
+    private func currentSelectedBookmarkIndex() -> Int? {
+        guard case .event(let index) = selectedItem else { return nil }
+        let events = appState.uniqueImportDestinations
+        guard index >= 0, index < events.count else { return nil }
+        return events[index].bookmarkIndex
+    }
+
+    private func restoreSelection(bookmarkIndex: Int?) {
+        guard let bookmarkIndex,
+              let newIndex = appState.uniqueImportDestinations.firstIndex(where: { $0.bookmarkIndex == bookmarkIndex }) else { return }
+        selectedItem = .event(index: newIndex)
+    }
+
+    private func shouldShowEventTooltip(_ label: String, depth: Int) -> Bool {
+        let available = AuroraSpacing.sidebarWidth - 20 - CGFloat(depth) * 12 - 24 - 16 - 11
+        return textWidth(label) > available
+    }
+
+    private func shouldShowFolderTooltip(_ label: String, depth: Int) -> Bool {
+        let available = AuroraSpacing.sidebarWidth - 20 - CGFloat(depth) * 12 - 24 - 10 - 16 - 16
+        return textWidth(label) > available
+    }
+
+    private func textWidth(_ label: String) -> CGFloat {
+        let font = NSFont(name: AuroraFontFamily.manrope, size: 13.5) ?? NSFont.systemFont(ofSize: 13.5, weight: .semibold)
+        return (label as NSString).size(withAttributes: [.font: font]).width
     }
 
     // MARK: - Storage widget
@@ -354,6 +561,7 @@ struct AuroraNavRow: View {
     let systemIcon: String
     let isActive: Bool
     var compact: Bool = false
+    var tooltip: String? = nil
     let action: () -> Void
 
     @State private var hovering = false
@@ -384,14 +592,10 @@ struct AuroraNavRow: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
-        .help(showsTooltip ? label : "")
+        .help(tooltip ?? "")
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: hovering)
         .animation(.easeOut(duration: 0.2), value: isActive)
-    }
-
-    private var showsTooltip: Bool {
-        compact && label.count > 22
     }
 
     private var textColor: Color {

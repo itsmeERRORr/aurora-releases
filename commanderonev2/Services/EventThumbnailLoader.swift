@@ -18,7 +18,9 @@ final class EventThumbnailLoader: ObservableObject {
 
     @Published private(set) var version: Int = 0
 
-    private let extensions: Set<String> = ["arw", "cr2", "cr3", "dng", "nef", "raf", "rw2"]
+    private let extensions: Set<String> = [
+        "3fr", "arw", "cr2", "cr3", "dng", "iiq", "nef", "nrw", "orf", "raf", "raw", "rw2"
+    ]
 
     func image(forFolderPath path: String) -> NSImage? {
         guard !path.isEmpty else { return nil }

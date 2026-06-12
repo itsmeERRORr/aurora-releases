@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		8C8FC2FB2F28C6CD00200835 /* commanderonev2.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = commanderonev2.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8C8FC2FB2F28C6CD00200835 /* Aurora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Aurora.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -40,7 +40,7 @@
 		8C8FC2FC2F28C6CD00200835 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				8C8FC2FB2F28C6CD00200835 /* commanderonev2.app */,
+				8C8FC2FB2F28C6CD00200835 /* Aurora.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -67,7 +67,7 @@
 			packageProductDependencies = (
 			);
 			productName = commanderonev2;
-			productReference = 8C8FC2FB2F28C6CD00200835 /* commanderonev2.app */;
+			productReference = 8C8FC2FB2F28C6CD00200835 /* Aurora.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -251,14 +251,15 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = JoaoPhotos;
+				INFOPLIST_KEY_CFBundleDisplayName = Aurora;
+				INFOPLIST_KEY_CFBundleIconFile = icon_JoaoPhotos.icns;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
-				INFOPLIST_KEY_NSRemovableVolumesUsageDescription = "JoaoPhotos needs access to removable camera cards to detect and import RAW files.";
+				INFOPLIST_KEY_NSRemovableVolumesUsageDescription = "Aurora needs access to removable camera cards to detect and import RAW files.";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = errormedia.commanderonev2;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Aurora;
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = macosx;
@@ -282,14 +283,15 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = JoaoPhotos;
+				INFOPLIST_KEY_CFBundleDisplayName = Aurora;
+				INFOPLIST_KEY_CFBundleIconFile = icon_JoaoPhotos.icns;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
-				INFOPLIST_KEY_NSRemovableVolumesUsageDescription = "JoaoPhotos needs access to removable camera cards to detect and import RAW files.";
+				INFOPLIST_KEY_NSRemovableVolumesUsageDescription = "Aurora needs access to removable camera cards to detect and import RAW files.";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = errormedia.commanderonev2;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Aurora;
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = macosx;

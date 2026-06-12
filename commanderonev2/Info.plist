@@ -3,10 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>João's Photos</string>
+	<string>Aurora</string>
 	<key>CFBundleName</key>
-	<string>João's Photos</string>
+	<string>Aurora</string>
 	<key>NSRemovableVolumesUsageDescription</key>
-	<string>João's Photos needs access to removable camera cards to detect and import RAW files.</string>
+	<string>Aurora needs access to removable camera cards to detect and import RAW files.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Aurora controls Adobe Lightroom Classic to import the photos you just copied into your catalog automatically.</string>
 </dict>
 </plist>

@@ -1,6 +1,33 @@
 import Foundation
 import SwiftUI
 
+struct EventSidebarNode: Identifiable, Codable, Equatable {
+    enum Kind: String, Codable {
+        case folder
+        case event
+    }
+
+    var id: UUID = UUID()
+    var kind: Kind
+    var name: String
+    var eventIndex: Int?
+    var isExpanded: Bool = true
+    var children: [EventSidebarNode] = []
+
+    static func folder(name: String) -> EventSidebarNode {
+        EventSidebarNode(kind: .folder, name: name, eventIndex: nil, isExpanded: true, children: [])
+    }
+
+    static func event(index: Int) -> EventSidebarNode {
+        EventSidebarNode(kind: .event, name: "", eventIndex: index, isExpanded: true, children: [])
+    }
+}
+
+enum EventSidebarItemReference: Equatable {
+    case event(Int)
+    case folder(UUID)
+}
+
 enum ImportState: Equatable {
     case idle
     case scanning
@@ -45,6 +72,8 @@ struct EventBannerOffset: Equatable, Codable {
 @MainActor
 @Observable
 final class AppState {
+    private var isLoadingPersistedState = false
+
     // MARK: - Volumes
     var mountedVolumes: [VolumeInfo] = []
     var activeVolume: VolumeInfo?
@@ -59,6 +88,8 @@ final class AppState {
         didSet {
             if let data = destinationBookmarkData {
                 UserDefaults.standard.set(data, forKey: "destinationBookmark")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "destinationBookmark")
             }
         }
     }
@@ -74,6 +105,22 @@ final class AppState {
         didSet { UserDefaults.standard.set(importMode.rawValue, forKey: "importMode") }
     }
 
+    var lightroomSyncEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(lightroomSyncEnabled, forKey: "lightroomSyncEnabled") }
+    }
+    var lightroomOpenAfterImport: Bool = false {
+        didSet { UserDefaults.standard.set(lightroomOpenAfterImport, forKey: "lightroomOpenAfterImport") }
+    }
+    var lightroomAppPath: String = "" {
+        didSet { UserDefaults.standard.set(lightroomAppPath, forKey: "lightroomAppPath") }
+    }
+    /// When enabled, after writing the sync request Aurora clicks the plug-in's menu
+    /// command in Lightroom (via AppleScript) so the photos import automatically with
+    /// no manual click. Requires macOS Automation permission (prompted on first use).
+    var lightroomAutoTrigger: Bool = true {
+        didSet { UserDefaults.standard.set(lightroomAutoTrigger, forKey: "lightroomAutoTrigger") }
+    }
+
     // MARK: - Import State
     var importState: ImportState = .idle
     var importProgress: ImportProgress = ImportProgress()
@@ -84,6 +131,8 @@ final class AppState {
         didSet {
             if let stats = statsReport {
                 StatsStorage.saveLastImport(stats)
+            } else {
+                StatsStorage.clearLastImport()
             }
         }
     }
@@ -120,6 +169,28 @@ final class AppState {
     /// Manual sidebar order. Values are bookmark indices; moving rows changes only this array.
     var eventFolderOrder: [Int] = [] {
         didSet { saveEventFolderOrder() }
+    }
+    /// Visual organization for the Events sidebar. Folder nodes are app-only;
+    /// event nodes reference eventFolderBookmarks by index and never move files on disk.
+    var eventSidebarNodes: [EventSidebarNode] = [] {
+        didSet {
+            if !isLoadingPersistedState {
+                saveEventSidebarNodes()
+            }
+        }
+    }
+
+    /// Event the Import screen is currently working in. This points to the
+    /// general event folder selected when the event was created, not necessarily
+    /// the concrete RAW destination subfolder for the current import.
+    var activeEventFolderIndex: Int? {
+        didSet {
+            if let activeEventFolderIndex {
+                UserDefaults.standard.set(activeEventFolderIndex, forKey: "activeEventFolderIndex")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "activeEventFolderIndex")
+            }
+        }
     }
 
     // MARK: - Import History
@@ -197,7 +268,8 @@ final class AppState {
         guard count > 0 else { return [] }
 
         var seen = Set<Int>()
-        var order = (eventFolderOrder.isEmpty ? defaultEventFolderOrder() : eventFolderOrder)
+        let sidebarOrder = eventSidebarEventOrder()
+        var order = (!sidebarOrder.isEmpty ? sidebarOrder : (eventFolderOrder.isEmpty ? defaultEventFolderOrder() : eventFolderOrder))
             .filter { index in
                 guard index >= 0, index < count, !seen.contains(index) else { return false }
                 seen.insert(index)
@@ -391,11 +463,25 @@ final class AppState {
 
     /// Bookmark data for "event" folders; RAW count is computed when displayed.
     var eventFolderBookmarks: [Data] = [] {
-        didSet { syncDisplayNamesCount(); syncPeakCounts(); syncCachedCounts(); syncFinalizedEventIDs(); saveEventFolderBookmarks() }
+        didSet {
+            syncDisplayNamesCount()
+            syncPeakCounts()
+            syncCachedCounts()
+            syncManualDatesCount()
+            syncFinalizedEventIDs()
+            if !isLoadingPersistedState {
+                syncEventSidebarTree()
+                saveEventFolderBookmarks()
+            }
+        }
     }
     /// Custom display names per folder; same count as eventFolderBookmarks. Empty string = use folder name.
     var eventFolderDisplayNames: [String] = [] {
         didSet { saveEventFolderDisplayNames() }
+    }
+    /// Manual event dates are used only when an event has no automatic import/finalized date.
+    var eventFolderManualDates: [Date?] = [] {
+        didSet { saveEventFolderManualDates() }
     }
     /// Peak (maximum) RAW count per folder; only ever increases, so deleting files doesn't reduce the displayed total.
     var eventFolderPeakRawCounts: [Int] = [] {
@@ -429,19 +515,28 @@ final class AppState {
     }
 
     // MARK: - Configuration
-    /// RAW extensions: Sony ARW, Canon CR2/CR3, Adobe/Leica/Ricoh DNG
-    var supportedExtensions: Set<String> = ["arw", "cr2", "cr3", "dng"]
+    /// RAW extensions across common camera systems.
+    var supportedExtensions: Set<String> = [
+        "3fr", "arw", "cr2", "cr3", "dng", "iiq", "nef", "nrw", "orf", "raf", "raw", "rw2"
+    ]
 
     // MARK: - Selected Tab (removed - now using NavigationItem in sidebar)
 
     // MARK: - Init
     init() {
+        isLoadingPersistedState = true
+        logEntries = SystemLogStore.loadAll()
+
         autoImport = UserDefaults.standard.bool(forKey: "autoImport")
         autoEject = UserDefaults.standard.object(forKey: "autoEject") as? Bool ?? true
         if let raw = UserDefaults.standard.string(forKey: "importMode"),
            let mode = ImportMode(rawValue: raw) {
             importMode = mode
         }
+        lightroomSyncEnabled = UserDefaults.standard.bool(forKey: "lightroomSyncEnabled")
+        lightroomOpenAfterImport = UserDefaults.standard.bool(forKey: "lightroomOpenAfterImport")
+        lightroomAppPath = UserDefaults.standard.string(forKey: "lightroomAppPath") ?? ""
+        lightroomAutoTrigger = UserDefaults.standard.object(forKey: "lightroomAutoTrigger") as? Bool ?? true
         if let data = UserDefaults.standard.data(forKey: "destinationBookmark") {
             destinationBookmarkData = data
             destinationURL = BookmarkManager.resolveBookmark(data)
@@ -505,6 +600,13 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([EventBannerOffset].self, from: data) {
             eventFolderBannerOffsets = decoded
         }
+        if let values = UserDefaults.standard.array(forKey: "eventFolderManualDatesData") as? [Double] {
+            eventFolderManualDates = values.map { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+        }
+        if let data = UserDefaults.standard.data(forKey: "eventSidebarNodesData"),
+           let decoded = try? PropertyListDecoder().decode([EventSidebarNode].self, from: data) {
+            eventSidebarNodes = decoded
+        }
         // Load event folder bookmarks (o didSet chama syncDisplayNamesCount e syncPeakCounts)
         if let data = UserDefaults.standard.data(forKey: "eventFolderBookmarksData"),
            let decoded = try? PropertyListDecoder().decode([Data].self, from: data) {
@@ -522,12 +624,22 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
             eventFolderOrder = decoded
         }
+        if UserDefaults.standard.object(forKey: "activeEventFolderIndex") != nil {
+            activeEventFolderIndex = UserDefaults.standard.integer(forKey: "activeEventFolderIndex")
+        }
 
         syncDisplayNamesCount()
         syncPeakCounts()
         syncCachedCounts()
+        syncManualDatesCount()
         syncFinalizedEventIDs()
+        isLoadingPersistedState = false
+        syncEventSidebarTree()
         syncEventFolderOrder()
+        if let activeEventFolderIndex,
+           (activeEventFolderIndex < 0 || activeEventFolderIndex >= eventFolderBookmarks.count) {
+            self.activeEventFolderIndex = nil
+        }
         refreshEventFolderCachedPaths()
         reconcileOrphanFinalizedEvents()
     }
@@ -653,6 +765,15 @@ final class AppState {
         }
     }
 
+    private func syncManualDatesCount() {
+        let n = eventFolderBookmarks.count
+        if eventFolderManualDates.count > n {
+            eventFolderManualDates = Array(eventFolderManualDates.prefix(n))
+        } else if eventFolderManualDates.count < n {
+            eventFolderManualDates += Array(repeating: nil, count: n - eventFolderManualDates.count)
+        }
+    }
+
     private func syncFinalizedEventIDs() {
         let n = eventFolderBookmarks.count
         if eventFolderFinalizedEventID.count > n {
@@ -666,6 +787,289 @@ final class AppState {
         let normalized = normalizedEventFolderOrder()
         if eventFolderOrder != normalized {
             eventFolderOrder = normalized
+        }
+    }
+
+    private func syncEventSidebarTree() {
+        let count = eventFolderBookmarks.count
+        if count == 0 {
+            var seen = Set<Int>()
+            let cleaned = cleanSidebarNodes(eventSidebarNodes, eventCount: 0, seen: &seen)
+            if cleaned != eventSidebarNodes { eventSidebarNodes = cleaned }
+            return
+        }
+
+        var seen = Set<Int>()
+        var cleaned = cleanSidebarNodes(eventSidebarNodes, eventCount: count, seen: &seen)
+        let fallbackOrder = eventFolderOrder.isEmpty ? defaultEventFolderOrder() : eventFolderOrder
+        for index in fallbackOrder where index >= 0 && index < count && !seen.contains(index) {
+            cleaned.insert(.event(index: index), at: 0)
+            seen.insert(index)
+        }
+        for index in 0..<count where !seen.contains(index) {
+            cleaned.insert(.event(index: index), at: 0)
+        }
+        if cleaned != eventSidebarNodes { eventSidebarNodes = cleaned }
+    }
+
+    private func cleanSidebarNodes(_ nodes: [EventSidebarNode], eventCount: Int, seen: inout Set<Int>) -> [EventSidebarNode] {
+        nodes.compactMap { node in
+            switch node.kind {
+            case .folder:
+                var cleaned = node
+                cleaned.children = cleanSidebarNodes(node.children, eventCount: eventCount, seen: &seen)
+                return cleaned
+            case .event:
+                guard let index = node.eventIndex,
+                      index >= 0,
+                      index < eventCount,
+                      !seen.contains(index) else { return nil }
+                seen.insert(index)
+                return .event(index: index)
+            }
+        }
+    }
+
+    private func eventSidebarEventOrder() -> [Int] {
+        var order: [Int] = []
+        collectEventSidebarOrder(from: eventSidebarNodes, into: &order)
+        return order
+    }
+
+    private func collectEventSidebarOrder(from nodes: [EventSidebarNode], into order: inout [Int]) {
+        for node in nodes {
+            switch node.kind {
+            case .event:
+                if let index = node.eventIndex { order.append(index) }
+            case .folder:
+                collectEventSidebarOrder(from: node.children, into: &order)
+            }
+        }
+    }
+
+    func createEventSidebarFolder(named name: String, inside parentID: UUID? = nil) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var nodes = eventSidebarNodes
+        let folder = EventSidebarNode.folder(name: trimmed)
+        if let parentID {
+            _ = insertSidebarFolderAlphabetically(folder, intoFolder: parentID, in: &nodes)
+        } else {
+            insertSidebarFolderAlphabetically(folder, in: &nodes)
+        }
+        eventSidebarNodes = nodes
+        syncEventFolderOrder()
+    }
+
+    private func insertSidebarFolderAlphabetically(_ folder: EventSidebarNode, in nodes: inout [EventSidebarNode]) {
+        let insertIndex = nodes.firstIndex { node in
+            if node.kind != .folder { return true }
+            return node.name.localizedCaseInsensitiveCompare(folder.name) == .orderedDescending
+        } ?? nodes.endIndex
+        nodes.insert(folder, at: insertIndex)
+    }
+
+    private func insertSidebarFolderAlphabetically(_ folder: EventSidebarNode, intoFolder folderID: UUID, in nodes: inout [EventSidebarNode]) -> Bool {
+        for index in nodes.indices {
+            if nodes[index].kind == .folder && nodes[index].id == folderID {
+                nodes[index].isExpanded = true
+                insertSidebarFolderAlphabetically(folder, in: &nodes[index].children)
+                return true
+            }
+            if insertSidebarFolderAlphabetically(folder, intoFolder: folderID, in: &nodes[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    func renameEventSidebarFolder(id: UUID, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var nodes = eventSidebarNodes
+        if renameSidebarFolder(id: id, name: trimmed, in: &nodes) {
+            eventSidebarNodes = nodes
+        }
+    }
+
+    func toggleEventSidebarFolder(id: UUID) {
+        var nodes = eventSidebarNodes
+        if toggleSidebarFolder(id: id, in: &nodes) {
+            eventSidebarNodes = nodes
+        }
+    }
+
+    func removeEventSidebarFolder(id: UUID) {
+        var nodes = eventSidebarNodes
+        if removeSidebarFolderPromotingChildren(id: id, from: &nodes) != nil {
+            eventSidebarNodes = nodes
+            syncEventFolderOrder()
+        }
+    }
+
+    func moveEventSidebarItem(_ item: EventSidebarItemReference, intoFolder targetFolderID: UUID?) {
+        if case .folder(let folderID) = item,
+           let targetFolderID,
+           (folderID == targetFolderID || sidebarFolder(targetFolderID, isDescendantOf: folderID, in: eventSidebarNodes)) {
+            return
+        }
+
+        var nodes = eventSidebarNodes
+        guard let moving = removeSidebarNode(item, from: &nodes) else { return }
+        if let targetFolderID {
+            guard insertSidebarNode(moving, intoFolder: targetFolderID, in: &nodes, atStart: false) else { return }
+        } else {
+            nodes.append(moving)
+        }
+        eventSidebarNodes = nodes
+        syncEventFolderOrder()
+    }
+
+    func moveEventSidebarItem(_ item: EventSidebarItemReference, before target: EventSidebarItemReference) {
+        guard item != target else { return }
+        if case .folder(let folderID) = item,
+           case .folder(let targetFolderID) = target,
+           (folderID == targetFolderID || sidebarFolder(targetFolderID, isDescendantOf: folderID, in: eventSidebarNodes)) {
+            return
+        }
+
+        var nodes = eventSidebarNodes
+        guard let moving = removeSidebarNode(item, from: &nodes) else { return }
+        guard insertSidebarNode(moving, before: target, in: &nodes) else { return }
+        eventSidebarNodes = nodes
+        syncEventFolderOrder()
+    }
+
+    private func insertSidebarNode(_ node: EventSidebarNode, intoFolder folderID: UUID, in nodes: inout [EventSidebarNode], atStart: Bool) -> Bool {
+        for index in nodes.indices {
+            if nodes[index].kind == .folder && nodes[index].id == folderID {
+                nodes[index].isExpanded = true
+                if atStart {
+                    nodes[index].children.insert(node, at: 0)
+                } else {
+                    nodes[index].children.append(node)
+                }
+                return true
+            }
+            if insertSidebarNode(node, intoFolder: folderID, in: &nodes[index].children, atStart: atStart) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func insertSidebarNode(_ node: EventSidebarNode, before target: EventSidebarItemReference, in nodes: inout [EventSidebarNode]) -> Bool {
+        if let targetIndex = nodes.firstIndex(where: { sidebarNode($0, matches: target) }) {
+            nodes.insert(node, at: targetIndex)
+            return true
+        }
+        for index in nodes.indices {
+            if insertSidebarNode(node, before: target, in: &nodes[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func removeSidebarNode(_ item: EventSidebarItemReference, from nodes: inout [EventSidebarNode]) -> EventSidebarNode? {
+        if let index = nodes.firstIndex(where: { sidebarNode($0, matches: item) }) {
+            return nodes.remove(at: index)
+        }
+        for index in nodes.indices {
+            if let removed = removeSidebarNode(item, from: &nodes[index].children) {
+                return removed
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func removeSidebarFolderPromotingChildren(id: UUID, from nodes: inout [EventSidebarNode]) -> [EventSidebarNode]? {
+        if let index = nodes.firstIndex(where: { $0.kind == .folder && $0.id == id }) {
+            let children = nodes[index].children
+            nodes.remove(at: index)
+            nodes.insert(contentsOf: children, at: index)
+            return children
+        }
+        for index in nodes.indices {
+            if let removed = removeSidebarFolderPromotingChildren(id: id, from: &nodes[index].children) {
+                return removed
+            }
+        }
+        return nil
+    }
+
+    private func renameSidebarFolder(id: UUID, name: String, in nodes: inout [EventSidebarNode]) -> Bool {
+        for index in nodes.indices {
+            if nodes[index].kind == .folder && nodes[index].id == id {
+                nodes[index].name = name
+                return true
+            }
+            if renameSidebarFolder(id: id, name: name, in: &nodes[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func toggleSidebarFolder(id: UUID, in nodes: inout [EventSidebarNode]) -> Bool {
+        for index in nodes.indices {
+            if nodes[index].kind == .folder && nodes[index].id == id {
+                nodes[index].isExpanded.toggle()
+                return true
+            }
+            if toggleSidebarFolder(id: id, in: &nodes[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func sidebarNode(_ node: EventSidebarNode, matches item: EventSidebarItemReference) -> Bool {
+        switch item {
+        case .event(let index):
+            return node.kind == .event && node.eventIndex == index
+        case .folder(let id):
+            return node.kind == .folder && node.id == id
+        }
+    }
+
+    private func sidebarFolder(_ targetID: UUID, isDescendantOf folderID: UUID, in nodes: [EventSidebarNode]) -> Bool {
+        for node in nodes where node.kind == .folder {
+            if node.id == folderID {
+                return containsSidebarFolder(targetID, in: node.children)
+            }
+            if sidebarFolder(targetID, isDescendantOf: folderID, in: node.children) { return true }
+        }
+        return false
+    }
+
+    private func containsSidebarFolder(_ folderID: UUID, in nodes: [EventSidebarNode]) -> Bool {
+        for node in nodes where node.kind == .folder {
+            if node.id == folderID || containsSidebarFolder(folderID, in: node.children) { return true }
+        }
+        return false
+    }
+
+    private func removeEventFromSidebarTreeAndShiftIndices(_ removedIndex: Int) {
+        var nodes = eventSidebarNodes
+        adjustSidebarEventIndices(afterRemoving: removedIndex, in: &nodes)
+        eventSidebarNodes = nodes
+    }
+
+    private func adjustSidebarEventIndices(afterRemoving removedIndex: Int, in nodes: inout [EventSidebarNode]) {
+        nodes = nodes.compactMap { node in
+            var adjusted = node
+            switch adjusted.kind {
+            case .event:
+                guard let index = adjusted.eventIndex else { return nil }
+                if index == removedIndex { return nil }
+                if index > removedIndex { adjusted.eventIndex = index - 1 }
+                return adjusted
+            case .folder:
+                adjustSidebarEventIndices(afterRemoving: removedIndex, in: &adjusted.children)
+                return adjusted
+            }
         }
     }
 
@@ -684,6 +1088,7 @@ final class AppState {
         guard let targetIndex = order.firstIndex(of: targetBookmarkIndex) else { return }
         order.insert(moving, at: targetIndex)
         eventFolderOrder = order
+        syncEventSidebarTree()
     }
 
     private func saveFinalizedEventIDs() {
@@ -695,6 +1100,11 @@ final class AppState {
     private func saveEventFolderOrder() {
         guard let data = try? PropertyListEncoder().encode(eventFolderOrder) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderOrderData")
+    }
+
+    private func saveEventSidebarNodes() {
+        guard let data = try? PropertyListEncoder().encode(eventSidebarNodes) else { return }
+        UserDefaults.standard.set(data, forKey: "eventSidebarNodesData")
     }
 
     private func savePreviousCachedPaths() {
@@ -720,6 +1130,30 @@ final class AppState {
     private func saveEventFolderDisplayNames() {
         guard let data = try? PropertyListEncoder().encode(eventFolderDisplayNames) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderDisplayNamesData")
+    }
+
+    private func saveEventFolderManualDates() {
+        let values = eventFolderManualDates.map { $0?.timeIntervalSince1970 ?? -1 }
+        UserDefaults.standard.set(values, forKey: "eventFolderManualDatesData")
+    }
+
+    func manualDateForEvent(at index: Int) -> Date? {
+        guard index >= 0, index < eventFolderManualDates.count else { return nil }
+        return eventFolderManualDates[index]
+    }
+
+    func setManualDateForEvent(at index: Int, date: Date?) {
+        guard index >= 0, index < eventFolderBookmarks.count else { return }
+        syncManualDatesCount()
+        guard index < eventFolderManualDates.count else { return }
+        var dates = eventFolderManualDates
+        dates[index] = date
+        eventFolderManualDates = dates
+    }
+
+    func displayDateForEvent(at index: Int, automaticDate: Date?) -> Date? {
+        if let automaticDate, automaticDate != .distantPast { return automaticDate }
+        return manualDateForEvent(at: index)
     }
 
     private func saveEventFolderPeakRawCounts() {
@@ -923,6 +1357,50 @@ final class AppState {
         return importStats(forEventPath: currentPath, alternatePaths: [previousPath])
     }
 
+    func mergeImportedStatsIntoEventCache(_ importedStats: StatsReport, destinationPath: String) {
+        guard importedStats.totalFilesAnalyzed > 0,
+              let index = eventFolderIndex(containingImportedDestination: destinationPath),
+              index < eventFolderCachedPaths.count else { return }
+        guard index >= eventFolderFinalizedEventID.count || eventFolderFinalizedEventID[index] == nil else { return }
+
+        let eventPath = eventFolderCachedPaths[index]
+        let previousPath = index < eventFolderPreviousCachedPaths.count ? eventFolderPreviousCachedPaths[index] : ""
+        let cachePath = eventPath.isEmpty ? destinationPath : eventPath
+        let existingReport = EventStatsCache.load(forPath: cachePath)?.report
+            ?? (!previousPath.isEmpty ? EventStatsCache.load(forPath: previousPath)?.report : nil)
+        let combined = StatsReport.combine(existingReport, importedStats)
+
+        var rawCountAtScan = combined.totalFilesAnalyzed
+        if index < eventFolderCachedCounts.count {
+            let current = eventFolderCachedCounts[index]
+            eventFolderCachedCounts[index] = current >= 0
+                ? max(current + importedStats.totalFilesAnalyzed, combined.totalFilesAnalyzed)
+                : combined.totalFilesAnalyzed
+            setEventFolderPeakIfHigher(at: index, count: eventFolderCachedCounts[index])
+            rawCountAtScan = eventFolderCachedCounts[index]
+        }
+
+        EventStatsCache.save(combined, forPath: cachePath, rawFileCountAtScan: rawCountAtScan)
+        log("Updated event EXIF stats and RAW count after import")
+    }
+
+    private func eventFolderIndex(containingImportedDestination destinationPath: String) -> Int? {
+        let destination = normalizePath(destinationPath)
+        guard !destination.isEmpty else { return nil }
+
+        let candidates = eventFolderBookmarks.indices.compactMap { index -> (index: Int, pathLength: Int)? in
+            let currentPath = index < eventFolderCachedPaths.count ? normalizePath(eventFolderCachedPaths[index]) : ""
+            let previousPath = index < eventFolderPreviousCachedPaths.count ? normalizePath(eventFolderPreviousCachedPaths[index]) : ""
+            let paths = [currentPath, previousPath].filter { !$0.isEmpty }
+            guard let matched = paths.first(where: { path in
+                destination == path || destination.hasPrefix(path + "/") || path.hasPrefix(destination + "/")
+            }) else { return nil }
+            return (index, matched.count)
+        }
+
+        return candidates.max { $0.pathLength < $1.pathLength }?.index
+    }
+
     /// Atualiza o pico de RAWs da pasta se o novo valor for maior (para não baixar ao apagar ficheiros).
     func setEventFolderPeakIfHigher(at index: Int, count: Int) {
         guard index >= 0, index < eventFolderPeakRawCounts.count else { return }
@@ -932,9 +1410,15 @@ final class AppState {
         }
     }
 
-    func addEventFolder(bookmark: Data) {
+    @discardableResult
+    func addEventFolder(bookmark: Data, displayName: String? = nil) -> Int {
         eventFolderBookmarks.append(bookmark)
         let newIndex = eventFolderBookmarks.count - 1
+        let trimmedName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedName.isEmpty, newIndex < eventFolderDisplayNames.count {
+            eventFolderDisplayNames[newIndex] = trimmedName
+        }
+        activeEventFolderIndex = newIndex
         var order = normalizedEventFolderOrder().filter { $0 != newIndex }
         order.insert(newIndex, at: 0)
         eventFolderOrder = order
@@ -942,7 +1426,14 @@ final class AppState {
         // Resolve immediately so the cached path is populated for this session
         // (otherwise EventStatsView thinks the folder is unreachable).
         refreshEventFolderCachedPaths()
+        if newIndex < eventFolderCachedPaths.count,
+           !eventFolderCachedPaths[newIndex].isEmpty {
+            let url = URL(fileURLWithPath: eventFolderCachedPaths[newIndex])
+            destinationURL = url
+            destinationBookmarkData = BookmarkManager.saveBookmark(for: url)
+        }
         refreshEventFolderMediaCounts()
+        return newIndex
     }
 
     func removeEventFolder(at index: Int) {
@@ -961,17 +1452,68 @@ final class AppState {
         }
         if index < eventFolderBannerOffsets.count { eventFolderBannerOffsets.remove(at: index) }
         if index < eventFolderDisplayNames.count { eventFolderDisplayNames.remove(at: index) }
+        if index < eventFolderManualDates.count { eventFolderManualDates.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
         if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
         eventFolderOrder = eventFolderOrder.compactMap { orderedIndex in
             if orderedIndex == index { return nil }
             return orderedIndex > index ? orderedIndex - 1 : orderedIndex
         }
+        if activeEventFolderIndex == index {
+            activeEventFolderIndex = nil
+        } else if let activeEventFolderIndex, activeEventFolderIndex > index {
+            self.activeEventFolderIndex = activeEventFolderIndex - 1
+        }
+        removeEventFromSidebarTreeAndShiftIndices(index)
         // Clean up scanning indicator: remove the deleted index and shift higher indices down by 1
         eventFolderScanningIndices.remove(index)
         eventFolderScanningIndices = Set(eventFolderScanningIndices.map { $0 > index ? $0 - 1 : $0 })
         // Triggers didSet → syncDisplayNamesCount / syncPeakCounts / syncCachedCounts (all no-ops now)
         eventFolderBookmarks.remove(at: index)
+    }
+
+    @discardableResult
+    func removeEventFolderAndStats(at index: Int) -> Bool {
+        guard index >= 0, index < eventFolderBookmarks.count else { return false }
+        syncCachedCounts()
+        syncFinalizedEventIDs()
+
+        let currentPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        let previousPath = index < eventFolderPreviousCachedPaths.count ? eventFolderPreviousCachedPaths[index] : ""
+        let eventPaths = Array(Set([currentPath, previousPath].map(normalizePath).filter { !$0.isEmpty }))
+
+        let eventReport = eventPaths.compactMap { EventStatsCache.load(forPath: $0)?.report }.first
+        let oldMostRecentImportID = importHistory.first?.id
+        let removedHistoryEntries = ImportHistoryStorage.removeEntries(matchingAnyOf: eventPaths)
+        importHistory = ImportHistoryStorage.load()
+
+        if let eventReport, let totalStatsReport {
+            var adjusted = totalStatsReport.removing(eventReport)
+            adjusted?.firstImportDate = importHistory.map(\.date).min()
+            self.totalStatsReport = adjusted
+        } else if eventReport == nil, !removedHistoryEntries.isEmpty {
+            log("Removed event history, but event stats cache was missing so global EXIF totals could not be adjusted", level: .warning)
+        }
+
+        if let oldMostRecentImportID,
+           removedHistoryEntries.contains(where: { $0.id == oldMostRecentImportID }) {
+            statsReport = nil
+            lastImportReport = nil
+        }
+
+        for path in eventPaths {
+            EventStatsCache.clear(forPath: path)
+        }
+
+        if index < eventFolderFinalizedEventID.count,
+           let finalizedID = eventFolderFinalizedEventID[index] {
+            finalizedEvents.removeAll { $0.id == finalizedID }
+            saveFinalizedEventIDs()
+        }
+
+        removeEventFolder(at: index)
+        log("Removed event from Aurora and deleted its app stats/history")
+        return true
     }
 
     @discardableResult
@@ -1113,6 +1655,78 @@ final class AppState {
         let path = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
         if !path.isEmpty { return URL(fileURLWithPath: path).lastPathComponent }
         return "Event \(index + 1)"
+    }
+
+    func recordTelegramDailyImport(
+        sourceName: String,
+        destinationPath: String,
+        fileCount: Int,
+        totalBytes: Int64,
+        duration: TimeInterval,
+        report: StatsReport
+    ) {
+        let eventName = eventNameContainingDestination(destinationPath)
+            ?? URL(fileURLWithPath: destinationPath).lastPathComponent
+        let shutterCounts = Dictionary(uniqueKeysWithValues: report.shutterCounts.map { key, value in
+            (String(key), value)
+        })
+
+        DailyImportSummaryStore.add(DailyImportSummaryEntry(
+            sourceName: sourceName,
+            eventName: eventName,
+            destinationPath: destinationPath,
+            rawCount: fileCount,
+            totalBytes: totalBytes > 0 ? totalBytes : report.totalBytes,
+            duration: Int(duration),
+            cameraCounts: report.cameraCounts,
+            lensCounts: report.lensCounts,
+            isoCounts: report.isoCounts,
+            shutterCounts: shutterCounts
+        ))
+    }
+
+    func requestLightroomSync(forImportFolder importFolder: String) {
+        guard lightroomSyncEnabled else { return }
+        let eventName = eventNameContainingDestination(importFolder)
+            ?? URL(fileURLWithPath: importFolder).deletingLastPathComponent().lastPathComponent
+
+        do {
+            let requestURL = try LightroomSyncService.writePendingRequest(eventName: eventName, importFolder: importFolder)
+            log("Lightroom sync requested for '\(eventName)': \(requestURL.lastPathComponent)")
+            if lightroomOpenAfterImport || lightroomAutoTrigger {
+                LightroomSyncService.openLightroom(appPath: lightroomAppPath.isEmpty ? nil : lightroomAppPath)
+            }
+            if lightroomAutoTrigger {
+                // Give Lightroom a moment to come to the front (and finish launching if it
+                // wasn't open), then click the plug-in menu command so the import is
+                // automatic. Runs off the main actor so the AppleScript delay doesn't block UI.
+                Task.detached {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    let ok = LightroomSyncService.triggerImportInLightroom()
+                    await self.log(ok
+                        ? "Triggered Lightroom import for '\(eventName)'"
+                        : "Could not auto-trigger Lightroom import — click 'Import Aurora Photos Now' in Lightroom, or grant Automation permission.",
+                        level: ok ? .info : .warning)
+                }
+            }
+        } catch {
+            log("Could not create Lightroom sync request: \(error.localizedDescription)", level: .warning)
+        }
+    }
+
+    private func eventNameContainingDestination(_ path: String) -> String? {
+        let destinationPath = normalizePath(path)
+        let match = uniqueImportDestinations
+            .sorted { $0.path.count > $1.path.count }
+            .first { event in
+                let eventPath = normalizePath(event.path)
+                guard !eventPath.isEmpty else { return false }
+                return destinationPath == eventPath
+                    || destinationPath.hasPrefix(eventPath + "/")
+                    || eventPath.hasPrefix(destinationPath + "/")
+            }
+        guard let match else { return nil }
+        return displayNameForEvent(at: match.bookmarkIndex) ?? match.name
     }
 
     func setEventFolderDisplayName(at index: Int, name: String) {
@@ -1306,6 +1920,7 @@ final class AppState {
     func log(_ message: String, level: LogEntry.Level = .info) {
         let entry = LogEntry(timestamp: Date(), message: message, level: level)
         logEntries.append(entry)
+        SystemLogStore.append(entry)
         #if DEBUG
         print("[\(level.rawValue.uppercased())] \(message)")
         #endif
@@ -1340,13 +1955,20 @@ struct ImportProgress {
     }
 }
 
-struct LogEntry: Identifiable {
-    let id = UUID()
+struct LogEntry: Identifiable, Codable {
+    let id: UUID
     let timestamp: Date
     let message: String
     let level: Level
 
-    enum Level: String {
+    init(id: UUID = UUID(), timestamp: Date, message: String, level: Level) {
+        self.id = id
+        self.timestamp = timestamp
+        self.message = message
+        self.level = level
+    }
+
+    enum Level: String, Codable {
         case info, warning, error
     }
 

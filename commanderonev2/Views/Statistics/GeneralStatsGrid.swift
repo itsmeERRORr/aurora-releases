@@ -251,5 +251,9 @@ struct GeneralStatCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: 200, alignment: .topLeading)
         .auroraCard()
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.medium, style: .continuous)
+                .strokeBorder(accent.opacity(0.22), lineWidth: 1)
+        )
     }
 }

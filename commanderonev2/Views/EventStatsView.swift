@@ -22,6 +22,7 @@ struct EventStatsView: View {
     @State private var isRepositioningBanner = false
     @State private var bannerOffsetDraft = EventBannerOffset()
     @State private var bannerDragStartOffset: EventBannerOffset?
+    @State private var shareErrorMessage: String?
     @FocusState private var eventNameFieldFocused: Bool
 
     // Import history summary — available instantly, no scan needed
@@ -75,12 +76,13 @@ struct EventStatsView: View {
             .padding(.bottom, 20)
         }
         .onAppear {
-            if !hasLoaded { loadFromCacheThenScan() }
+            if !hasLoaded { loadFromCache() }
         }
         .onChange(of: destinationPath) { _, _ in
             hasLoaded = false
             report = nil
             errorMessage = nil
+            shareErrorMessage = nil
             scanDate = nil
             isCachedData = false
             isEditingEventName = false
@@ -88,7 +90,12 @@ struct EventStatsView: View {
             isRepositioningBanner = false
             bannerOffsetDraft = EventBannerOffset()
             bannerDragStartOffset = nil
-            loadFromCacheThenScan()
+            loadFromCache()
+        }
+        .alert("Could not export share image", isPresented: shareErrorBinding) {
+            Button("OK", role: .cancel) { shareErrorMessage = nil }
+        } message: {
+            Text(shareErrorMessage ?? "Unknown error")
         }
     }
 
@@ -210,8 +217,90 @@ struct EventStatsView: View {
                 .buttonStyle(AuroraGhostButtonStyle())
             }
 
+            shareMenu
+
             bannerMenu
         }
+    }
+
+    private var shareErrorBinding: Binding<Bool> {
+        Binding(
+            get: { shareErrorMessage != nil },
+            set: { if !$0 { shareErrorMessage = nil } }
+        )
+    }
+
+    private var shareMenu: some View {
+        Menu {
+            Button("Instagram Story") {
+                exportSocialShare(format: .story)
+            }
+            Button("Instagram Post") {
+                exportSocialShare(format: .post)
+            }
+        } label: {
+            Label("Share", systemImage: "square.and.arrow.up")
+                .font(.manrope(12, weight: .bold))
+        }
+        .buttonStyle(AuroraGhostButtonStyle())
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func exportSocialShare(format: EventSocialShareFormat) {
+        do {
+            try EventSocialShareExporter.export(snapshot: socialShareSnapshot, format: format)
+        } catch {
+            shareErrorMessage = error.localizedDescription
+        }
+    }
+
+    private var socialShareSnapshot: EventSocialShareSnapshot {
+        let summary = importSummary
+        let activeReport = report
+        let totalBytes = summary?.totalBytes ?? activeReport?.totalBytes ?? 0
+        let bytes = AuroraFormat.bytesParts(totalBytes)
+        let rawCount = knownRawFileCount ?? activeReport?.totalFilesAnalyzed ?? summary?.photoCount ?? 0
+        let topLenses = activeReport?.allLenses.prefix(3).map { lens in
+            EventSocialRankItem(
+                name: LensDisplayFormatter.displayName(make: lens.make, model: lens.model),
+                subtitle: LensDisplayFormatter.brandName(make: lens.make, model: lens.model),
+                count: AuroraFormat.count(lens.count)
+            )
+        } ?? []
+        let topCameras = activeReport?.allCameras.prefix(3).map { camera in
+            EventSocialRankItem(
+                name: friendlyCameraName(for: camera.model),
+                subtitle: nil,
+                count: AuroraFormat.count(camera.count)
+            )
+        } ?? []
+        let dateRange: String = {
+            if let first = summary?.firstDate {
+                return AuroraFormat.dateRange(first, summary?.lastDate ?? first)
+            }
+            if let date = activeReport?.firstImportDate {
+                return AuroraFormat.dateMedium(date)
+            }
+            return "Event stats"
+        }()
+
+        return EventSocialShareSnapshot(
+            eventName: currentEventName,
+            destinationPath: destinationPath,
+            bannerImagePath: eventBannerImagePath,
+            bannerOffset: activeBannerOffset,
+            dateRange: dateRange,
+            rawFiles: rawCount > 0 ? AuroraFormat.count(rawCount) : "—",
+            deliveredPhotos: deliveredPhotoCount > 0 ? AuroraFormat.count(deliveredPhotoCount) : "—",
+            dataImported: totalBytes > 0 ? "\(bytes.value) \(bytes.unit)" : "—",
+            avgISO: activeReport?.avgISO.map(AuroraFormat.iso) ?? "—",
+            avgShutter: activeReport?.avgShutterSpeed.map(AuroraFormat.shutter) ?? "—",
+            avgAperture: activeReport?.avgAperture.map(AuroraFormat.aperture) ?? "—",
+            avgFocal: activeReport?.avgFocalLength.map(AuroraFormat.focal) ?? "—",
+            topLenses: topLenses,
+            topCameras: topCameras
+        )
     }
 
     @ViewBuilder
@@ -535,8 +624,8 @@ struct EventStatsView: View {
                 .font(.manrope(15, weight: .bold))
                 .foregroundStyle(Color.auroraMuted)
             Text(hasKnownRawFiles
-                 ? "RAW files are counted, but ISO, cameras, lenses and monthly stats need a fresh scan."
-                 : "No ARW, CR2, CR3 or DNG files found in this folder")
+                 ? "RAW files are counted, but ISO, cameras and lenses need a fresh scan."
+                 : "No supported RAW files found in this folder")
                 .font(.manrope(11, weight: .medium))
                 .foregroundStyle(Color.auroraFaint)
         }
@@ -560,11 +649,6 @@ struct EventStatsView: View {
                     topLensesSection(report: report)
                         .frame(maxWidth: .infinity)
                 }
-            }
-
-            if !report.monthCounts.isEmpty {
-                monthlyChart(for: report)
-                    .frame(maxWidth: .infinity)
             }
         }
     }
@@ -594,7 +678,7 @@ struct EventStatsView: View {
             }
 
             LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 6),
+                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 7),
                 spacing: AuroraSpacing.gridGap
             ) {
                 PhotoStatCard(
@@ -606,13 +690,14 @@ struct EventStatsView: View {
                 PhotoStatCard(
                     icon: "checkmark.rectangle.stack.fill",
                     accent: .auroraHealthy,
-                    pages: [(label: "Photos Delivered", value: AuroraFormat.count(deliveredPhotoCount))]
+                    pages: deliveredPages(for: report)
                 )
 
                 PhotoStatCard(icon: "camera.aperture", accent: .auroraBlue, pages: isoPages(for: report))
                 PhotoStatCard(icon: "circle.dotted", accent: .auroraViolet, pages: aperturePages(for: report))
                 PhotoStatCard(icon: "viewfinder", accent: .auroraMagenta, pages: focalPages(for: report))
                 PhotoStatCard(icon: "timer", accent: .auroraPurple, pages: shutterPages(for: report))
+                PhotoStatCard(icon: "rectangle.portrait.fill", accent: .auroraLive, pages: orientationPages(for: report))
             }
         }
         .auroraStaticCard()
@@ -637,6 +722,20 @@ struct EventStatsView: View {
         return max(appState.eventFolderCachedJPGCounts[bookmarkIndex], 0)
     }
 
+    private func deliveredPages(for report: StatsReport) -> [(label: String, value: String)] {
+        let delivered = deliveredPhotoCount
+        let rawCount = rawFileCount(for: report)
+        return [
+            ("Photos Delivered", delivered > 0 ? AuroraFormat.count(delivered) : "—"),
+            ("Keep Rate", keepRate(delivered: delivered, rawCount: rawCount))
+        ]
+    }
+
+    private func keepRate(delivered: Int, rawCount: Int) -> String {
+        guard delivered > 0, rawCount > 0 else { return "—" }
+        return String(format: "%.1f%%", Double(delivered) / Double(rawCount) * 100)
+    }
+
     private func datePages(first: Date, last: Date) -> [(label: String, value: String)] {
         var pages: [(label: String, value: String)] = [
             (label: "Last Import", value: AuroraFormat.dateMedium(last))
@@ -651,6 +750,7 @@ struct EventStatsView: View {
         var pages: [(label: String, value: String)] = [("Avg ISO", formatOptional(report.avgISO, AuroraFormat.iso))]
         if let v = report.maxISO, v > 0 { pages.append(("Highest ISO", AuroraFormat.iso(v))) }
         if let v = report.minISO, v > 0 { pages.append(("Lowest ISO", AuroraFormat.iso(v))) }
+        pages.append(("Most Used ISO", formatOptional(report.mostUsedISO, AuroraFormat.iso)))
         return pages
     }
 
@@ -658,6 +758,7 @@ struct EventStatsView: View {
         var pages: [(label: String, value: String)] = [("Avg Aperture", formatOptional(report.avgAperture, AuroraFormat.aperture))]
         if let v = report.maxAperture, v > 0 { pages.append(("Highest Aperture", AuroraFormat.aperture(v))) }
         if let v = report.minAperture, v > 0 { pages.append(("Lowest Aperture", AuroraFormat.aperture(v))) }
+        pages.append(("Most Used Aperture", formatOptional(report.mostUsedAperture, AuroraFormat.aperture)))
         return pages
     }
 
@@ -665,6 +766,7 @@ struct EventStatsView: View {
         var pages: [(label: String, value: String)] = [("Avg Focal", formatOptional(report.avgFocalLength, AuroraFormat.focal))]
         if let v = report.maxFocalLength, v > 0 { pages.append(("Highest Focal", AuroraFormat.focal(v))) }
         if let v = report.minFocalLength, v > 0 { pages.append(("Lowest Focal", AuroraFormat.focal(v))) }
+        pages.append(("Most Used Focal", formatOptional(report.mostUsedFocalLength, AuroraFormat.focal)))
         return pages
     }
 
@@ -672,7 +774,18 @@ struct EventStatsView: View {
         var pages: [(label: String, value: String)] = [("Avg Shutter", formatOptional(report.avgShutterSpeed, AuroraFormat.shutter))]
         if let v = report.minShutterSpeed, v > 0 { pages.append(("Fastest Shutter", AuroraFormat.shutter(v))) }
         if let v = report.maxShutterSpeed, v > 0 { pages.append(("Longest Shutter", AuroraFormat.shutter(v))) }
+        pages.append(("Most Used Shutter", formatOptional(report.mostUsedShutterSpeed, AuroraFormat.shutter)))
         return pages
+    }
+
+    private func orientationPages(for report: StatsReport) -> [(label: String, value: String)] {
+        guard report.portraitCount + report.landscapeCount > 0 else {
+            return [("Portraits", "—"), ("Landscapes", "—")]
+        }
+        return [
+            ("Portraits", AuroraFormat.count(report.portraitCount)),
+            ("Landscapes", AuroraFormat.count(report.landscapeCount))
+        ]
     }
 
     private func formatOptional(_ value: Double?, _ formatter: (Double) -> String) -> String {
@@ -780,22 +893,6 @@ struct EventStatsView: View {
         .modifier(HoverScaleEffect())
     }
 
-    // MARK: - Monthly Chart
-
-    private func monthlyChart(for report: StatsReport) -> some View {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM yyyy"
-        let sorted = report.monthCounts
-            .compactMap { key, count -> (String, Date, Int)? in
-                guard let d = formatter.date(from: key) else { return nil }
-                return (key, d, count)
-            }
-            .sorted { $0.1 > $1.1 }
-            .prefix(12)
-            .map { (month: $0.0, count: $0.2) }
-        return MonthlyChartView(data: Array(sorted))
-    }
-
     // MARK: - Helpers
 
     private func friendlyCameraName(for model: String) -> String {
@@ -821,7 +918,7 @@ struct EventStatsView: View {
     /// Load from cache immediately. Never auto-scans — the scan is triggered when the
     /// folder is first added (Statistics/Dashboard). The user can manually refresh here.
     @MainActor
-    private func loadFromCacheThenScan() {
+    private func loadFromCache() {
         if let cached = cachedStatsForCurrentEvent() {
             report = cached.report
             scanDate = cached.scanDate
@@ -841,7 +938,7 @@ struct EventStatsView: View {
         }
     }
 
-    private func cachedStatsForCurrentEvent() -> (report: StatsReport, scanDate: Date)? {
+    private func cachedStatsForCurrentEvent() -> (report: StatsReport, scanDate: Date, rawFileCountAtScan: Int?)? {
         if let cached = EventStatsCache.load(forPath: destinationPath) {
             return cached
         }
@@ -877,7 +974,7 @@ struct EventStatsView: View {
                 isCachedData = false
                 let now = Date()
                 scanDate = now
-                EventStatsCache.save(r, forPath: destinationPath, scanDate: now)
+                EventStatsCache.save(r, forPath: destinationPath, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
                 if let bookmarkIndex {
                     appState.updateEventFolderCache(at: bookmarkIndex, count: r.totalFilesAnalyzed, path: destinationPath)
                     appState.setEventFolderPeakIfHigher(at: bookmarkIndex, count: r.totalFilesAnalyzed)
