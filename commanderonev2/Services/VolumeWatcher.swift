@@ -59,6 +59,10 @@ final class VolumeWatcher {
         appState.log("Volume watcher stopped")
     }
 
+    func refreshMountedVolumes() {
+        scanExistingVolumes()
+    }
+
     deinit {
         let center = NSWorkspace.shared.notificationCenter
         if let mountObserver { center.removeObserver(mountObserver) }
@@ -68,21 +72,27 @@ final class VolumeWatcher {
     private func scanExistingVolumes() {
         let fm = FileManager.default
         guard let volumeURLs = fm.mountedVolumeURLs(
-            includingResourceValuesForKeys: [.volumeNameKey, .volumeIsRemovableKey],
+            includingResourceValuesForKeys: [.volumeNameKey, .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsInternalKey],
             options: [.skipHiddenVolumes]
         ) else { return }
 
-        // Only look for "Untitled" volume (SD card)
         for url in volumeURLs {
-            let resourceValues = try? url.resourceValues(forKeys: [.volumeNameKey])
+            let resourceValues = try? url.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsInternalKey])
             let name = resourceValues?.volumeName ?? url.lastPathComponent
+            let isRemovable = resourceValues?.volumeIsRemovable ?? false
 
-            // Only process "Untitled" volume
-            if name == "Untitled" {
+            if shouldProcessVolume(url, name: name, isRemovable: isRemovable, isLocal: resourceValues?.volumeIsLocal ?? false, isInternal: resourceValues?.volumeIsInternal ?? false) {
                 if let info = makeVolumeInfo(from: url) {
-                    if !appState.mountedVolumes.contains(where: { $0.path == info.path }) {
+                    if let index = appState.mountedVolumes.firstIndex(where: { $0.path == info.path }) {
+                        var updated = info
+                        updated.isActive = appState.activeVolume?.path == info.path && info.rawFileCount > 0
+                        appState.mountedVolumes[index] = updated
+                        if appState.activeVolume?.path == info.path {
+                            appState.activeVolume = info.rawFileCount > 0 ? updated : nil
+                        }
+                    } else {
                         appState.mountedVolumes.append(info)
-                        appState.log("Found SD card: \(info.name) (\(info.rawFileCount) RAW files)")
+                        appState.log("Found card: \(info.name) (\(info.rawFileCount) RAW files)")
                         if info.rawFileCount > 0 {
                             activateVolume(info)
                         }
@@ -93,22 +103,27 @@ final class VolumeWatcher {
     }
 
     private func handleMountInternal(path: URL) {
-        let resourceValues = try? path.resourceValues(forKeys: [.volumeNameKey])
+        let resourceValues = try? path.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsInternalKey])
         let name = resourceValues?.volumeName ?? path.lastPathComponent
+        let isRemovable = resourceValues?.volumeIsRemovable ?? false
 
-        // Only process "Untitled" volume (SD card)
-        guard name == "Untitled" else { return }
+        guard shouldProcessVolume(
+            path,
+            name: name,
+            isRemovable: isRemovable,
+            isLocal: resourceValues?.volumeIsLocal ?? false,
+            isInternal: resourceValues?.volumeIsInternal ?? false
+        ) else { return }
 
-        appState.log("Detected SD card mount: \(name)")
+        appState.log("Detected card mount: \(name)")
 
         if let info = makeVolumeInfo(from: path) {
             appState.mountedVolumes.removeAll { $0.path == info.path }
             appState.mountedVolumes.append(info)
-            appState.log("SD card: \(info.rawFileCount) RAW files found")
+            appState.log("Card \(info.name): \(info.rawFileCount) RAW files found")
 
             if info.rawFileCount > 0 {
                 activateVolume(info)
-                // Auto-import ONLY for "Untitled" volume
                 if appState.autoImport && appState.destinationURL != nil {
                     appState.log("Auto-import triggered for \(info.name)")
                     NotificationCenter.default.post(name: .startAutoImport, object: nil)
@@ -139,6 +154,25 @@ final class VolumeWatcher {
         }
         appState.log("Active volume set: \(info.name)")
         NotificationCenter.default.post(name: .cardDetected, object: nil)
+    }
+
+    private func shouldProcessVolume(_ url: URL, name: String, isRemovable: Bool, isLocal: Bool, isInternal: Bool) -> Bool {
+        guard name != "Macintosh HD", !isDestinationVolume(url) else { return false }
+        if name == "Untitled" || isRemovable { return true }
+        // CFexpress readers over Thunderbolt may appear as local, non-internal
+        // volumes rather than removable/ejectable media.
+        return isLocal && !isInternal
+    }
+
+    private func isDestinationVolume(_ volumeURL: URL) -> Bool {
+        guard let destinationURL = appState.destinationURL else { return false }
+        let volumePath = normalizedPath(volumeURL.path)
+        let destinationPath = normalizedPath(destinationURL.path)
+        return destinationPath == volumePath || destinationPath.hasPrefix(volumePath + "/")
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     // Manual folder selection

@@ -27,6 +27,8 @@ actor ImportEngine {
         let totalBytes: Int64
         let currentFileName: String
         let bytesPerSecond: Double
+        let skippedFiles: Int
+        let statusMessage: String?
     }
 
     enum Mode: Sendable {
@@ -39,6 +41,8 @@ actor ImportEngine {
         to destinationBase: URL,
         mode: Mode = .move,
         createSubfolder: Bool = false,
+        renameOptions: ImportRenameOptions? = nil,
+        reservationCoordinator: DestinationReservationCoordinator? = nil,
         onProgress: @Sendable (ProgressUpdate) -> Void
     ) async throws -> ImportResult {
         isCancelled = false
@@ -69,6 +73,55 @@ actor ImportEngine {
             fileSizes.append(size)
         }
 
+        let sources = sourceFiles.enumerated().map { index, sourceFile in
+            ImportSource(
+                url: sourceFile,
+                fileName: renameOptions?.destinationFileName(for: sourceFile, index: index) ?? sourceFile.lastPathComponent,
+                size: fileSizes[index]
+            )
+        }
+        let jobs: [ImportJob]
+        if let reservationCoordinator {
+            jobs = await Self.importJobs(
+                fileManager: fileManager,
+                destFolder: destFolder,
+                sources: sources,
+                mode: mode,
+                reservationCoordinator: reservationCoordinator
+            )
+        } else {
+            jobs = Self.importJobs(
+                fileManager: fileManager,
+                destFolder: destFolder,
+                sources: sources,
+                mode: mode
+            )
+        }
+        let skippedFiles = sourceFiles.count - jobs.count
+        let importTotalBytes = jobs.reduce(Int64(0)) { $0 + $1.size }
+
+        if jobs.isEmpty {
+            onProgress(ProgressUpdate(
+                completedFiles: 0,
+                totalFiles: 0,
+                transferredBytes: 0,
+                totalBytes: 0,
+                currentFileName: "No new files",
+                bytesPerSecond: 0,
+                skippedFiles: skippedFiles,
+                statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
+            ))
+            return ImportResult(
+                fileCount: 0,
+                totalBytes: 0,
+                duration: 0,
+                averageSpeed: 0,
+                destinationPath: destFolder.path,
+                importedFiles: [],
+                skippedFiles: skippedFiles
+            )
+        }
+
         let startTime = Date()
         let transferredBytes = TransferCounter()
         let completedCount = TransferCounter()
@@ -79,7 +132,7 @@ actor ImportEngine {
         try await withThrowingTaskGroup(of: Void.self) { group in
             var index = 0
 
-            for (fileIndex, sourceFile) in sourceFiles.enumerated() {
+            for job in jobs {
                 // Check cancel before adding more work
                 if isCancelled {
                     group.cancelAll()
@@ -100,12 +153,11 @@ actor ImportEngine {
                     try await group.next()
                 }
 
-                let fileName = sourceFile.lastPathComponent
-                let destFolderCopy = destFolder
-                let fileSize = fileSizes[fileIndex]
+                let sourceFile = job.url
+                let destFile = job.destination
+                let fileSize = job.size
 
                 group.addTask { [fileManager] in
-                    let destFile = Self.uniqueDestinationURL(fileManager: fileManager, destFolder: destFolderCopy, fileName: fileName)
                     do {
                         switch mode {
                         case .move:
@@ -118,10 +170,10 @@ actor ImportEngine {
                             do {
                                 try fileManager.copyItem(at: sourceFile, to: destFile)
                             } catch {
-                                return
+                                throw ImportError.fileFailed(sourceFile.lastPathComponent, error.localizedDescription)
                             }
                         } else {
-                            return
+                            throw ImportError.fileFailed(sourceFile.lastPathComponent, error.localizedDescription)
                         }
                     }
 
@@ -134,7 +186,7 @@ actor ImportEngine {
                 index += 1
 
                 // Report progress periodically (every 4 files to avoid UI flood)
-                if index % 4 == 0 || index == sourceFiles.count {
+                if index % 4 == 0 || index == jobs.count {
                     let completed = await completedCount.value
                     let transferred = await transferredBytes.value
                     let currentName = await lastFileName.value
@@ -143,11 +195,13 @@ actor ImportEngine {
 
                     onProgress(ProgressUpdate(
                         completedFiles: Int(completed),
-                        totalFiles: sourceFiles.count,
+                        totalFiles: jobs.count,
                         transferredBytes: transferred,
-                        totalBytes: totalBytes,
+                        totalBytes: importTotalBytes,
                         currentFileName: currentName,
-                        bytesPerSecond: speed
+                        bytesPerSecond: speed,
+                        skippedFiles: skippedFiles,
+                        statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
                     ))
                 }
             }
@@ -164,11 +218,13 @@ actor ImportEngine {
 
         onProgress(ProgressUpdate(
             completedFiles: Int(finalCompleted),
-            totalFiles: sourceFiles.count,
+            totalFiles: jobs.count,
             transferredBytes: finalTransferred,
-            totalBytes: totalBytes,
+            totalBytes: importTotalBytes,
             currentFileName: "Done",
-            bytesPerSecond: speed
+            bytesPerSecond: speed,
+            skippedFiles: skippedFiles,
+            statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
         ))
 
         let duration = Date().timeIntervalSince(startTime)
@@ -181,12 +237,101 @@ actor ImportEngine {
             duration: duration,
             averageSpeed: avgSpeed,
             destinationPath: destFolder.path,
-            importedFiles: files
+            importedFiles: files,
+            skippedFiles: skippedFiles
         )
     }
 
-    /// Returns a destination URL that does not yet exist. If the base fileName exists, tries base_2.ext, base_3.ext, … until free.
-    private static func uniqueDestinationURL(fileManager: FileManager, destFolder: URL, fileName: String) -> URL {
+    private struct ImportSource {
+        let url: URL
+        let fileName: String
+        let size: Int64
+    }
+
+    private struct ImportJob {
+        let url: URL
+        let destination: URL
+        let size: Int64
+    }
+
+    private static func importJobs(
+        fileManager: FileManager,
+        destFolder: URL,
+        sources: [ImportSource],
+        mode: Mode
+    ) -> [ImportJob] {
+        var reservedFileNames = Set<String>()
+        var actualReservedFileNames = Set<String>()
+
+        return sources.compactMap { source in
+            let intendedDestination = uniqueDestinationURL(
+                fileManager: fileManager,
+                destFolder: destFolder,
+                fileName: source.fileName,
+                reservedFileNames: &reservedFileNames,
+                avoidExistingFiles: false
+            )
+
+            if mode == .copy,
+               existingFileMatchesSource(at: intendedDestination, sourceSize: source.size, fileManager: fileManager) {
+                return nil
+            }
+
+            var destination = intendedDestination
+            if fileManager.fileExists(atPath: destination.path)
+                || actualReservedFileNames.contains(destination.lastPathComponent.lowercased()) {
+                destination = uniqueDestinationURL(
+                    fileManager: fileManager,
+                    destFolder: destFolder,
+                    fileName: source.fileName,
+                    reservedFileNames: &actualReservedFileNames,
+                    avoidExistingFiles: true
+                )
+            } else {
+                actualReservedFileNames.insert(destination.lastPathComponent.lowercased())
+            }
+
+            return ImportJob(url: source.url, destination: destination, size: source.size)
+        }
+    }
+
+    private static func importJobs(
+        fileManager: FileManager,
+        destFolder: URL,
+        sources: [ImportSource],
+        mode: Mode,
+        reservationCoordinator: DestinationReservationCoordinator
+    ) async -> [ImportJob] {
+        var jobs: [ImportJob] = []
+        for source in sources {
+            guard let destination = await reservationCoordinator.reserveDestination(
+                fileManager: fileManager,
+                destFolder: destFolder,
+                fileName: source.fileName,
+                sourceSize: source.size,
+                mode: mode
+            ) else { continue }
+            jobs.append(ImportJob(url: source.url, destination: destination, size: source.size))
+        }
+        return jobs
+    }
+
+    private static func existingFileMatchesSource(at destination: URL, sourceSize: Int64, fileManager: FileManager) -> Bool {
+        guard fileManager.fileExists(atPath: destination.path),
+              let attrs = try? fileManager.attributesOfItem(atPath: destination.path),
+              let size = attrs[.size] as? Int64 else { return false }
+        return size == sourceSize
+    }
+
+    /// Returns a destination URL that does not yet exist or isn't already reserved for this import.
+    /// If the base fileName conflicts, tries baseB.ext, baseC.ext, … until free.
+    private static func uniqueDestinationURL(
+        fileManager: FileManager,
+        destFolder: URL,
+        fileName: String,
+        reservedFileNames: inout Set<String>,
+        avoidExistingFiles: Bool
+    ) -> URL {
         let asURL = URL(fileURLWithPath: fileName)
         let base = asURL.deletingPathExtension().lastPathComponent
         let ext = asURL.pathExtension
@@ -194,11 +339,105 @@ actor ImportEngine {
 
         var candidate = destFolder.appendingPathComponent(fileName)
         var n = 2
-        while fileManager.fileExists(atPath: candidate.path) {
-            candidate = destFolder.appendingPathComponent("\(base)_\(n)\(suffix)")
+        while (avoidExistingFiles && fileManager.fileExists(atPath: candidate.path))
+            || reservedFileNames.contains(candidate.lastPathComponent.lowercased()) {
+            candidate = destFolder.appendingPathComponent("\(base)\(duplicateLetterSuffix(for: n))\(suffix)")
             n += 1
         }
+        reservedFileNames.insert(candidate.lastPathComponent.lowercased())
         return candidate
+    }
+
+    private static func duplicateLetterSuffix(for duplicateIndex: Int) -> String {
+        var value = max(duplicateIndex, 1)
+        var result = ""
+        while value > 0 {
+            value -= 1
+            let scalar = UnicodeScalar(65 + (value % 26))!
+            result = String(Character(scalar)) + result
+            value /= 26
+        }
+        return result
+    }
+}
+
+actor DestinationReservationCoordinator {
+    private var reservedFileNamesByFolder: [String: Set<String>] = [:]
+
+    func reserveDestination(
+        fileManager: FileManager,
+        destFolder: URL,
+        fileName: String,
+        sourceSize: Int64,
+        mode: ImportEngine.Mode
+    ) -> URL? {
+        var reservedFileNames = reservedFileNamesByFolder[destFolder.path] ?? []
+        let intendedDestination = destFolder.appendingPathComponent(fileName)
+
+        if mode == .copy,
+           Self.existingFileMatchesSource(at: intendedDestination, sourceSize: sourceSize, fileManager: fileManager) {
+            return nil
+        }
+
+        let destination: URL
+        if fileManager.fileExists(atPath: intendedDestination.path)
+            || reservedFileNames.contains(intendedDestination.lastPathComponent.lowercased()) {
+            destination = Self.uniqueDestinationURL(
+                fileManager: fileManager,
+                destFolder: destFolder,
+                fileName: fileName,
+                reservedFileNames: &reservedFileNames,
+                avoidExistingFiles: true
+            )
+        } else {
+            destination = intendedDestination
+            reservedFileNames.insert(destination.lastPathComponent.lowercased())
+        }
+
+        reservedFileNamesByFolder[destFolder.path] = reservedFileNames
+        return destination
+    }
+
+    private static func existingFileMatchesSource(at destination: URL, sourceSize: Int64, fileManager: FileManager) -> Bool {
+        guard fileManager.fileExists(atPath: destination.path),
+              let attrs = try? fileManager.attributesOfItem(atPath: destination.path),
+              let size = attrs[.size] as? Int64 else { return false }
+        return size == sourceSize
+    }
+
+    private static func uniqueDestinationURL(
+        fileManager: FileManager,
+        destFolder: URL,
+        fileName: String,
+        reservedFileNames: inout Set<String>,
+        avoidExistingFiles: Bool
+    ) -> URL {
+        let asURL = URL(fileURLWithPath: fileName)
+        let base = asURL.deletingPathExtension().lastPathComponent
+        let ext = asURL.pathExtension
+        let suffix = ext.isEmpty ? "" : ".\(ext)"
+
+        var candidate = destFolder.appendingPathComponent(fileName)
+        var n = 2
+        while (avoidExistingFiles && fileManager.fileExists(atPath: candidate.path))
+            || reservedFileNames.contains(candidate.lastPathComponent.lowercased()) {
+            candidate = destFolder.appendingPathComponent("\(base)\(duplicateLetterSuffix(for: n))\(suffix)")
+            n += 1
+        }
+        reservedFileNames.insert(candidate.lastPathComponent.lowercased())
+        return candidate
+    }
+
+    private static func duplicateLetterSuffix(for duplicateIndex: Int) -> String {
+        var value = max(duplicateIndex, 1)
+        var result = ""
+        while value > 0 {
+            value -= 1
+            let scalar = UnicodeScalar(65 + (value % 26))!
+            result = String(Character(scalar)) + result
+            value /= 26
+        }
+        return result
     }
 }
 
@@ -225,6 +464,17 @@ struct ImportResult: Sendable {
     let averageSpeed: Double
     let destinationPath: String
     let importedFiles: [String]
+    let skippedFiles: Int
+
+    static let empty = ImportResult(
+        fileCount: 0,
+        totalBytes: 0,
+        duration: 0,
+        averageSpeed: 0,
+        destinationPath: "",
+        importedFiles: [],
+        skippedFiles: 0
+    )
 }
 
 enum ImportError: LocalizedError {

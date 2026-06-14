@@ -655,19 +655,39 @@ struct EventStatsView: View {
 
     @ViewBuilder
     private func photoStatsCard(for report: StatsReport) -> some View {
-        let isLimitedData = report.avgISO == nil && report.avgAperture == nil && report.avgFocalLength == nil && report.totalFilesAnalyzed > 0
+        let isLimitedData = report.rawOutput.contains("mdls fallback") && report.totalFilesAnalyzed > 0
+        let isShowingCachedStatsWithoutCurrentRAWs = diskIsReachable && knownRawFileCount == 0 && report.totalFilesAnalyzed > 0
         VStack(alignment: .leading, spacing: 6) {
             AuroraPanelHeader(title: "Photo Stats")
+
+            if isShowingCachedStatsWithoutCurrentRAWs {
+                HStack(spacing: 8) {
+                    Image(systemName: "archivebox")
+                        .foregroundStyle(Color.auroraCyan)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("No RAW files currently in this folder")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.textPrimary)
+                        Text("Showing cached stats from the last scan/import. Import history is kept separately.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.textSecondary)
+                    }
+                }
+                .padding(10)
+                .background(Color.auroraCyan.opacity(0.1))
+                .cornerRadius(8)
+                .padding(.bottom, 6)
+            }
 
             if isLimitedData {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundStyle(Color.orange)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Limited stats — exiftool not installed")
+                        Text("Limited stats — Spotlight fallback")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.textPrimary)
-                        Text("Install exiftool for ISO, aperture, focal length and lens data: brew install exiftool")
+                        Text("ISO and shutter appear when macOS exposes them. Install exiftool for full lens, date and exposure data: brew install exiftool")
                             .font(.system(size: 11))
                             .foregroundColor(.textSecondary)
                     }
@@ -981,12 +1001,19 @@ struct EventStatsView: View {
                 }
                 appState.log("Event stats scanned & cached: \(eventName) — \(r.totalFilesAnalyzed) photos")
             } else {
-                // Scan returned nothing — keep showing cached data if available
-                if report == nil {
-                    let fileCount = VolumeWatcher.listRawFiles(at: url, extensions: appState.supportedExtensions).count
-                    if fileCount > 0 {
-                        errorMessage = "Could not analyze files — make sure exiftool is installed (brew install exiftool)"
+                let fileCount = VolumeWatcher.listRawFiles(at: url, extensions: appState.supportedExtensions).count
+                if fileCount == 0 {
+                    if let bookmarkIndex {
+                        appState.updateEventFolderCache(at: bookmarkIndex, count: 0, path: destinationPath)
                     }
+                    if let cached = cachedStatsForCurrentEvent() {
+                        report = cached.report
+                        scanDate = cached.scanDate
+                        isCachedData = true
+                    }
+                    appState.log("Event scan found no current RAW files; keeping cached stats for \(eventName)", level: .warning)
+                } else if report == nil {
+                    errorMessage = "Could not analyze files — make sure exiftool is installed (brew install exiftool)"
                 }
             }
         }

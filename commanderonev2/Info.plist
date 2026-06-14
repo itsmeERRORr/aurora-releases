@@ -8,7 +8,5 @@
 	<string>Aurora</string>
 	<key>NSRemovableVolumesUsageDescription</key>
 	<string>Aurora needs access to removable camera cards to detect and import RAW files.</string>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>Aurora controls Adobe Lightroom Classic to import the photos you just copied into your catalog automatically.</string>
 </dict>
 </plist>

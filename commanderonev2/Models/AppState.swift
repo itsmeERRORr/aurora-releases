@@ -56,7 +56,7 @@ enum ImportState: Equatable {
     }
 }
 
-struct VolumeInfo: Identifiable, Equatable, Hashable {
+struct VolumeInfo: Identifiable, Equatable, Hashable, Sendable {
     let id: String
     let name: String
     let path: URL
@@ -81,6 +81,9 @@ final class AppState {
     var isSortingSourceFiles = false
     var captureDateCache: [URL: Date] = [:]
     var photoRatings: [URL: Int] = [:]
+    var sourceFileCountForDestinationCheck: Int = 0
+    var allDestinationFilesAlreadyImported = false
+    var sourceFilesImportStatusMessage: String?
 
     // MARK: - Destination
     var destinationURL: URL?
@@ -104,26 +107,17 @@ final class AppState {
     var importMode: ImportMode = .move {
         didSet { UserDefaults.standard.set(importMode.rawValue, forKey: "importMode") }
     }
-
-    var lightroomSyncEnabled: Bool = false {
-        didSet { UserDefaults.standard.set(lightroomSyncEnabled, forKey: "lightroomSyncEnabled") }
+    var renameOnImport: Bool = false {
+        didSet { UserDefaults.standard.set(renameOnImport, forKey: "renameOnImport") }
     }
-    var lightroomOpenAfterImport: Bool = false {
-        didSet { UserDefaults.standard.set(lightroomOpenAfterImport, forKey: "lightroomOpenAfterImport") }
-    }
-    var lightroomAppPath: String = "" {
-        didSet { UserDefaults.standard.set(lightroomAppPath, forKey: "lightroomAppPath") }
-    }
-    /// When enabled, after writing the sync request Aurora clicks the plug-in's menu
-    /// command in Lightroom (via AppleScript) so the photos import automatically with
-    /// no manual click. Requires macOS Automation permission (prompted on first use).
-    var lightroomAutoTrigger: Bool = true {
-        didSet { UserDefaults.standard.set(lightroomAutoTrigger, forKey: "lightroomAutoTrigger") }
+    var renameTemplate: String = RenameTemplateRenderer.defaultTemplate {
+        didSet { UserDefaults.standard.set(renameTemplate, forKey: "renameTemplate") }
     }
 
     // MARK: - Import State
     var importState: ImportState = .idle
     var importProgress: ImportProgress = ImportProgress()
+    var importJobs: [ImportJobProgress] = []
     var lastImportReport: ImportReport?
 
     // MARK: - Stats
@@ -533,10 +527,8 @@ final class AppState {
            let mode = ImportMode(rawValue: raw) {
             importMode = mode
         }
-        lightroomSyncEnabled = UserDefaults.standard.bool(forKey: "lightroomSyncEnabled")
-        lightroomOpenAfterImport = UserDefaults.standard.bool(forKey: "lightroomOpenAfterImport")
-        lightroomAppPath = UserDefaults.standard.string(forKey: "lightroomAppPath") ?? ""
-        lightroomAutoTrigger = UserDefaults.standard.object(forKey: "lightroomAutoTrigger") as? Bool ?? true
+        renameOnImport = UserDefaults.standard.bool(forKey: "renameOnImport")
+        renameTemplate = UserDefaults.standard.string(forKey: "renameTemplate") ?? RenameTemplateRenderer.defaultTemplate
         if let data = UserDefaults.standard.data(forKey: "destinationBookmark") {
             destinationBookmarkData = data
             destinationURL = BookmarkManager.resolveBookmark(data)
@@ -1156,6 +1148,13 @@ final class AppState {
         return manualDateForEvent(at: index)
     }
 
+    func effectiveDateForEvent(at index: Int) -> Date? {
+        let summary = importStatsForEventFolder(at: index)
+        let finalized = finalizedEvent(forBookmarkIndex: index)
+        let automaticDate = summary?.lastDate ?? finalized?.lastImportDate
+        return displayDateForEvent(at: index, automaticDate: automaticDate) ?? finalized?.finalizedAt
+    }
+
     private func saveEventFolderPeakRawCounts() {
         guard let data = try? PropertyListEncoder().encode(eventFolderPeakRawCounts) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderPeakRawCountsData")
@@ -1685,35 +1684,6 @@ final class AppState {
         ))
     }
 
-    func requestLightroomSync(forImportFolder importFolder: String) {
-        guard lightroomSyncEnabled else { return }
-        let eventName = eventNameContainingDestination(importFolder)
-            ?? URL(fileURLWithPath: importFolder).deletingLastPathComponent().lastPathComponent
-
-        do {
-            let requestURL = try LightroomSyncService.writePendingRequest(eventName: eventName, importFolder: importFolder)
-            log("Lightroom sync requested for '\(eventName)': \(requestURL.lastPathComponent)")
-            if lightroomOpenAfterImport || lightroomAutoTrigger {
-                LightroomSyncService.openLightroom(appPath: lightroomAppPath.isEmpty ? nil : lightroomAppPath)
-            }
-            if lightroomAutoTrigger {
-                // Give Lightroom a moment to come to the front (and finish launching if it
-                // wasn't open), then click the plug-in menu command so the import is
-                // automatic. Runs off the main actor so the AppleScript delay doesn't block UI.
-                Task.detached {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    let ok = LightroomSyncService.triggerImportInLightroom()
-                    await self.log(ok
-                        ? "Triggered Lightroom import for '\(eventName)'"
-                        : "Could not auto-trigger Lightroom import — click 'Import Aurora Photos Now' in Lightroom, or grant Automation permission.",
-                        level: ok ? .info : .warning)
-                }
-            }
-        } catch {
-            log("Could not create Lightroom sync request: \(error.localizedDescription)", level: .warning)
-        }
-    }
-
     private func eventNameContainingDestination(_ path: String) -> String? {
         let destinationPath = normalizePath(path)
         let match = uniqueImportDestinations
@@ -1727,6 +1697,19 @@ final class AppState {
             }
         guard let match else { return nil }
         return displayNameForEvent(at: match.bookmarkIndex) ?? match.name
+    }
+
+    func renameEventName(forDestinationPath path: String) -> String {
+        if let activeEventFolderIndex,
+           let name = displayNameForEvent(at: activeEventFolderIndex),
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return name
+        }
+        if let name = eventNameContainingDestination(path),
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return name
+        }
+        return URL(fileURLWithPath: path).lastPathComponent
     }
 
     func setEventFolderDisplayName(at index: Int, name: String) {
@@ -1935,6 +1918,9 @@ struct ImportProgress {
     var currentFileName: String = ""
     var startTime: Date?
     var bytesPerSecond: Double = 0
+    var skippedFiles: Int = 0
+    var statusMessage: String?
+    var failureMessage: String?
 
     var fraction: Double {
         guard totalFiles > 0 else { return 0 }
@@ -1953,6 +1939,14 @@ struct ImportProgress {
         let secs = Int(elapsed) % 60
         return String(format: "%d:%02d", mins, secs)
     }
+}
+
+struct ImportJobProgress: Identifiable {
+    let id: String
+    let sourceName: String
+    let sourcePath: String
+    var state: ImportState
+    var progress: ImportProgress
 }
 
 struct LogEntry: Identifiable, Codable {

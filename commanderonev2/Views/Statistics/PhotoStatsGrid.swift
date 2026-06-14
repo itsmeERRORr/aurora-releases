@@ -70,9 +70,17 @@ struct PhotoStatsGrid: View {
             let rawCount = report?.totalFilesAnalyzed ?? 0
             return [
                 ("Photos Delivered", delivered > 0 ? AuroraFormat.count(delivered) : "—"),
-                ("Keep Rate", keepRate(delivered: delivered, rawCount: rawCount))
+                ("Keep Rate", keepRate(delivered: delivered, rawCount: rawCount)),
+                ("Avg / Event", deliveredAveragePerEvent(delivered: delivered))
             ]
         }
+    }
+
+    private func deliveredAveragePerEvent(delivered: Int) -> String {
+        guard delivered > 0 else { return "—" }
+        let eventCount = appState.eventFolderCachedJPGCounts.filter { $0 > 0 }.count
+        guard eventCount > 0 else { return "—" }
+        return AuroraFormat.count(delivered / eventCount)
     }
 
     private var isoPages: [(label: String, value: String)] {

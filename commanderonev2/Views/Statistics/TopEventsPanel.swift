@@ -38,11 +38,7 @@ enum EventAggregator {
                 ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0) : 0
             let files = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
             let bytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
-            let lastDate = summary?.lastDate
-                ?? finalized?.lastImportDate
-                ?? finalized?.finalizedAt
-            let displayDate = appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: lastDate)
-                ?? .distantPast
+            let displayDate = appState.effectiveDateForEvent(at: destination.bookmarkIndex) ?? .distantPast
 
             guard files > 0 else { return nil }
 
@@ -271,21 +267,22 @@ struct LatestEventsPanel: View {
         for destination: (path: String, name: String, bookmarkIndex: Int)
     ) -> LatestEventDisplay? {
         let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
+        let finalized = appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)
         let peak = destination.bookmarkIndex < appState.eventFolderPeakRawCounts.count
             ? appState.eventFolderPeakRawCounts[destination.bookmarkIndex]
             : 0
         let cached = destination.bookmarkIndex < appState.eventFolderCachedCounts.count
             ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
             : 0
-        let totalFiles = max(summary?.photoCount ?? 0, max(peak, cached))
+        let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
 
         let aggregate = EventAggregate(
             id: destination.path,
             name: destination.name,
             totalFiles: totalFiles,
-            totalBytes: summary?.totalBytes ?? 0,
+            totalBytes: max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0),
             averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
-            lastDate: appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: summary?.lastDate) ?? .distantPast
+            lastDate: appState.effectiveDateForEvent(at: destination.bookmarkIndex) ?? .distantPast
         )
         let bannerPath: String? = if destination.bookmarkIndex < appState.eventFolderBannerImagePaths.count {
             appState.eventFolderBannerImagePaths[destination.bookmarkIndex].isEmpty

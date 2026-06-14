@@ -212,9 +212,7 @@ struct DeliverablesPerEventChart: View {
             guard destination.bookmarkIndex < appState.eventFolderCachedJPGCounts.count else { return nil }
             let count = max(appState.eventFolderCachedJPGCounts[destination.bookmarkIndex], 0)
             guard count > 0 else { return nil }
-            let lastDate = appState.importStatsForEventFolder(at: destination.bookmarkIndex)?.lastDate
-                ?? appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)?.lastImportDate
-                ?? .distantPast
+            let lastDate = appState.effectiveDateForEvent(at: destination.bookmarkIndex) ?? .distantPast
             return DeliverableEntry(
                 id: destination.path,
                 name: destination.name,

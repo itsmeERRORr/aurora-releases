@@ -220,8 +220,7 @@ struct StatsViewAllSheetView: View {
     }
 
     private func latestDate(for event: (path: String, name: String, bookmarkIndex: Int)) -> Date {
-        let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
-        return appState.displayDateForEvent(at: event.bookmarkIndex, automaticDate: summary?.lastDate) ?? .distantPast
+        appState.effectiveDateForEvent(at: event.bookmarkIndex) ?? .distantPast
     }
 
     private func bookmarkIndex(for path: String) -> Int? {
@@ -312,7 +311,6 @@ private struct LatestSidebarOrderRow: View {
     var onSelect: () -> Void = {}
 
     var body: some View {
-        let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
         let finalized = appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex)
         let peak = event.bookmarkIndex < appState.eventFolderPeakRawCounts.count
             ? appState.eventFolderPeakRawCounts[event.bookmarkIndex]
@@ -320,7 +318,9 @@ private struct LatestSidebarOrderRow: View {
         let cached = event.bookmarkIndex < appState.eventFolderCachedCounts.count
             ? max(appState.eventFolderCachedCounts[event.bookmarkIndex], 0)
             : 0
+        let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)
         let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
+        let displayDate = appState.effectiveDateForEvent(at: event.bookmarkIndex)
         let bannerPath: String? = {
             guard event.bookmarkIndex < appState.eventFolderBannerImagePaths.count else { return nil }
             let path = appState.eventFolderBannerImagePaths[event.bookmarkIndex]
@@ -339,13 +339,13 @@ private struct LatestSidebarOrderRow: View {
                     .lineLimit(1)
                     .contentShape(Rectangle())
                     .onTapGesture(perform: onSelect)
-                Text(displayDate(summary?.lastDate, bookmarkIndex: event.bookmarkIndex).map(AuroraFormat.dateCompact) ?? "—")
+                Text(displayDate.map(AuroraFormat.dateCompact) ?? "—")
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
                     .contentShape(Rectangle())
                     .help("Click to set a manual event date")
                     .onTapGesture {
-                        onEditDate(event.bookmarkIndex, editableDate(automaticDate: summary?.lastDate))
+                        onEditDate(event.bookmarkIndex, editableDate())
                     }
             }
             Spacer(minLength: 4)
@@ -355,16 +355,12 @@ private struct LatestSidebarOrderRow: View {
         .padding(.vertical, 8)
     }
 
-    private func displayDate(_ automaticDate: Date?, bookmarkIndex: Int) -> Date? {
-        appState.displayDateForEvent(at: bookmarkIndex, automaticDate: automaticDate)
-    }
-
-    private func editableDate(automaticDate: Date?) -> Date {
+    private func editableDate() -> Date {
         if let manual = appState.manualDateForEvent(at: event.bookmarkIndex) {
             return manual
         }
-        if let automaticDate, automaticDate != .distantPast {
-            return automaticDate
+        if let effectiveDate = appState.effectiveDateForEvent(at: event.bookmarkIndex) {
+            return effectiveDate
         }
         return Date()
     }

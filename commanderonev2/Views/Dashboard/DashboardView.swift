@@ -141,8 +141,7 @@ struct DashboardView: View {
             : 0
         let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
         let totalBytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
-        let displayDate = appState.displayDateForEvent(at: destination.bookmarkIndex, automaticDate: summary?.lastDate)
-            ?? .distantPast
+        let displayDate = appState.effectiveDateForEvent(at: destination.bookmarkIndex) ?? .distantPast
 
         return EventAggregate(
             id: destination.path,
@@ -419,6 +418,9 @@ struct WaitingCard: View {
 
     @State private var pulse = false
     @State private var importBorderSpin = false
+    @State private var showRenameEditor = false
+    @State private var renameEditorConfirmed = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
@@ -480,6 +482,20 @@ struct WaitingCard: View {
         .onChange(of: shouldEmphasizeImportNow) { _, _ in
             updateAnimations()
         }
+        .onChange(of: isImportNowBlocked) { _, _ in
+            updateAnimations()
+        }
+        .onChange(of: appState.renameOnImport) { _, isEnabled in
+            if isEnabled {
+                renameEditorConfirmed = false
+                showRenameEditor = true
+            }
+        }
+        .sheet(isPresented: $showRenameEditor, onDismiss: handleRenameEditorDismiss) {
+            RenameTemplateEditorSheet(appState: appState) {
+                renameEditorConfirmed = true
+            }
+        }
     }
 
     private func updateAnimations() {
@@ -492,9 +508,9 @@ struct WaitingCard: View {
             pulse = false
         }
 
-        if shouldEmphasizeImportNow {
+        if shouldEmphasizeImportNow && !isImportNowBlocked {
             importBorderSpin = false
-            withAnimation(.linear(duration: 1.15).repeatForever(autoreverses: false)) {
+            withAnimation(.linear(duration: 1.85).repeatForever(autoreverses: false)) {
                 importBorderSpin = true
             }
         } else {
@@ -503,11 +519,14 @@ struct WaitingCard: View {
     }
 
     private var cardIcon: String {
-        if appState.activeVolume != nil { return "externaldrive.fill" }
+        if !importableVolumes.isEmpty { return "externaldrive.fill" }
         return "sdcard"
     }
 
     private var title: String {
+        if importableVolumes.count > 1 {
+            return "\(importableVolumes.count) cards ready"
+        }
         if let vol = appState.activeVolume {
             return "Card ready: \(vol.name)"
         }
@@ -520,6 +539,10 @@ struct WaitingCard: View {
     }
 
     private var subtitle: String {
+        if importableVolumes.count > 1 {
+            let total = importableVolumes.reduce(0) { $0 + $1.rawFileCount }
+            return "\(AuroraFormat.count(total)) RAW files across \(importableVolumes.count) cards"
+        }
         if let vol = appState.activeVolume, vol.rawFileCount > 0 {
             return "\(AuroraFormat.count(vol.rawFileCount)) RAW files detected"
         }
@@ -674,19 +697,20 @@ struct WaitingCard: View {
                 Button("Resume", action: onResume).buttonStyle(AuroraGradientButtonStyle(compact: true))
                 Button("Cancel", action: onCancel).buttonStyle(AuroraGhostButtonStyle())
             default:
+                let importBlocked = isImportNowBlocked
                 Button {
                     onImportNow()
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "bolt.fill").font(.system(size: 11, weight: .bold))
-                        Text("Import now")
+                        Text(importableVolumes.count > 1 ? "Import all" : "Import now")
                     }
                 }
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                .disabled(appState.activeVolume == nil)
-                .opacity(appState.activeVolume == nil ? 0.5 : 1)
+                .disabled(importBlocked)
+                .opacity(importBlocked ? 0.5 : 1)
                 .overlay {
-                    if shouldEmphasizeImportNow {
+                    if shouldEmphasizeImportNow && !importBlocked {
                         ZStack {
                             RoundedRectangle(cornerRadius: AuroraRadius.badge, style: .continuous)
                                 .strokeBorder(Color.white.opacity(0.28), lineWidth: 1)
@@ -713,24 +737,45 @@ struct WaitingCard: View {
                     }
                 }
                 .shadow(
-                    color: shouldEmphasizeImportNow ? Color.auroraCyan.opacity(0.35) : .clear,
-                    radius: shouldEmphasizeImportNow ? 14 : 0,
+                    color: shouldEmphasizeImportNow && !importBlocked ? Color.auroraCyan.opacity(0.35) : .clear,
+                    radius: shouldEmphasizeImportNow && !importBlocked ? 14 : 0,
                     x: 0,
                     y: 0
                 )
 
-                Toggle("Auto-import", isOn: $appState.autoImport)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .tint(Color.auroraCyan)
-                    .font(.manrope(12, weight: .semibold))
-                    .foregroundStyle(Color.auroraMuted)
+                HStack(spacing: 12) {
+                    AuroraMiniToggle(label: "Auto-import", isOn: $appState.autoImport, tint: .auroraCyan)
+                    AuroraMiniToggle(label: "Rename", isOn: $appState.renameOnImport, tint: .auroraMagenta)
+                    if appState.renameOnImport {
+                        Button("Edit") { showRenameEditor = true }
+                            .font(.manrope(11, weight: .bold))
+                            .foregroundStyle(Color.auroraMagenta)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.auroraMagenta.opacity(0.14))
+                            )
+                            .overlay(
+                                Capsule(style: .continuous)
+                                    .strokeBorder(Color.auroraMagenta.opacity(0.35), lineWidth: 1)
+                            )
+                            .buttonStyle(.plain)
+                    }
+                }
             }
         }
     }
 
+    private func handleRenameEditorDismiss() {
+        if appState.renameOnImport && !renameEditorConfirmed {
+            appState.renameOnImport = false
+        }
+        renameEditorConfirmed = false
+    }
+
     private var shouldEmphasizeImportNow: Bool {
-        guard let volume = appState.activeVolume, volume.rawFileCount > 0 else { return false }
+        guard !importableVolumes.isEmpty else { return false }
         switch appState.importState {
         case .idle, .done, .ejectingDone:
             return true
@@ -739,14 +784,65 @@ struct WaitingCard: View {
         }
     }
 
+    private var isImportNowBlocked: Bool {
+        let allAlreadyImported = appState.allDestinationFilesAlreadyImported && appState.sourceFileCountForDestinationCheck > 0
+        return importableVolumes.isEmpty || allAlreadyImported
+    }
+
     private var shouldPulseWaitingCard: Bool {
-        guard appState.activeVolume == nil else { return false }
+        guard importableVolumes.isEmpty else { return false }
         switch appState.importState {
         case .idle, .done, .ejectingDone:
             return true
         default:
             return false
         }
+    }
+
+    private var importableVolumes: [VolumeInfo] {
+        let volumes = appState.mountedVolumes.filter { $0.rawFileCount > 0 && !isDestinationVolume($0.path) }
+        guard !volumes.isEmpty else {
+            if let active = appState.activeVolume, active.rawFileCount > 0, !isDestinationVolume(active.path) { return [active] }
+            return []
+        }
+        return Array(volumes.prefix(2))
+    }
+
+    private func isDestinationVolume(_ sourceURL: URL) -> Bool {
+        guard let destinationURL = appState.destinationURL else { return false }
+        let sourcePath = normalizedPath(sourceURL.path)
+        let destinationPath = normalizedPath(destinationURL.path)
+        return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
+    }
+}
+
+private struct AuroraMiniToggle: View {
+    let label: String
+    @Binding var isOn: Bool
+    let tint: Color
+
+    var body: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.16)) { isOn.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                Text(label)
+                    .font(.manrope(12, weight: .semibold))
+                    .foregroundStyle(isOn ? Color.auroraTxt : Color.auroraMuted)
+                ZStack(alignment: isOn ? .trailing : .leading) {
+                    Capsule()
+                        .fill(isOn ? tint.opacity(0.95) : Color.auroraStroke2.opacity(0.9))
+                        .frame(width: 36, height: 20)
+                    Circle()
+                        .fill(Color.white.opacity(isOn ? 0.96 : 0.72))
+                        .frame(width: 16, height: 16)
+                        .padding(.horizontal, 2)
+                        .shadow(color: isOn ? tint.opacity(0.45) : .clear, radius: 6, x: 0, y: 0)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .help(isOn ? "Enabled" : "Disabled")
     }
 }
 
@@ -808,6 +904,8 @@ struct FileBrowserRow: View {
     @State private var isLoadingSource = false
     @State private var isLoadingDest = false
     @State private var showAdvanced = false
+    @State private var loadSourceTask: Task<Void, Never>?
+    @State private var loadDestTask: Task<Void, Never>?
 
     var body: some View {
         HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
@@ -817,7 +915,8 @@ struct FileBrowserRow: View {
                 color: .auroraCyan,
                 files: sourceFiles,
                 isLoading: isLoadingSource,
-                emptyHint: appState.activeVolume == nil ? "No card detected" : "No RAW files found",
+                emptyHint: sourceVolumes.isEmpty ? "No card detected" : "No RAW files found",
+                statusText: sourceFilesStatusText,
                 onAdvanced: sourceFiles.isEmpty ? nil : { showAdvanced = true }
             )
             filePanel(
@@ -826,7 +925,8 @@ struct FileBrowserRow: View {
                 color: .auroraViolet,
                 files: destFiles,
                 isLoading: isLoadingDest,
-                emptyHint: appState.destinationURL == nil ? "No destination set" : "No files found"
+                emptyHint: appState.destinationURL == nil ? "No destination set" : "No files found",
+                onRefresh: appState.destinationURL == nil ? nil : { loadDestFiles(from: appState.destinationURL) }
             )
         }
         .sheet(isPresented: $showAdvanced) {
@@ -835,14 +935,30 @@ struct FileBrowserRow: View {
             }
         }
         .onChange(of: appState.activeVolume) { _, volume in
-            loadSourceFiles(from: volume)
+            loadSourceFiles()
+        }
+        .onChange(of: appState.mountedVolumes) { _, _ in
+            loadSourceFiles()
         }
         .onChange(of: appState.destinationURL) { _, url in
             loadDestFiles(from: url)
         }
+        .onChange(of: appState.renameOnImport) { _, _ in
+            clearImportBlockReason()
+        }
+        .onChange(of: appState.renameTemplate) { _, _ in
+            clearImportBlockReason()
+        }
+        .onChange(of: appState.importMode) { _, _ in
+            clearImportBlockReason()
+        }
         .onAppear {
-            loadSourceFiles(from: appState.activeVolume)
+            loadSourceFiles()
             loadDestFiles(from: appState.destinationURL)
+        }
+        .onDisappear {
+            loadSourceTask?.cancel()
+            loadDestTask?.cancel()
         }
     }
 
@@ -853,18 +969,53 @@ struct FileBrowserRow: View {
         files: [URL],
         isLoading: Bool,
         emptyHint: String,
-        onAdvanced: (() -> Void)? = nil
+        statusText: String? = nil,
+        onAdvanced: (() -> Void)? = nil,
+        onRefresh: (() -> Void)? = nil
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 IconChip(systemName: icon, color: color, size: 26, iconScale: 0.5)
-                Text(title)
-                    .font(.manrope(13, weight: .bold))
-                    .foregroundStyle(Color.auroraTxt)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 8) {
+                        Text(title)
+                            .font(.manrope(13, weight: .bold))
+                            .foregroundStyle(Color.auroraTxt)
+                        if title == "Source Files", let statusText {
+                            Text(statusText)
+                                .font(.manrope(11, weight: .bold))
+                                .foregroundStyle(Color.auroraCyan)
+                                .lineLimit(1)
+                        }
+                    }
+                    if title == "Source Files", let sourceNamesText {
+                        Text(sourceNamesText)
+                            .font(.manrope(10.5, weight: .semibold))
+                            .foregroundStyle(Color.auroraFaint)
+                            .lineLimit(1)
+                    }
+                }
+                if let statusText, title != "Source Files" {
+                    Text(statusText)
+                        .font(.manrope(11, weight: .bold))
+                        .foregroundStyle(Color.auroraCyan)
+                        .lineLimit(1)
+                }
                 Spacer()
                 if let onAdvanced {
                     Button("Advanced", action: onAdvanced)
                         .buttonStyle(AuroraGhostButtonStyle())
+                }
+                if let onRefresh {
+                    Button(action: onRefresh) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("Refresh")
+                        }
+                    }
+                    .buttonStyle(AuroraGhostButtonStyle())
+                    .disabled(isLoading)
                 }
                 if !files.isEmpty {
                     Text("\(files.count)")
@@ -955,28 +1106,88 @@ struct FileBrowserRow: View {
         return "\(parts.value) \(parts.unit)"
     }
 
-    private func loadSourceFiles(from volume: VolumeInfo?) {
-        guard let volume = volume else { sourceFiles = []; return }
+    private func loadSourceFiles() {
+        let volumes = sourceVolumes
+        guard !volumes.isEmpty else {
+            loadSourceTask?.cancel()
+            sourceFiles = []
+            clearImportBlockReason()
+            return
+        }
         isLoadingSource = true
-        let path = volume.path
+        let paths = volumes.map(\.path)
         let exts = appState.supportedExtensions
-        Task {
-            let files = VolumeWatcher.listRawFiles(at: path, extensions: exts)
+        loadSourceTask?.cancel()
+        loadSourceTask = Task.detached(priority: .utility) {
+            let files = paths.flatMap { path in
+                VolumeWatcher.listRawFiles(at: path, extensions: exts)
+            }
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            sourceFiles = files
-            isLoadingSource = false
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                sourceFiles = files
+                isLoadingSource = false
+                clearImportBlockReason()
+            }
         }
     }
 
     private func loadDestFiles(from url: URL?) {
-        guard let url = url else { destFiles = []; return }
+        guard let url = url else {
+            loadDestTask?.cancel()
+            destFiles = []
+            clearImportBlockReason()
+            return
+        }
         isLoadingDest = true
         let exts = appState.supportedExtensions
-        Task {
+        loadDestTask?.cancel()
+        loadDestTask = Task.detached(priority: .utility) {
             let files = VolumeWatcher.listRawFiles(at: url, extensions: exts)
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            destFiles = files
-            isLoadingDest = false
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                destFiles = files
+                isLoadingDest = false
+                clearImportBlockReason()
+            }
         }
+    }
+
+    private var sourceFilesStatusText: String? {
+        if let message = appState.sourceFilesImportStatusMessage { return message }
+        return sourceVolumes.count > 1 ? "\(sourceVolumes.count) cards" : nil
+    }
+
+    private var sourceNamesText: String? {
+        let names = sourceVolumes.map(\.name)
+        guard !names.isEmpty else { return nil }
+        return names.joined(separator: " + ")
+    }
+
+    private var sourceVolumes: [VolumeInfo] {
+        let volumes = appState.mountedVolumes.filter { $0.rawFileCount > 0 && !isDestinationVolume($0.path) }
+        guard !volumes.isEmpty else {
+            if let active = appState.activeVolume, active.rawFileCount > 0, !isDestinationVolume(active.path) { return [active] }
+            return []
+        }
+        return Array(volumes.prefix(2))
+    }
+
+    private func isDestinationVolume(_ sourceURL: URL) -> Bool {
+        guard let destinationURL = appState.destinationURL else { return false }
+        let sourcePath = normalizedPath(sourceURL.path)
+        let destinationPath = normalizedPath(destinationURL.path)
+        return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
+
+    private func clearImportBlockReason() {
+        appState.sourceFileCountForDestinationCheck = sourceFiles.count
+        appState.allDestinationFilesAlreadyImported = false
+        appState.sourceFilesImportStatusMessage = nil
     }
 }

@@ -1,6 +1,4 @@
 import SwiftUI
-import AppKit
-import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @Bindable var appState: AppState
@@ -20,7 +18,6 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
                 topbar
                 importSection
-                lightroomSection
                 updateSection
                 dataSection
                 telegramSection
@@ -117,71 +114,6 @@ struct SettingsView: View {
         }
         .toggleStyle(.switch)
         .tint(Color.auroraCyan)
-    }
-
-    // MARK: - Lightroom
-
-    private var lightroomSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Lightroom Integration")
-
-            VStack(alignment: .leading, spacing: 14) {
-                toggleRow(
-                    label: "Request Lightroom sync after import",
-                    help: "Creates a pending sync request for the Aurora Sync Lightroom Classic plugin.",
-                    binding: $appState.lightroomSyncEnabled
-                )
-                toggleRow(
-                    label: "Open Lightroom Classic after import",
-                    help: "Opens Lightroom Classic after Aurora writes the sync request.",
-                    binding: $appState.lightroomOpenAfterImport
-                )
-
-                HStack(spacing: 12) {
-                    IconChip(systemName: "camera.viewfinder", color: .auroraViolet)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Lightroom Classic app")
-                            .font(.manrope(13, weight: .bold))
-                            .foregroundStyle(Color.auroraTxt)
-                        Text(lightroomAppLabel)
-                            .font(.manrope(11, weight: .medium))
-                            .foregroundStyle(Color.auroraFaint)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    Button("Choose…", action: chooseLightroomApp)
-                        .buttonStyle(AuroraGhostButtonStyle())
-                    if !appState.lightroomAppPath.isEmpty {
-                        Button("Clear") { appState.lightroomAppPath = "" }
-                            .buttonStyle(AuroraGhostButtonStyle())
-                    }
-                }
-            }
-            .padding(.horizontal, 6)
-        }
-        .auroraStaticCard()
-    }
-
-    private var lightroomAppLabel: String {
-        if !appState.lightroomAppPath.isEmpty { return appState.lightroomAppPath }
-        if let defaultURL = LightroomSyncService.defaultLightroomURL() {
-            return "Auto-detected: \(defaultURL.path)"
-        }
-        return "No app selected. Aurora will try the default Lightroom Classic paths."
-    }
-
-    private func chooseLightroomApp() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.application]
-        panel.message = "Choose Lightroom Classic.app"
-        panel.prompt = "Choose"
-
-        if panel.runModal() == .OK, let url = panel.url {
-            appState.lightroomAppPath = url.path
-        }
     }
 
     // MARK: - Telegram

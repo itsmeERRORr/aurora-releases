@@ -7,6 +7,7 @@ struct ContentView: View {
 
     @State private var volumeWatcher: VolumeWatcher?
     @State private var importEngine = ImportEngine()
+    @State private var activeImportEngines: [String: ImportEngine] = [:]
     @State private var statsRunner: StatsRunner?
     @State private var showProgressOverlay = false
     @State private var selectedNavItem: NavigationItem = .statistics
@@ -68,6 +69,9 @@ struct ContentView: View {
         }
         .onChange(of: appState.autoImport) { _, isEnabled in
             if !isEnabled { cancelAutoImportCountdown() }
+        }
+        .onChange(of: appState.destinationURL) { _, _ in
+            volumeWatcher?.refreshMountedVolumes()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -291,7 +295,13 @@ struct ContentView: View {
     // MARK: - Import actions
 
     private func startImport() {
-        guard let source = appState.activeVolume else {
+        guard isImportStartAllowed else {
+            appState.log("Cannot import: another import is already running", level: .warning)
+            return
+        }
+
+        let importSources = eligibleImportVolumes()
+        guard let source = importSources.first else {
             appState.log("Cannot import: no active volume", level: .warning)
             return
         }
@@ -314,17 +324,24 @@ struct ContentView: View {
                 appState.reopenEvent(at: idx)
             }
         }
+
+        if importSources.count > 1 {
+            startMultiCardImport(sources: Array(importSources.prefix(2)), destination: dest)
+            return
+        }
+
         guard let watcher = volumeWatcher else { return }
 
         appState.importState = .scanning
         showProgressOverlay = true
+        appState.importJobs = []
         appState.log("Starting import from \(source.name) to \(dest.path)")
 
         Task {
             let sourceAccessing = source.path.startAccessingSecurityScopedResource()
             defer { if sourceAccessing { source.path.stopAccessingSecurityScopedResource() } }
 
-            let files = watcher.listRawFiles(at: source.path)
+            let files = watcher.listRawFiles(at: source.path).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
             guard !files.isEmpty else {
                 appState.importState = .idle
                 showProgressOverlay = false
@@ -341,8 +358,21 @@ struct ContentView: View {
 
             do {
                 let engineMode: ImportEngine.Mode = appState.importMode == .copy ? .copy : .move
+                let importDate = Date()
+                let captureDates = appState.renameOnImport && RenameTemplateRenderer.usesDateTokens(appState.renameTemplate)
+                    ? await RenameCaptureDateReader.captureDates(for: files)
+                    : [:]
+                let renameOptions = appState.renameOnImport
+                    ? ImportRenameOptions(
+                        template: appState.renameTemplate,
+                        eventName: appState.renameEventName(forDestinationPath: dest.path),
+                        importDate: importDate,
+                        totalCount: files.count,
+                        captureDatesByPath: captureDates
+                    )
+                    : nil
                 let result = try await importEngine.importFiles(
-                    from: files, to: dest, mode: engineMode
+                    from: files, to: dest, mode: engineMode, renameOptions: renameOptions
                 ) { progress in
                     Task { @MainActor in
                         appState.importProgress.completedFiles = progress.completedFiles
@@ -351,8 +381,11 @@ struct ContentView: View {
                         appState.importProgress.totalBytes = progress.totalBytes
                         appState.importProgress.currentFileName = progress.currentFileName
                         appState.importProgress.bytesPerSecond = progress.bytesPerSecond
+                        appState.importProgress.skippedFiles = progress.skippedFiles
+                        appState.importProgress.statusMessage = progress.statusMessage
                     }
                 }
+                volumeWatcher?.refreshMountedVolumes()
 
                 appState.importState = .done
                 let report = ImportReport(
@@ -367,6 +400,25 @@ struct ContentView: View {
                 )
                 appState.lastImportReport = report
                 appState.log("Import complete: \(report.summary)")
+                if result.skippedFiles > 0 {
+                    appState.log("Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s") already present in destination")
+                }
+
+                if result.importedFiles.isEmpty {
+                    if result.skippedFiles > 0 {
+                        appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                        appState.allDestinationFilesAlreadyImported = true
+                        appState.sourceFilesImportStatusMessage = "All \(result.skippedFiles) files are already imported"
+                    }
+                    try? await Task.sleep(for: .seconds(1))
+                    showProgressOverlay = false
+                    appState.importState = .idle
+                    return
+                } else if result.skippedFiles > 0 {
+                    appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                    appState.allDestinationFilesAlreadyImported = false
+                    appState.sourceFilesImportStatusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+                }
 
                 if appState.autoEject {
                     appState.importState = .ejecting
@@ -414,8 +466,6 @@ struct ContentView: View {
                     )
                     Task { await attemptTelegramDailySummarySend() }
                 }
-                appState.requestLightroomSync(forImportFolder: result.destinationPath)
-
                 try? await Task.sleep(for: .seconds(1))
                 showProgressOverlay = false
                 selectedNavItem = .statistics
@@ -431,6 +481,8 @@ struct ContentView: View {
                 showProgressOverlay = false
                 appState.log("Import cancelled by user", level: .warning)
             } catch {
+                appState.importProgress.failureMessage = error.localizedDescription
+                appState.importProgress.statusMessage = "Import failed: \(error.localizedDescription)"
                 appState.importState = .error(error.localizedDescription)
                 appState.log("Import failed: \(error.localizedDescription)", level: .error)
                 try? await Task.sleep(for: .seconds(3))
@@ -440,9 +492,386 @@ struct ContentView: View {
         }
     }
 
+    private var isImportStartAllowed: Bool {
+        switch appState.importState {
+        case .idle, .done, .ejectingDone, .error:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func eligibleImportVolumes() -> [VolumeInfo] {
+        let volumes = appState.mountedVolumes.filter { $0.rawFileCount > 0 && !isDestinationVolume($0.path) }
+        guard !volumes.isEmpty else {
+            if let active = appState.activeVolume, active.rawFileCount > 0, !isDestinationVolume(active.path) { return [active] }
+            return []
+        }
+        if let active = appState.activeVolume,
+           let activeIndex = volumes.firstIndex(where: { $0.path == active.path }) {
+            var ordered = volumes
+            ordered.remove(at: activeIndex)
+            ordered.insert(active, at: 0)
+            return ordered
+        }
+        return volumes
+    }
+
+    private func isDestinationVolume(_ sourceURL: URL) -> Bool {
+        guard let destinationURL = appState.destinationURL else { return false }
+        let sourcePath = normalizedPath(sourceURL.path)
+        let destinationPath = normalizedPath(destinationURL.path)
+        return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
+    }
+
+    private func startMultiCardImport(sources: [VolumeInfo], destination dest: URL) {
+        guard !sources.isEmpty else { return }
+        guard sources.count > 1 else { return }
+
+        let startDate = Date()
+        let jobIDs = sources.map { $0.id }
+        let engines = Dictionary(uniqueKeysWithValues: jobIDs.map { ($0, ImportEngine()) })
+        activeImportEngines = engines
+        appState.importJobs = sources.map { source in
+            ImportJobProgress(
+                id: source.id,
+                sourceName: source.name,
+                sourcePath: source.path.path,
+                state: .scanning,
+                progress: ImportProgress(totalFiles: source.rawFileCount, startTime: startDate)
+            )
+        }
+        appState.importProgress = ImportProgress(
+            totalFiles: sources.reduce(0) { $0 + max($1.rawFileCount, 0) },
+            startTime: startDate
+        )
+        appState.importState = .scanning
+        showProgressOverlay = true
+        appState.log("Starting parallel import from \(sources.count) cards to \(dest.path)")
+
+        let mode: ImportEngine.Mode = appState.importMode == .copy ? .copy : .move
+        let renameOnImport = appState.renameOnImport
+        let renameTemplate = appState.renameTemplate
+        let importDate = Date()
+        let eventName = appState.renameEventName(forDestinationPath: dest.path)
+        let supportedExtensions = appState.supportedExtensions
+        let reservationCoordinator = DestinationReservationCoordinator()
+
+        Task {
+            let outcomes = await withTaskGroup(of: MultiImportOutcome.self) { group in
+                for source in sources {
+                    guard let engine = engines[source.id] else { continue }
+                    group.addTask {
+                        await runMultiImportJob(
+                            source: source,
+                            dest: dest,
+                            mode: mode,
+                            renameOnImport: renameOnImport,
+                            renameTemplate: renameTemplate,
+                            eventName: eventName,
+                            importDate: importDate,
+                            supportedExtensions: supportedExtensions,
+                            engine: engine,
+                            reservationCoordinator: reservationCoordinator
+                        )
+                    }
+                }
+
+                var finished: [MultiImportOutcome] = []
+                for await outcome in group {
+                    finished.append(outcome)
+                }
+                return finished
+            }
+
+            activeImportEngines.removeAll()
+            volumeWatcher?.refreshMountedVolumes()
+
+            let successful = outcomes.filter { $0.errorMessage == nil }
+            let failed = outcomes.filter { $0.errorMessage != nil }
+            let importedOutcomes = successful.filter { !$0.result.importedFiles.isEmpty }
+            let skippedFiles = successful.reduce(0) { $0 + $1.result.skippedFiles }
+
+            if !failed.isEmpty {
+                let message = failed.map { "\($0.source.name): \($0.errorMessage ?? "unknown error")" }.joined(separator: " · ")
+                appState.importProgress.failureMessage = message
+                appState.importProgress.statusMessage = "Some card imports failed: \(message)"
+                appState.log("Parallel import failures: \(message)", level: .error)
+            }
+
+            if importedOutcomes.isEmpty {
+                if skippedFiles > 0 {
+                    appState.sourceFileCountForDestinationCheck = skippedFiles
+                    appState.allDestinationFilesAlreadyImported = true
+                    appState.sourceFilesImportStatusMessage = "All \(skippedFiles) files are already imported"
+                }
+                try? await Task.sleep(for: .seconds(1))
+                showProgressOverlay = false
+                appState.importState = failed.isEmpty ? .idle : .error(appState.importProgress.failureMessage ?? "Import failed")
+                try? await Task.sleep(for: .seconds(2))
+                appState.importState = .idle
+                appState.importJobs = []
+                return
+            }
+
+            if skippedFiles > 0 {
+                appState.sourceFileCountForDestinationCheck = skippedFiles
+                appState.allDestinationFilesAlreadyImported = false
+                appState.sourceFilesImportStatusMessage = "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s")"
+            }
+
+            appState.importState = .generatingStats
+            appState.log("Generating stats for \(importedOutcomes.count) card import\(importedOutcomes.count == 1 ? "" : "s")...")
+
+            var combinedSessionStats: StatsReport?
+            var combinedImportedFiles: [String] = []
+            var combinedBytes: Int64 = 0
+            let startedAt = startDate
+
+            for outcome in importedOutcomes {
+                await statsRunner?.runStats(
+                    importedFiles: outcome.result.importedFiles,
+                    destinationPath: outcome.result.destinationPath,
+                    duration: outcome.result.duration
+                )
+
+                guard let lastStats = appState.statsReport else { continue }
+                combinedSessionStats = StatsReport.combine(combinedSessionStats, lastStats)
+                combinedImportedFiles.append(contentsOf: outcome.result.importedFiles)
+                combinedBytes += lastStats.totalBytes
+
+                appState.totalStatsReport = StatsReport.combine(appState.totalStatsReport, lastStats)
+                appState.log("Total stats updated: \(appState.totalStatsReport?.totalFilesAnalyzed ?? 0) files total")
+
+                let historyEntry = ImportHistoryEntry(
+                    sourceName: outcome.source.name,
+                    destinationPath: outcome.result.destinationPath,
+                    fileCount: outcome.result.importedFiles.count,
+                    totalBytes: lastStats.totalBytes
+                )
+                ImportHistoryStorage.add(historyEntry)
+                appState.importHistory = ImportHistoryStorage.load()
+                appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: outcome.result.destinationPath)
+                appState.recordTelegramDailyImport(
+                    sourceName: outcome.source.name,
+                    destinationPath: outcome.result.destinationPath,
+                    fileCount: outcome.result.importedFiles.count,
+                    totalBytes: lastStats.totalBytes,
+                    duration: outcome.result.duration,
+                    report: lastStats
+                )
+            }
+
+            if let combinedSessionStats {
+                appState.statsReport = combinedSessionStats
+            }
+
+            let duration = Date().timeIntervalSince(startedAt)
+            let averageSpeed = duration > 0 ? Double(combinedBytes) / duration : 0
+            appState.lastImportReport = ImportReport(
+                sourceVolumeName: sources.map(\.name).joined(separator: " + "),
+                sourcePath: sources.map { $0.path.path }.joined(separator: "\n"),
+                destinationPath: dest.path,
+                fileCount: combinedImportedFiles.count,
+                totalBytes: combinedBytes,
+                duration: duration,
+                averageSpeed: averageSpeed,
+                importedFiles: combinedImportedFiles
+            )
+            appState.log("Parallel import complete: \(combinedImportedFiles.count) files from \(sources.count) cards")
+            Task { await attemptTelegramDailySummarySend() }
+
+            try? await Task.sleep(for: .seconds(1))
+            showProgressOverlay = false
+            selectedNavItem = .statistics
+            appState.importJobs = []
+
+            try? await Task.sleep(for: .seconds(1))
+            appState.importState = .idle
+        }
+    }
+
+    private func runMultiImportJob(
+        source: VolumeInfo,
+        dest: URL,
+        mode: ImportEngine.Mode,
+        renameOnImport: Bool,
+        renameTemplate: String,
+        eventName: String,
+        importDate: Date,
+        supportedExtensions: Set<String>,
+        engine: ImportEngine,
+        reservationCoordinator: DestinationReservationCoordinator
+    ) async -> MultiImportOutcome {
+        do {
+            let sourceAccessing = source.path.startAccessingSecurityScopedResource()
+            defer { if sourceAccessing { source.path.stopAccessingSecurityScopedResource() } }
+
+            let files = VolumeWatcher.listRawFiles(at: source.path, extensions: supportedExtensions)
+                .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+
+            guard !files.isEmpty else {
+                await MainActor.run {
+                    updateMultiImportJob(sourceID: source.id, state: .done, progress: ImportProgress(totalFiles: 0, completedFiles: 0, currentFileName: "No RAW files", startTime: Date()))
+                    appState.log("No RAW files found on \(source.name)", level: .warning)
+                }
+                return MultiImportOutcome(source: source, result: .empty, errorMessage: nil)
+            }
+
+            await MainActor.run {
+                updateMultiImportJob(sourceID: source.id, state: .importing, progress: ImportProgress(totalFiles: files.count, startTime: Date()))
+                appState.importState = .importing
+                appState.log("\(source.name): found \(files.count) RAW files to import")
+            }
+
+            let destAccessing = BookmarkManager.startAccessing(dest)
+            defer { if destAccessing { BookmarkManager.stopAccessing(dest) } }
+
+            let captureDates = renameOnImport && RenameTemplateRenderer.usesDateTokens(renameTemplate)
+                ? await RenameCaptureDateReader.captureDates(for: files)
+                : [:]
+            let renameOptions = renameOnImport
+                ? ImportRenameOptions(
+                    template: renameTemplate,
+                    eventName: eventName,
+                    importDate: importDate,
+                    totalCount: files.count,
+                    captureDatesByPath: captureDates
+                )
+                : nil
+
+            let result = try await engine.importFiles(
+                from: files,
+                to: dest,
+                mode: mode,
+                renameOptions: renameOptions,
+                reservationCoordinator: reservationCoordinator
+            ) { progress in
+                Task { @MainActor in
+                    var jobProgress = ImportProgress(
+                        totalFiles: progress.totalFiles,
+                        completedFiles: progress.completedFiles,
+                        totalBytes: progress.totalBytes,
+                        transferredBytes: progress.transferredBytes,
+                        currentFileName: progress.currentFileName,
+                        startTime: Date(),
+                        bytesPerSecond: progress.bytesPerSecond,
+                        skippedFiles: progress.skippedFiles,
+                        statusMessage: progress.statusMessage
+                    )
+                    if let existing = appState.importJobs.first(where: { $0.id == source.id })?.progress.startTime {
+                        jobProgress.startTime = existing
+                    }
+                    updateMultiImportJob(sourceID: source.id, state: .importing, progress: jobProgress)
+                }
+            }
+
+            await MainActor.run {
+                updateMultiImportJob(sourceID: source.id, state: .done, progress: completedProgress(for: source.id, result: result))
+                appState.log("\(source.name): import complete (\(result.importedFiles.count) files, \(result.skippedFiles) skipped)")
+            }
+
+            if !result.importedFiles.isEmpty, appState.autoEject {
+                await MainActor.run {
+                    updateMultiImportJobState(sourceID: source.id, state: .ejecting)
+                    appState.log("\(source.name): ejecting card...")
+                }
+                await Task.detached { sync() }.value
+                try? await Task.sleep(for: .seconds(3))
+                let ejected = await VolumeEjector.eject(volumeURL: source.path)
+                await MainActor.run {
+                    updateMultiImportJobState(sourceID: source.id, state: .ejectingDone)
+                    appState.log(ejected ? "\(source.name): ejecting card... Done" : "⚠ Failed to eject \(source.name). You may need to eject manually.", level: ejected ? .info : .warning)
+                }
+            }
+
+            return MultiImportOutcome(source: source, result: result, errorMessage: nil)
+        } catch ImportError.cancelled {
+            await MainActor.run {
+                updateMultiImportJobState(sourceID: source.id, state: .idle)
+                appState.log("\(source.name): import cancelled", level: .warning)
+            }
+            return MultiImportOutcome(source: source, result: .empty, errorMessage: nil)
+        } catch {
+            await MainActor.run {
+                var progress = appState.importJobs.first(where: { $0.id == source.id })?.progress ?? ImportProgress()
+                progress.failureMessage = error.localizedDescription
+                progress.statusMessage = "Import failed: \(error.localizedDescription)"
+                updateMultiImportJob(sourceID: source.id, state: .error(error.localizedDescription), progress: progress)
+                appState.log("\(source.name): import failed: \(error.localizedDescription)", level: .error)
+            }
+            return MultiImportOutcome(source: source, result: .empty, errorMessage: error.localizedDescription)
+        }
+    }
+
+    @MainActor
+    private func updateMultiImportJob(sourceID: String, state: ImportState, progress: ImportProgress) {
+        guard let index = appState.importJobs.firstIndex(where: { $0.id == sourceID }) else { return }
+        appState.importJobs[index].state = state
+        appState.importJobs[index].progress = progress
+        updateAggregateImportProgress()
+    }
+
+    @MainActor
+    private func updateMultiImportJobState(sourceID: String, state: ImportState) {
+        guard let index = appState.importJobs.firstIndex(where: { $0.id == sourceID }) else { return }
+        appState.importJobs[index].state = state
+        updateAggregateImportProgress()
+    }
+
+    @MainActor
+    private func completedProgress(for sourceID: String, result: ImportResult) -> ImportProgress {
+        var progress = appState.importJobs.first(where: { $0.id == sourceID })?.progress ?? ImportProgress()
+        progress.completedFiles = result.fileCount
+        progress.totalFiles = max(progress.totalFiles, result.fileCount)
+        progress.transferredBytes = result.totalBytes
+        progress.totalBytes = max(progress.totalBytes, result.totalBytes)
+        progress.bytesPerSecond = result.averageSpeed
+        progress.currentFileName = result.importedFiles.isEmpty ? "No new files" : "Done"
+        progress.skippedFiles = result.skippedFiles
+        if result.skippedFiles > 0 {
+            progress.statusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+        }
+        return progress
+    }
+
+    @MainActor
+    private func updateAggregateImportProgress() {
+        guard !appState.importJobs.isEmpty else { return }
+        let jobs = appState.importJobs
+        let startTime = appState.importProgress.startTime ?? jobs.compactMap { $0.progress.startTime }.min()
+        let totalFiles = jobs.reduce(0) { $0 + $1.progress.totalFiles }
+        let completedFiles = jobs.reduce(0) { $0 + $1.progress.completedFiles }
+        let totalBytes = jobs.reduce(Int64(0)) { $0 + $1.progress.totalBytes }
+        let transferredBytes = jobs.reduce(Int64(0)) { $0 + $1.progress.transferredBytes }
+        let speed = jobs.reduce(0.0) { $0 + $1.progress.bytesPerSecond }
+        let skipped = jobs.reduce(0) { $0 + $1.progress.skippedFiles }
+        let activeNames = jobs
+            .filter { if case .importing = $0.state { return true }; return false }
+            .map(\.sourceName)
+        appState.importProgress = ImportProgress(
+            totalFiles: totalFiles,
+            completedFiles: completedFiles,
+            totalBytes: totalBytes,
+            transferredBytes: transferredBytes,
+            currentFileName: activeNames.isEmpty ? "Parallel import" : activeNames.joined(separator: " + "),
+            startTime: startTime,
+            bytesPerSecond: speed,
+            skippedFiles: skipped,
+            statusMessage: skipped > 0 ? "Skipped \(skipped) duplicate file\(skipped == 1 ? "" : "s")" : nil,
+            failureMessage: appState.importProgress.failureMessage
+        )
+    }
+
     private func pauseImport() {
         Task {
-            await importEngine.pause()
+            if activeImportEngines.isEmpty {
+                await importEngine.pause()
+            } else {
+                for engine in activeImportEngines.values {
+                    await engine.pause()
+                }
+            }
             appState.importState = .paused
             appState.log("Import paused")
         }
@@ -450,7 +879,13 @@ struct ContentView: View {
 
     private func resumeImport() {
         Task {
-            await importEngine.resume()
+            if activeImportEngines.isEmpty {
+                await importEngine.resume()
+            } else {
+                for engine in activeImportEngines.values {
+                    await engine.resume()
+                }
+            }
             appState.importState = .importing
             appState.log("Import resumed")
         }
@@ -458,8 +893,22 @@ struct ContentView: View {
 
     private func cancelImport() {
         Task {
-            await importEngine.cancel()
+            if activeImportEngines.isEmpty {
+                await importEngine.cancel()
+            } else {
+                for engine in activeImportEngines.values {
+                    await engine.cancel()
+                }
+            }
+            activeImportEngines.removeAll()
+            appState.importJobs = []
             appState.log("Import cancel requested")
         }
     }
+}
+
+private struct MultiImportOutcome: Sendable {
+    let source: VolumeInfo
+    let result: ImportResult
+    let errorMessage: String?
 }

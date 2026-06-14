@@ -21,6 +21,7 @@ struct AdvancedView: View {
     @State private var showNoDestinationAlert = false
     @State private var importEngine = ImportEngine()
     @State private var gridWidth: CGFloat = 0
+    @State private var selectedSourceID: String?
     @State private var loadFilesTask: Task<Void, Never>?
     @State private var thumbnailTasks: [URL: Task<Void, Never>] = [:]
     @State private var previewTask: Task<Void, Never>?
@@ -67,7 +68,7 @@ struct AdvancedView: View {
 
     private var showImportOverlay: Bool {
         switch appState.importState {
-        case .importing, .paused, .scanning, .verifying, .ejecting, .ejectingDone, .generatingStats:
+        case .importing, .paused, .scanning, .verifying, .ejecting, .ejectingDone, .generatingStats, .error:
             return true
         default:
             return false
@@ -158,6 +159,12 @@ struct AdvancedView: View {
 
                 if !files.isEmpty {
                     HStack(spacing: 8) {
+                        if sourceVolumes.count > 1 {
+                            sourceButton(title: "All Cards", sourceID: nil)
+                            ForEach(sourceVolumes) { volume in
+                                sourceButton(title: volume.name, sourceID: volume.id)
+                            }
+                        }
                         filterButton(.all)
                         filterButton(.rated)
                         filterButton(.unrated)
@@ -195,12 +202,12 @@ struct AdvancedView: View {
 
     private var headerSubtitle: String {
         if isLoadingFiles { return "Scanning source files…" }
-        guard let volume = appState.activeVolume else { return "No card detected" }
+        guard !sourceVolumes.isEmpty else { return "No card detected" }
         let selected = selectedFilesInView.count
         if selected > 0 {
-            return "\(AuroraFormat.count(selected)) selected from \(AuroraFormat.count(displayedFiles.count)) shown · \(volume.name)"
+            return "\(AuroraFormat.count(selected)) selected from \(AuroraFormat.count(displayedFiles.count)) shown · \(sourceSelectionTitle)"
         }
-        return "\(AuroraFormat.count(displayedFiles.count)) files shown · \(AuroraFormat.count(files.count)) RAW files on \(volume.name)"
+        return "\(AuroraFormat.count(displayedFiles.count)) files shown · \(AuroraFormat.count(files.count)) RAW files · \(sourceSelectionTitle)"
     }
 
     private var destinationLabel: String {
@@ -217,6 +224,16 @@ struct AdvancedView: View {
             Text(filterTitle(filter))
         }
         .buttonStyle(AuroraGhostButtonStyle(active: ratingFilter == filter))
+    }
+
+    private func sourceButton(title: String, sourceID: String?) -> some View {
+        Button {
+            selectedSourceID = sourceID
+            loadFiles()
+        } label: {
+            Text(title)
+        }
+        .buttonStyle(AuroraGhostButtonStyle(active: selectedSourceID == sourceID))
     }
 
     private func filterTitle(_ filter: RatingFilter) -> String {
@@ -247,7 +264,7 @@ struct AdvancedView: View {
                 Text(files.isEmpty ? "No RAW files found" : "No files match this filter")
                     .font(.sora(18, weight: .bold))
                     .foregroundStyle(Color.auroraTxt)
-                Text(files.isEmpty ? "Advanced appears only when the active card has source files." : "Change the filter or rate more photos.")
+                Text(files.isEmpty ? "Choose a card with RAW files, or select All Cards." : "Change the filter or rate more photos.")
                     .font(.manrope(12, weight: .semibold))
                     .foregroundStyle(Color.auroraMuted)
             }
@@ -407,17 +424,21 @@ struct AdvancedView: View {
     }
 
     private func loadFiles() {
-        guard let volume = appState.activeVolume, volume.rawFileCount > 0 else {
+        let volumes = selectedSourceVolumes
+        guard !volumes.isEmpty else {
             files = []
             return
         }
         loadFilesTask?.cancel()
+        clearLoadedGalleryState()
         isLoadingFiles = true
-        let path = volume.path
+        let paths = volumes.map(\.path)
         let extensions = appState.supportedExtensions
         loadFilesTask = Task {
             let sourceFiles = await Task.detached(priority: .userInitiated) {
-                VolumeWatcher.listRawFiles(at: path, extensions: extensions)
+                paths.flatMap { path in
+                    VolumeWatcher.listRawFiles(at: path, extensions: extensions)
+                }
                     .sorted { $0.lastPathComponent < $1.lastPathComponent }
             }.value
             guard !Task.isCancelled else { return }
@@ -433,6 +454,20 @@ struct AdvancedView: View {
                 prefetchInitialThumbnails()
             }
         }
+    }
+
+    private func clearLoadedGalleryState() {
+        previewTask?.cancel()
+        previewTask = nil
+        for task in thumbnailTasks.values { task.cancel() }
+        thumbnailTasks.removeAll()
+        thumbnailStates = [:]
+        previewImage = nil
+        isLoadingPreview = false
+        selectedFile = nil
+        selectedFiles = []
+        lastSelectedIndex = nil
+        selectionAnchorIndex = nil
     }
 
     private func closeAdvanced() {
@@ -652,26 +687,47 @@ struct AdvancedView: View {
     }
 
     private func importSelectedFiles() {
-        guard let source = appState.activeVolume,
-              let destination = appState.destinationURL else { return }
+        guard let destination = appState.destinationURL else { return }
         let filesToImport = selectedFilesInView
         guard !filesToImport.isEmpty else { return }
+        let importSources = sources(containing: filesToImport)
+        guard !importSources.isEmpty else { return }
+        let sourceName = importSources.map(\.name).joined(separator: " + ")
+        let sourcePath = importSources.map { $0.path.path }.joined(separator: "\n")
 
         Task {
-            let sourceAccessing = source.path.startAccessingSecurityScopedResource()
-            defer { if sourceAccessing { source.path.stopAccessingSecurityScopedResource() } }
+            let sourceAccesses = importSources.map { ($0.path, $0.path.startAccessingSecurityScopedResource()) }
+            defer {
+                for (url, isAccessing) in sourceAccesses where isAccessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
             let destinationAccessing = BookmarkManager.startAccessing(destination)
             defer { if destinationAccessing { BookmarkManager.stopAccessing(destination) } }
 
             await MainActor.run {
                 appState.importState = .importing
                 appState.importProgress = ImportProgress(totalFiles: filesToImport.count, startTime: Date())
-                appState.log("Advanced import: \(filesToImport.count) selected files to \(destination.path)")
+                appState.log("Advanced import: \(filesToImport.count) selected files from \(sourceName) to \(destination.path)")
             }
 
             do {
                 let mode: ImportEngine.Mode = appState.importMode == .copy ? .copy : .move
-                let result = try await importEngine.importFiles(from: filesToImport, to: destination, mode: mode) { progress in
+                let orderedFiles = filesToImport.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+                let importDate = Date()
+                let captureDates = appState.renameOnImport && RenameTemplateRenderer.usesDateTokens(appState.renameTemplate)
+                    ? await RenameCaptureDateReader.captureDates(for: orderedFiles)
+                    : [:]
+                let renameOptions = appState.renameOnImport
+                    ? ImportRenameOptions(
+                        template: appState.renameTemplate,
+                        eventName: appState.renameEventName(forDestinationPath: destination.path),
+                        importDate: importDate,
+                        totalCount: orderedFiles.count,
+                        captureDatesByPath: captureDates
+                    )
+                    : nil
+                let result = try await importEngine.importFiles(from: orderedFiles, to: destination, mode: mode, renameOptions: renameOptions) { progress in
                     Task { @MainActor in
                         appState.importProgress.completedFiles = progress.completedFiles
                         appState.importProgress.totalFiles = progress.totalFiles
@@ -679,14 +735,16 @@ struct AdvancedView: View {
                         appState.importProgress.totalBytes = progress.totalBytes
                         appState.importProgress.currentFileName = progress.currentFileName
                         appState.importProgress.bytesPerSecond = progress.bytesPerSecond
+                        appState.importProgress.skippedFiles = progress.skippedFiles
+                        appState.importProgress.statusMessage = progress.statusMessage
                     }
                 }
 
                 await MainActor.run {
                     appState.importState = .generatingStats
                     appState.lastImportReport = ImportReport(
-                        sourceVolumeName: source.name,
-                        sourcePath: source.path.path,
+                        sourceVolumeName: sourceName,
+                        sourcePath: sourcePath,
                         destinationPath: result.destinationPath,
                         fileCount: result.fileCount,
                         totalBytes: result.totalBytes,
@@ -695,7 +753,24 @@ struct AdvancedView: View {
                         importedFiles: result.importedFiles
                     )
                     appState.log("Advanced import complete: \(result.fileCount) files")
+                    if result.skippedFiles > 0 {
+                        appState.log("Advanced import skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s") already present in destination")
+                    }
+                    if result.importedFiles.isEmpty {
+                        if result.skippedFiles > 0 {
+                            appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                            appState.allDestinationFilesAlreadyImported = true
+                            appState.sourceFilesImportStatusMessage = "All \(result.skippedFiles) files are already imported"
+                        }
+                        appState.importState = .idle
+                    } else if result.skippedFiles > 0 {
+                        appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                        appState.allDestinationFilesAlreadyImported = false
+                        appState.sourceFilesImportStatusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+                    }
                 }
+
+                guard !result.importedFiles.isEmpty else { return }
 
                 let runner = StatsRunner(appState: appState)
                 await runner.runStats(importedFiles: result.importedFiles, destinationPath: result.destinationPath, duration: result.duration)
@@ -704,7 +779,7 @@ struct AdvancedView: View {
                     if let lastStats = appState.statsReport {
                         appState.totalStatsReport = StatsReport.combine(appState.totalStatsReport, lastStats)
                         ImportHistoryStorage.add(ImportHistoryEntry(
-                            sourceName: source.name,
+                            sourceName: sourceName,
                             destinationPath: result.destinationPath,
                             fileCount: result.importedFiles.count,
                             totalBytes: lastStats.totalBytes
@@ -712,7 +787,7 @@ struct AdvancedView: View {
                         appState.importHistory = ImportHistoryStorage.load()
                         appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: result.destinationPath)
                         appState.recordTelegramDailyImport(
-                            sourceName: source.name,
+                            sourceName: sourceName,
                             destinationPath: result.destinationPath,
                             fileCount: result.importedFiles.count,
                             totalBytes: lastStats.totalBytes,
@@ -720,7 +795,6 @@ struct AdvancedView: View {
                             report: lastStats
                         )
                     }
-                    appState.requestLightroomSync(forImportFolder: result.destinationPath)
                     selectedFiles.subtract(filesToImport)
                     files.removeAll { filesToImport.contains($0) }
                     appState.updateSourceFiles(files)
@@ -733,6 +807,8 @@ struct AdvancedView: View {
                 }
             } catch {
                 await MainActor.run {
+                    appState.importProgress.failureMessage = error.localizedDescription
+                    appState.importProgress.statusMessage = "Import failed: \(error.localizedDescription)"
                     appState.importState = .error(error.localizedDescription)
                     appState.log("Advanced import failed: \(error.localizedDescription)", level: .error)
                 }
@@ -758,6 +834,51 @@ struct AdvancedView: View {
         Task {
             await importEngine.cancel()
         }
+    }
+
+    private var sourceVolumes: [VolumeInfo] {
+        let volumes = appState.mountedVolumes.filter { $0.rawFileCount > 0 && !isDestinationVolume($0.path) }
+        guard !volumes.isEmpty else {
+            if let active = appState.activeVolume, active.rawFileCount > 0, !isDestinationVolume(active.path) { return [active] }
+            return []
+        }
+        return Array(volumes.prefix(2))
+    }
+
+    private var selectedSourceVolumes: [VolumeInfo] {
+        guard let selectedSourceID else { return sourceVolumes }
+        let selected = sourceVolumes.filter { $0.id == selectedSourceID }
+        return selected.isEmpty ? sourceVolumes : selected
+    }
+
+    private var sourceSelectionTitle: String {
+        guard selectedSourceID != nil else {
+            return sourceVolumes.count > 1 ? "All Cards" : (sourceVolumes.first?.name ?? "No card")
+        }
+        return selectedSourceVolumes.first?.name ?? "All Cards"
+    }
+
+    private func sources(containing files: [URL]) -> [VolumeInfo] {
+        sourceVolumes.filter { volume in
+            files.contains { file in isFile(file, under: volume.path) }
+        }
+    }
+
+    private func isDestinationVolume(_ sourceURL: URL) -> Bool {
+        guard let destinationURL = appState.destinationURL else { return false }
+        let sourcePath = normalizedPath(sourceURL.path)
+        let destinationPath = normalizedPath(destinationURL.path)
+        return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
+    }
+
+    private func isFile(_ file: URL, under folder: URL) -> Bool {
+        let filePath = normalizedPath(file.path)
+        let folderPath = normalizedPath(folder.path)
+        return filePath == folderPath || filePath.hasPrefix(folderPath + "/")
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     private func extractJPEG(from file: URL, tag: String) async -> Data? {

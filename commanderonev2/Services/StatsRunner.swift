@@ -349,26 +349,22 @@ final class StatsRunner {
         // Helper: returns true for "---", "----", etc. (Sony no-lens accidental shots)
         let isNoLens: (String) -> Bool = { model in
             let trimmed = model.trimmingCharacters(in: .whitespaces)
-            return !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" }
+            let lower = trimmed.lowercased()
+            return (!trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" }) || lower.contains("no lens")
         }
 
         for entry in entries {
             let make = entry["Make"] as? String ?? ""
+            let lensModel = entry["LensModel"] as? String
+            let lensID = entry["LensID"] as? String
+            let hasNoLens = [lensModel, lensID].compactMap { $0 }.contains(where: isNoLens)
 
-            // Skip photos taken without a lens entirely (Sony --- accidental shots)
-            // These have LensModel consisting entirely of dashes
-            if let lens = entry["LensModel"] as? String, isNoLens(lens) {
-                continue
-            }
-            if let lensID = entry["LensID"] as? String, isNoLens(lensID) {
-                continue
-            }
-
-            // Store lens with make|model format
-            if let lens = entry["LensModel"] as? String, !lens.isEmpty, lens != "Unknown" {
+            // Store lens with make|model format. No-lens shots still carry useful
+            // camera, ISO, shutter and date data, so only exclude them from lens stats.
+            if let lens = lensModel, !hasNoLens, !lens.isEmpty, lens != "Unknown" {
                 let key = "\(make)|\(lens)"
                 lensCounts[key, default: 0] += 1
-            } else if let lensID = entry["LensID"] as? String, !lensID.isEmpty, lensID != "Unknown" {
+            } else if let lensID, !hasNoLens, !lensID.isEmpty, lensID != "Unknown" {
                 let key = "\(make)|\(lensID)"
                 lensCounts[key, default: 0] += 1
             }
@@ -691,11 +687,42 @@ final class StatsRunner {
 
     private nonisolated static func runMdlsStats(files: [String]) -> StatsReport {
         var cameraCounts: [String: Int] = [:]
+        var shutterCounts: [Double: Int] = [:]
+        var isoCounts: [String: Int] = [:]
+        var apertureCounts: [String: Int] = [:]
+        var focalCounts: [String: Int] = [:]
+        var orientationCounts: [String: Int] = [:]
+        var isoSum = 0.0
+        var isoCount = 0
+        var maxISO: Double?
+        var minISO: Double?
+        var apertureSum = 0.0
+        var apertureCount = 0
+        var maxAperture: Double?
+        var minAperture: Double?
+        var focalSum = 0.0
+        var focalCount = 0
+        var maxFocalLength: Double?
+        var minFocalLength: Double?
+        var maxShutterSpeed: Double?
+        var minShutterSpeed: Double?
+        var analyzedCount = 0
 
         for file in files.prefix(200) {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/mdls")
-            process.arguments = ["-name", "kMDItemAcquisitionMake", "-name", "kMDItemAcquisitionModel", file]
+            process.arguments = [
+                "-name", "kMDItemAcquisitionMake",
+                "-name", "kMDItemAcquisitionModel",
+                "-name", "kMDItemISOSpeed",
+                "-name", "kMDItemExposureTimeSeconds",
+                "-name", "kMDItemFNumber",
+                "-name", "kMDItemFocalLength",
+                "-name", "kMDItemPixelWidth",
+                "-name", "kMDItemPixelHeight",
+                "-name", "kMDItemOrientation",
+                file
+            ]
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = Pipe()
@@ -708,6 +735,7 @@ final class StatsRunner {
 
                 var make = ""
                 var model = ""
+                var entry: [String: Any] = [:]
                 for line in output.components(separatedBy: "\n") {
                     if line.contains("kMDItemAcquisitionMake") {
                         make = extractMdlsValue(line)
@@ -715,10 +743,50 @@ final class StatsRunner {
                     if line.contains("kMDItemAcquisitionModel") {
                         model = extractMdlsValue(line)
                     }
+                    if let key = mdlsKey(from: line) {
+                        entry[key] = extractMdlsValue(line)
+                    }
                 }
+
+                analyzedCount += 1
 
                 if !model.isEmpty {
                     cameraCounts["\(make)|\(model)", default: 0] += 1
+                }
+
+                if let iso = parseMdlsDouble(entry["kMDItemISOSpeed"]), iso > 0 {
+                    isoSum += iso
+                    isoCount += 1
+                    isoCounts[String(Int(iso.rounded())), default: 0] += 1
+                    maxISO = max(maxISO ?? iso, iso)
+                    minISO = min(minISO ?? iso, iso)
+                }
+
+                if let shutter = parseMdlsDouble(entry["kMDItemExposureTimeSeconds"]), shutter > 0 {
+                    let rounded = (shutter * 10000).rounded() / 10000
+                    shutterCounts[rounded, default: 0] += 1
+                    maxShutterSpeed = max(maxShutterSpeed ?? shutter, shutter)
+                    minShutterSpeed = min(minShutterSpeed ?? shutter, shutter)
+                }
+
+                if let aperture = parseMdlsDouble(entry["kMDItemFNumber"]), aperture > 0 {
+                    apertureSum += aperture
+                    apertureCount += 1
+                    apertureCounts[Self.histogramKey(aperture, decimals: 1), default: 0] += 1
+                    maxAperture = max(maxAperture ?? aperture, aperture)
+                    minAperture = min(minAperture ?? aperture, aperture)
+                }
+
+                if let focal = parseMdlsDouble(entry["kMDItemFocalLength"]), focal > 0 {
+                    focalSum += focal
+                    focalCount += 1
+                    focalCounts[String(Int(focal.rounded())), default: 0] += 1
+                    maxFocalLength = max(maxFocalLength ?? focal, focal)
+                    minFocalLength = min(minFocalLength ?? focal, focal)
+                }
+
+                if let orientation = mdlsImageOrientation(from: entry) {
+                    orientationCounts[orientation, default: 0] += 1
                 }
             } catch {
                 continue
@@ -738,28 +806,78 @@ final class StatsRunner {
             cameraStat = nil
         }
 
+        let sortedShutters = shutterCounts.sorted { $0.value > $1.value }
+        let topShutters = sortedShutters.prefix(5).map { pair in
+            StatsReport.ShutterStat(rawValue: pair.key, count: pair.value)
+        }
+
+        let avgISO = isoCount > 0 ? isoSum / Double(isoCount) : nil
+        let avgAperture = apertureCount > 0 ? apertureSum / Double(apertureCount) : nil
+        let avgFocalLength = focalCount > 0 ? focalSum / Double(focalCount) : nil
+
         return StatsReport(
             topLenses: [],
             mostUsedCamera: cameraStat,
-            shutterSpeeds: [],
-            totalFilesAnalyzed: files.count,
+            shutterSpeeds: topShutters,
+            totalFilesAnalyzed: analyzedCount,
             rawOutput: "(mdls fallback - limited data)",
-            avgISO: nil,
-            avgAperture: nil,
-            avgFocalLength: nil,
+            avgISO: avgISO,
+            maxISO: maxISO,
+            minISO: minISO,
+            avgAperture: avgAperture,
+            maxAperture: maxAperture,
+            minAperture: minAperture,
+            avgFocalLength: avgFocalLength,
+            maxFocalLength: maxFocalLength,
+            minFocalLength: minFocalLength,
             lensCounts: [:],
             cameraCounts: cameraCounts,
-            shutterCounts: [:],
-            isoSum: 0,
-            isoCount: 0,
-            apertureSum: 0,
-            apertureCount: 0,
-            focalSum: 0,
-            focalCount: 0,
+            shutterCounts: shutterCounts,
+            isoCounts: isoCounts,
+            apertureCounts: apertureCounts,
+            focalCounts: focalCounts,
+            orientationCounts: orientationCounts,
+            maxShutterSpeed: maxShutterSpeed,
+            minShutterSpeed: minShutterSpeed,
+            isoSum: isoSum,
+            isoCount: isoCount,
+            apertureSum: apertureSum,
+            apertureCount: apertureCount,
+            focalSum: focalSum,
+            focalCount: focalCount,
             monthCounts: [:],
             weekCounts: [:],
             yearCounts: [:]
         )
+    }
+
+    private nonisolated static func mdlsKey(from line: String) -> String? {
+        let parts = line.split(separator: "=", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        return parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static func parseMdlsDouble(_ value: Any?) -> Double? {
+        guard let value = value as? String else { return nil }
+        let cleaned = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\"", with: "")
+        guard cleaned != "(null)", cleaned != "null" else { return nil }
+        if let direct = Double(cleaned) { return direct }
+        return parseFraction(cleaned)
+    }
+
+    private nonisolated static func mdlsImageOrientation(from entry: [String: Any]) -> String? {
+        guard let width = parseMdlsDouble(entry["kMDItemPixelWidth"]),
+              let height = parseMdlsDouble(entry["kMDItemPixelHeight"]),
+              width > 0,
+              height > 0 else { return nil }
+        let rotated = orientationRotatesDimensions(entry["kMDItemOrientation"])
+        let effectiveWidth = rotated ? height : width
+        let effectiveHeight = rotated ? width : height
+        if effectiveHeight > effectiveWidth { return "portrait" }
+        if effectiveWidth > effectiveHeight { return "landscape" }
+        return "square"
     }
 
     private nonisolated static func extractMdlsValue(_ line: String) -> String {
