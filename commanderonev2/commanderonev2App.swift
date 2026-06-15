@@ -3,11 +3,9 @@ import SwiftUI
 @main
 struct commanderonev2App: App {
     @State private var appState = AppState()
+    @State private var showLicenseOverlay = !LicensingService.isActivated()
 
     #if canImport(Sparkle)
-    // Initialised in both Beta and Production, but `SparkleUpdater.init()` only
-    // *starts* the updater for Production. On Beta the menu item below is also
-    // hidden via AppPaths.isBeta.
     @StateObject private var updater = SparkleUpdater()
     #endif
 
@@ -17,11 +15,16 @@ struct commanderonev2App: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(appState: appState)
+            ContentView(appState: appState, showLicenseOverlay: $showLicenseOverlay)
                 .frame(minWidth: 1280, minHeight: 800)
                 #if canImport(Sparkle)
                 .environmentObject(updater)
                 #endif
+                .overlay {
+                    if showLicenseOverlay {
+                        LicenseEntryView(isPresented: $showLicenseOverlay)
+                    }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)

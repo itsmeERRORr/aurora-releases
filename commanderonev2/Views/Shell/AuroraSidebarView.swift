@@ -125,12 +125,16 @@ struct AuroraSidebarView: View {
     @ViewBuilder
     private var eventsList: some View {
         if appState.eventSidebarNodes.isEmpty {
-            Text("No events yet")
-                .font(.manrope(12.5, weight: .medium))
-                .foregroundStyle(Color.auroraFaint)
-                .italic()
-                .padding(.horizontal, 18)
-                .padding(.vertical, 8)
+            VStack {
+                Spacer().frame(height: 60)
+                Text("No events yet")
+                    .font(.manrope(12.5, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+                    .italic()
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 18)
         } else {
             ScrollView {
                 VStack(spacing: 2) {

@@ -3,6 +3,39 @@
   <channel>
     <title>Aurora</title>
     <item>
+      <title>Version 1.1.3</title>
+      <pubDate>Mon, 15 Jun 2026 13:12:27 +0000</pubDate>
+      <enclosure
+        url="https://github.com/itsmeERRORr/aurora-releases/releases/download/v1.1.3/Aurora-1.1.3.dmg"
+        sparkle:version="6"
+        sparkle:shortVersionString="1.1.3"
+        sparkle:edSignature="RJn/ZLYADF88qyql9FZ1ROQjwczld/3mamNYCCWMJpyPu8EFTgRt/em5HWFw3uIh8nIvnTiRpyR6kf4WhzvnAg=="
+        length="7679564"
+        type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 1.1.2</title>
+      <pubDate>Mon, 15 Jun 2026 13:09:08 +0000</pubDate>
+      <enclosure
+        url="https://github.com/itsmeERRORr/aurora-releases/releases/download/v1.1.2/Aurora-1.1.2.dmg"
+        sparkle:version="5"
+        sparkle:shortVersionString="1.1.2"
+        sparkle:edSignature="AXGZ5lfbhf4gLLkA6h0hMeWDwVPsUSvxAyXS1tzTDQe6roge2jrfALcqxUrPvOystZFSueYCxTn8ArLIIk9CAQ=="
+        length="7679684"
+        type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 1.1.0</title>
+      <pubDate>Mon, 15 Jun 2026 13:03:35 +0000</pubDate>
+      <enclosure
+        url="https://github.com/itsmeERRORr/aurora-releases/releases/download/v1.1.0/Aurora-1.1.0.dmg"
+        sparkle:version="3"
+        sparkle:shortVersionString="1.1.0"
+        sparkle:edSignature="G9Q9xjD4Pje2wwkD+BowzDWx67v93/QrlyrGB1Ntes2Xl/0i1ey32T4b04p2ktu8FRxsC4zfqzIBYZBkfyAqBw=="
+        length="7674866"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.7</title>
       <pubDate>Mon, 15 Jun 2026 12:49:49 +0000</pubDate>
       <enclosure

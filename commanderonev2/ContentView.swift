@@ -3,6 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @Bindable var appState: AppState
+    @Binding var showLicenseOverlay: Bool
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var volumeWatcher: VolumeWatcher?
@@ -109,7 +110,7 @@ struct ContentView: View {
         case .storage:
             StorageView(appState: appState)
         case .settings:
-            SettingsView(appState: appState)
+            SettingsView(appState: appState, showLicenseOverlay: $showLicenseOverlay)
         case .logs:
             LogsView(appState: appState)
         case .event(let index):

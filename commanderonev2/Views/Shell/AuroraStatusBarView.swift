@@ -78,6 +78,9 @@ struct AuroraStatusBarView: View {
             Text("System healthy")
                 .font(.manrope(11.5, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"))")
+                .font(.manrope(10, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
         }
         .padding(.trailing, 18)
     }
