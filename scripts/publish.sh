@@ -32,6 +32,7 @@ set -euo pipefail
 
 # -------- Config --------------------------------------------------------------
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SPARKLE_ACCOUNT="${SPARKLE_ACCOUNT:-aurora}"
 cd "$PROJECT_DIR"
 
 PROJECT_FILE="commanderonev2.xcodeproj"
@@ -98,6 +99,17 @@ if (( USE_GITHUB == 1 )); then
         echo "  Create it (public so Sparkle can fetch the appcast):" >&2
         echo "    gh repo create $GITHUB_OWNER/$GITHUB_REPO --public --description 'Aurora updates'" >&2
         exit 1
+    fi
+    if [[ "$(gh repo view "$GITHUB_OWNER/$GITHUB_REPO" --json isEmpty --jq .isEmpty)" == "true" ]]; then
+        echo "GitHub repo '$GITHUB_OWNER/$GITHUB_REPO' is empty — creating initial README commit."
+        README_CONTENT="$(printf '# Aurora Releases\n\nPublic Sparkle appcast and DMG releases for Aurora.\n' | base64)"
+        gh api \
+            --method PUT \
+            "repos/$GITHUB_OWNER/$GITHUB_REPO/contents/README.md" \
+            -f message="Initialise releases repository" \
+            -f content="$README_CONTENT" \
+            -f branch="main" \
+            >/dev/null
     fi
 fi
 
@@ -207,7 +219,7 @@ if [[ -z "$SIGN_UPDATE" ]]; then
     exit 1
 fi
 
-SIGN_OUTPUT="$("$SIGN_UPDATE" "$DMG_PATH")"
+SIGN_OUTPUT="$("$SIGN_UPDATE" --account "$SPARKLE_ACCOUNT" "$DMG_PATH")"
 # sign_update prints e.g.: sparkle:edSignature="…" length="…"
 ED_SIG="$(echo "$SIGN_OUTPUT" | sed -nE 's/.*sparkle:edSignature="([^"]+)".*/\1/p')"
 ENCLOSURE_LEN="$(echo "$SIGN_OUTPUT" | sed -nE 's/.*length="([^"]+)".*/\1/p')"

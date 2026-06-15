@@ -16,6 +16,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SPARKLE_ACCOUNT="${SPARKLE_ACCOUNT:-aurora}"
 
 find_sparkle_tool() {
     local tool_name="$1"
@@ -38,18 +39,53 @@ if [[ -z "$GENERATE_KEYS" ]]; then
 fi
 
 echo "Using: $GENERATE_KEYS"
+echo "Account: $SPARKLE_ACCOUNT"
 echo
 
-# generate_keys prints the public key to stderr and stores the private key in
-# Keychain. -p prints the existing public key if one is already in Keychain.
-PUBLIC_KEY="$("$GENERATE_KEYS" -p 2>/dev/null || true)"
+extract_public_key() {
+    local output="$1"
+    local line candidate
+
+    while IFS= read -r line; do
+        # Sparkle versions differ slightly in wording; accept either a bare
+        # key line or a labelled "Public ... key: <base64>" line.
+        if [[ "$line" == *":"* ]]; then
+            candidate="${line##*:}"
+        else
+            candidate="$line"
+        fi
+
+        candidate="${candidate//[$' \t\r\n']/}"
+        if [[ "$candidate" =~ ^[A-Za-z0-9+/=]{40,}$ ]]; then
+            printf "%s" "$candidate"
+            return 0
+        fi
+    done <<< "$output"
+
+    return 1
+}
+
+# generate_keys stores the private key in Keychain. -p prints the existing
+# public key, but on some Sparkle versions the "no key" message is printed to
+# stdout, so validate before reusing it.
+EXISTING_OUTPUT="$("$GENERATE_KEYS" --account "$SPARKLE_ACCOUNT" -p 2>&1 || true)"
+PUBLIC_KEY="$(extract_public_key "$EXISTING_OUTPUT" || true)"
 
 if [[ -z "$PUBLIC_KEY" ]]; then
     echo "No existing key in Keychain — generating a new EdDSA key pair…"
-    "$GENERATE_KEYS"
-    PUBLIC_KEY="$("$GENERATE_KEYS" -p)"
+    "$GENERATE_KEYS" --account "$SPARKLE_ACCOUNT"
+    GENERATED_OUTPUT="$("$GENERATE_KEYS" --account "$SPARKLE_ACCOUNT" -p 2>&1 || true)"
+    PUBLIC_KEY="$(extract_public_key "$GENERATED_OUTPUT" || true)"
 else
     echo "Existing key found in Keychain. Reusing it."
+fi
+
+if [[ -z "$PUBLIC_KEY" ]]; then
+    echo "ERROR: Could not read Sparkle public key after generation." >&2
+    echo "Try running this manually to inspect the output:" >&2
+    echo "  $GENERATE_KEYS --account $SPARKLE_ACCOUNT" >&2
+    echo "  $GENERATE_KEYS --account $SPARKLE_ACCOUNT -p" >&2
+    exit 1
 fi
 
 echo

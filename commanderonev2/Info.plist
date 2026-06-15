@@ -26,9 +26,9 @@
 	  macOS Keychain on the publisher's machine.
 	-->
 	<key>SUFeedURL</key>
-	<string>https://github.com/YOUR_GITHUB_USER/aurora-releases/releases/latest/download/appcast.xml</string>
+	<string>https://github.com/itsmeERRORr/aurora-releases/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string></string>
+    <string>xH+GSsp27B0eJAl/fR4hCf3OyHk+NdhRZ7+VqkQjTbc=</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 </dict>
