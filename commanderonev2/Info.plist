@@ -10,12 +10,23 @@
 	<string>Aurora needs access to removable camera cards to detect and import RAW files.</string>
 	<!--
 	  Sparkle auto-update keys.
-	  Filled in during Phase 4 (GitHub Releases + EdDSA keys). Until then the
-	  updater stays dormant on Production (canCheckForUpdates = false) and the
-	  Beta build never starts the updater regardless.
+
+	  SUFeedURL points at GitHub Releases. The "latest/download/appcast.xml"
+	  path follows GitHub's redirect to whichever release is newest, so we
+	  never have to bake the version number into this URL — every publish
+	  uploads a fresh appcast.xml as an asset of the new release.
+
+	  Replace YOUR_GITHUB_USER below with your actual GitHub login (the same
+	  one publish.sh resolves via `gh api user --jq .login`). The repo name
+	  defaults to "aurora-releases" — override via the GITHUB_REPO env var if
+	  you use something else.
+
+	  SUPublicEDKey: paste the base64-encoded EdDSA public key printed by
+	  scripts/setup-sparkle-keys.sh. The matching private key lives in the
+	  macOS Keychain on the publisher's machine.
 	-->
 	<key>SUFeedURL</key>
-	<string></string>
+	<string>https://github.com/YOUR_GITHUB_USER/aurora-releases/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string></string>
 	<key>SUEnableAutomaticChecks</key>

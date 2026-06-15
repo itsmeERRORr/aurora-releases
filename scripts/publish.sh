@@ -8,19 +8,25 @@
 #   5. Signs the .dmg with the Sparkle EdDSA private key (stored in Keychain).
 #   6. Prepends a new <item> to releases/appcast.xml so the Production app's
 #      Sparkle updater can see the new version.
+#   7. (If `gh` CLI is installed and authenticated) creates the GitHub Release
+#      and uploads the DMG and updated appcast.xml as assets — the Production
+#      app's Sparkle picks them up automatically.
 #
 # Usage:
 #   scripts/publish.sh                  # bump patch  (e.g. 1.0.0 → 1.0.1)
 #   scripts/publish.sh --minor          # bump minor  (e.g. 1.0.4 → 1.1.0)
 #   scripts/publish.sh --major          # bump major  (e.g. 1.4.2 → 2.0.0)
+#   scripts/publish.sh --local-only     # skip GitHub upload (Phase-3 behaviour)
 #
 # Environment overrides:
-#   RELEASE_BASE_URL  — base URL the appcast points to. Defaults to
-#                       file://<project>/releases (local). Phase 4 will set
-#                       it to the GitHub Releases URL.
-#   APPCAST_TITLE     — defaults to "Aurora".
-#   PROJECT_NAME      — defaults to "Aurora" (the PRODUCT_NAME of the
-#                       Release configuration; must match Aurora.app).
+#   GITHUB_OWNER      — GitHub user/org that owns the releases repo. Defaults
+#                       to whatever `gh api user --jq .login` returns.
+#   GITHUB_REPO       — Releases repository name. Defaults to "aurora-releases".
+#   RELEASE_BASE_URL  — Base URL embedded in the appcast's <enclosure url=...>.
+#                       Auto-derived from GITHUB_OWNER/REPO/version unless set.
+#   APPCAST_TITLE     — Defaults to "Aurora".
+#   PROJECT_NAME      — Defaults to "Aurora" (the PRODUCT_NAME of the Release
+#                       configuration; must match Aurora.app).
 
 set -euo pipefail
 
@@ -37,19 +43,73 @@ ARCHIVE_PATH="$BUILD_DIR/${PRODUCT_NAME}.xcarchive"
 EXPORT_DIR="$BUILD_DIR/export"
 APPCAST="$RELEASES_DIR/appcast.xml"
 APPCAST_TITLE="${APPCAST_TITLE:-Aurora}"
-RELEASE_BASE_URL_DEFAULT="file://$RELEASES_DIR"
-RELEASE_BASE_URL="${RELEASE_BASE_URL:-$RELEASE_BASE_URL_DEFAULT}"
 
 mkdir -p "$RELEASES_DIR" "$BUILD_DIR"
 
+# -------- GitHub Releases setup ----------------------------------------------
+GITHUB_REPO="${GITHUB_REPO:-aurora-releases}"
+LOCAL_ONLY=0
+USE_GITHUB=1
+
+resolve_github_owner() {
+    if [[ -n "${GITHUB_OWNER:-}" ]]; then
+        printf '%s' "$GITHUB_OWNER"
+        return 0
+    fi
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        gh api user --jq .login 2>/dev/null
+    fi
+}
+
 # -------- Arg parsing ---------------------------------------------------------
 BUMP_KIND="patch"
-case "${1:-}" in
-    --minor) BUMP_KIND="minor" ;;
-    --major) BUMP_KIND="major" ;;
-    --patch|"") BUMP_KIND="patch" ;;
-    *) echo "Unknown flag: $1 (use --patch | --minor | --major)" >&2; exit 1 ;;
-esac
+for arg in "$@"; do
+    case "$arg" in
+        --minor) BUMP_KIND="minor" ;;
+        --major) BUMP_KIND="major" ;;
+        --patch) BUMP_KIND="patch" ;;
+        --local-only) LOCAL_ONLY=1; USE_GITHUB=0 ;;
+        "") : ;;
+        *) echo "Unknown flag: $arg (use --patch | --minor | --major | --local-only)" >&2; exit 1 ;;
+    esac
+done
+
+# Decide GitHub upload mode now so we can fail fast with clear errors before
+# we waste time archiving.
+if (( USE_GITHUB == 1 )); then
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "ERROR: 'gh' CLI not found." >&2
+        echo "  Install:   brew install gh" >&2
+        echo "  Auth:      gh auth login" >&2
+        echo "  Or run:    scripts/publish.sh --local-only (skip GitHub)" >&2
+        exit 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        echo "ERROR: 'gh' is installed but not authenticated. Run: gh auth login" >&2
+        exit 1
+    fi
+    GITHUB_OWNER="$(resolve_github_owner)"
+    if [[ -z "$GITHUB_OWNER" ]]; then
+        echo "ERROR: Could not resolve GITHUB_OWNER. Set the env var or run gh auth login." >&2
+        exit 1
+    fi
+    if ! gh repo view "$GITHUB_OWNER/$GITHUB_REPO" >/dev/null 2>&1; then
+        echo "ERROR: GitHub repo '$GITHUB_OWNER/$GITHUB_REPO' not found or no access." >&2
+        echo "  Create it (public so Sparkle can fetch the appcast):" >&2
+        echo "    gh repo create $GITHUB_OWNER/$GITHUB_REPO --public --description 'Aurora updates'" >&2
+        exit 1
+    fi
+fi
+
+# Compute RELEASE_BASE_URL: where the appcast points the <enclosure url=...>.
+# Format must match where we upload the DMG below.
+if [[ -z "${RELEASE_BASE_URL:-}" ]]; then
+    if (( USE_GITHUB == 1 )); then
+        RELEASE_BASE_URL="https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download/PLACEHOLDER_TAG"
+    else
+        RELEASE_BASE_URL="file://$RELEASES_DIR"
+    fi
+fi
 
 # -------- 1. Read and bump version -------------------------------------------
 CURRENT_VERSION="$(grep -m1 "MARKETING_VERSION = " "$PROJECT_FILE/project.pbxproj" \
@@ -69,8 +129,15 @@ case "$BUMP_KIND" in
     major) NEW_MAJOR=$((CV_MAJOR + 1)); NEW_MINOR=0; NEW_PATCH=0 ;;
 esac
 NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
+RELEASE_TAG="v$NEW_VERSION"
+
+# Now that we know the version, resolve the PLACEHOLDER_TAG.
+RELEASE_BASE_URL="${RELEASE_BASE_URL/PLACEHOLDER_TAG/$RELEASE_TAG}"
 
 echo "Publishing Aurora $CURRENT_VERSION → $NEW_VERSION"
+if (( USE_GITHUB == 1 )); then
+    echo "  GitHub target: $GITHUB_OWNER/$GITHUB_REPO   tag: $RELEASE_TAG"
+fi
 echo
 
 # Write back into both Debug and Release configs in the pbxproj.
@@ -191,18 +258,46 @@ else
     mv "$TMP_APPCAST" "$APPCAST"
 fi
 
+# -------- 7. Upload to GitHub Releases ---------------------------------------
+# Uploads both the DMG and the updated appcast.xml as assets of the new
+# release. We always reuse the same appcast.xml filename so Sparkle can fetch
+# `…/releases/latest/download/appcast.xml` and get the most recent feed
+# without ever knowing the version number.
+if (( USE_GITHUB == 1 )); then
+    echo
+    echo "Uploading to GitHub Releases ($GITHUB_OWNER/$GITHUB_REPO @ $RELEASE_TAG)…"
+
+    # If the release already exists (re-publish of the same version), delete
+    # any conflicting assets so the upload is idempotent.
+    if gh release view "$RELEASE_TAG" --repo "$GITHUB_OWNER/$GITHUB_REPO" >/dev/null 2>&1; then
+        echo "  Release $RELEASE_TAG already exists — replacing assets."
+        gh release upload "$RELEASE_TAG" "$DMG_PATH" "$APPCAST" \
+            --repo "$GITHUB_OWNER/$GITHUB_REPO" \
+            --clobber
+    else
+        gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_OWNER/$GITHUB_REPO" \
+            --title "Aurora $NEW_VERSION" \
+            --notes "Automated release for Aurora $NEW_VERSION." \
+            "$DMG_PATH" "$APPCAST"
+    fi
+
+    PUBLIC_APPCAST_URL="https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/latest/download/appcast.xml"
+fi
+
 # -------- Done ---------------------------------------------------------------
-cat <<EOF
+echo
+echo "✅ Published Aurora $NEW_VERSION"
+echo
+echo "   DMG       : $DMG_PATH         ($((DMG_SIZE_BYTES / 1024 / 1024)) MB)"
+echo "   Appcast   : $APPCAST"
 
-✅ Published Aurora $NEW_VERSION
-
-   DMG       : $DMG_PATH         ($((DMG_SIZE_BYTES / 1024 / 1024)) MB)
-   Appcast   : $APPCAST
-   Feed URL  : $RELEASE_BASE_URL/appcast.xml
-
-Next steps (Phase 4):
-  • Upload "$DMG_NAME" and appcast.xml to GitHub Releases (or your CDN).
-  • Set SUFeedURL in commanderonev2/Info.plist to the final URL.
-  • Open the Production app → menu Aurora > Check for Updates… should
-    show "$NEW_VERSION available — Update Now".
-EOF
+if (( USE_GITHUB == 1 )); then
+    echo "   GitHub    : https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/tag/$RELEASE_TAG"
+    echo "   Feed URL  : $PUBLIC_APPCAST_URL"
+    echo
+    echo "Production app: menu Aurora > Check for Updates… should now show"
+    echo "  '$NEW_VERSION available — Update Now'."
+else
+    echo "   Feed URL  : $RELEASE_BASE_URL/appcast.xml   (local-only)"
+fi

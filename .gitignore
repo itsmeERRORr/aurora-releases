@@ -9,12 +9,13 @@ xcuserdata/
 build/
 DerivedData/
 
-# Publish output — DMGs and appcast (Phase 3+).
-# We DO commit `releases/appcast.xml` later (Phase 4 publishes it to GitHub
-# Releases / a CDN). Until then it's local-only.
+# Publish output
+# - DMGs live in GitHub Releases assets; the local copies are throwaway.
+# - releases/appcast.xml IS tracked (mirrors what's currently on GitHub).
+# - releases/.private/ would hold any on-disk key material; never tracked.
 releases/*.dmg
 releases/.private/
-releases/Aurora-*
+releases/Aurora-*.app
 
 # Local env
 .env.local
