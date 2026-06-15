@@ -5,11 +5,7 @@ import Foundation
 enum FinalizedEventsStore {
 
     private static var storageURL: URL {
-        let appSupport = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("commanderonev2", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("finalized_events.json")
+        AppPaths.applicationSupportRoot.appendingPathComponent("finalized_events.json")
     }
 
     static func loadAll() -> [FinalizedEvent] {

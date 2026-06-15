@@ -4,19 +4,15 @@ enum StatsStorage {
     private static let totalKey = "com.commander.totalStats"
     private static let lastImportKey = "com.commander.lastImportStats"
 
-    // File-based storage for persistence across Xcode builds
+    // File-based storage for persistence across Xcode builds.
+    // Path is routed through AppPaths so Production and Beta builds keep
+    // their own isolated files (commanderonev2/ vs commanderonev2-beta/).
     private static var storageURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("commanderonev2", isDirectory: true)
-        try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
-        return appDir.appendingPathComponent("totalStats.json")
+        AppPaths.applicationSupportRoot.appendingPathComponent("totalStats.json")
     }
 
     private static var lastImportURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("commanderonev2", isDirectory: true)
-        try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
-        return appDir.appendingPathComponent("lastImportStats.json")
+        AppPaths.applicationSupportRoot.appendingPathComponent("lastImportStats.json")
     }
 
     static func save(_ stats: StatsReport) {

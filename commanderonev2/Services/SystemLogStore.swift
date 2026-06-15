@@ -2,10 +2,7 @@ import Foundation
 
 enum SystemLogStore {
     private static var storageURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("commanderonev2", isDirectory: true)
-        try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
-        return appDir.appendingPathComponent("system.log.jsonl")
+        AppPaths.applicationSupportRoot.appendingPathComponent("system.log.jsonl")
     }
 
     static func append(_ entry: LogEntry) {

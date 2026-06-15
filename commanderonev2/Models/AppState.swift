@@ -1180,9 +1180,7 @@ final class AppState {
     }
 
     private var eventBannerCacheDirectory: URL {
-        let appSupport = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("commanderonev2/event_banners", isDirectory: true)
+        AppPaths.subdirectory("event_banners")
     }
 
     /// Atualiza o cache de count e path para um folder (chamado quando o disco está online).

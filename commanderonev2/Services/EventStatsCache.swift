@@ -3,12 +3,7 @@ import Foundation
 /// Persists per-event EXIF scan results so they survive disk disconnections and app restarts.
 final class EventStatsCache {
 
-    private static let storageDir: URL = {
-        let appSupport = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("commanderonev2/event_stats_cache", isDirectory: true)
-    }()
+    private static let storageDir: URL = AppPaths.subdirectory("event_stats_cache")
 
     private struct CacheEntry: Codable {
         let report: StatsReport
