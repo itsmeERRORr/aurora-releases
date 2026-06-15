@@ -21,9 +21,13 @@ final class SparkleUpdater: NSObject, ObservableObject {
     private let updaterController: SPUStandardUpdaterController
 
     override init() {
-        // Beta IS the publisher — it must never start the updater, otherwise
-        // it would try to update itself with its own release.
+        // Never start the updater in debug builds (Xcode runs) — only in
+        // production Release binaries. Beta also never updates itself.
+        #if DEBUG
+        let shouldStart = false
+        #else
         let shouldStart = !AppPaths.isBeta
+        #endif
         self.updaterController = SPUStandardUpdaterController(
             startingUpdater: shouldStart,
             updaterDelegate: nil,

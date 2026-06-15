@@ -107,12 +107,10 @@ struct EventStatsView: View {
     }
 
     private var eventBannerCard: some View {
-        bannerCardBackground
-            .frame(maxWidth: .infinity)
-            .frame(height: 400)
-            .clipped()
-            // Header (gradient + title + controls) overlaid at the top
-            .overlay(alignment: .top) {
+        ZStack {
+            bannerCardBackground
+
+            VStack(spacing: 0) {
                 bannerHeader
                     .padding(.horizontal, 14)
                     .padding(.vertical, 14)
@@ -124,13 +122,16 @@ struct EventStatsView: View {
                             endPoint: .bottom
                         )
                         .frame(height: 130)
-                        .frame(maxHeight: .infinity, alignment: .top)
-                        .allowsHitTesting(false)
+                        .frame(maxWidth: .infinity, alignment: .top)
+                        .allowsHitTesting(false),
+                        alignment: .top
                     )
+                Spacer()
             }
-            // Photos-imported caption overlaid at the bottom
-            .overlay(alignment: .bottomLeading) {
-                if let summary = importSummary {
+
+            if let summary = importSummary {
+                VStack(spacing: 0) {
+                    Spacer()
                     Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
                         .font(.manrope(12, weight: .bold))
                         .foregroundStyle(.white.opacity(0.92))
@@ -147,16 +148,19 @@ struct EventStatsView: View {
                         )
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
-                    .strokeBorder(Color.auroraStroke, lineWidth: 1)
-            )
-            .overlay {
-                if isRepositioningBanner {
-                    bannerRepositionOverlay
-                }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 400)
+        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
+                .strokeBorder(Color.auroraStroke, lineWidth: 1)
+        )
+        .overlay {
+            if isRepositioningBanner {
+                bannerRepositionOverlay
             }
+        }
     }
 
     @ViewBuilder

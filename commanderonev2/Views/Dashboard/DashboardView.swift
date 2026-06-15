@@ -42,7 +42,7 @@ struct DashboardView: View {
     private var topbar: some View {
         HStack(spacing: 14) {
             IconChip(systemName: "square.grid.2x2.fill", color: .auroraCyan, size: 36, iconScale: 0.5)
-            Text("Dashboard")
+            Text("Dashboard123")
                 .font(.auroraTopbarH2)
                 .tracking(-0.4)
                 .foregroundStyle(Color.auroraTxt)
@@ -166,6 +166,7 @@ struct DashboardView: View {
                         Text("No event")
                             .font(.manrope(11, weight: .semibold))
                             .foregroundStyle(Color.auroraFaint)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)

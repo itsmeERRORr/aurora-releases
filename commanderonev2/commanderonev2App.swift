@@ -19,6 +19,9 @@ struct commanderonev2App: App {
         WindowGroup {
             ContentView(appState: appState)
                 .frame(minWidth: 1280, minHeight: 800)
+                #if canImport(Sparkle)
+                .environmentObject(updater)
+                #endif
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)

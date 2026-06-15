@@ -131,6 +131,13 @@ if [[ ! "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
     exit 1
 fi
 
+CURRENT_BUILD="$(grep -m1 "CURRENT_PROJECT_VERSION = " "$PROJECT_FILE/project.pbxproj" \
+                    | sed -E 's/.*CURRENT_PROJECT_VERSION = ([0-9]+);.*/\1/')"
+if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: Could not parse CURRENT_PROJECT_VERSION: '$CURRENT_BUILD'" >&2
+    exit 1
+fi
+
 # Normalise to MAJOR.MINOR.PATCH (Xcode allows 1.0)
 IFS='.' read -r CV_MAJOR CV_MINOR CV_PATCH <<<"$CURRENT_VERSION"
 CV_PATCH="${CV_PATCH:-0}"
@@ -141,6 +148,7 @@ case "$BUMP_KIND" in
     major) NEW_MAJOR=$((CV_MAJOR + 1)); NEW_MINOR=0; NEW_PATCH=0 ;;
 esac
 NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
+NEW_BUILD=$((CURRENT_BUILD + 1))
 RELEASE_TAG="v$NEW_VERSION"
 
 # Now that we know the version, resolve the PLACEHOLDER_TAG.
@@ -155,12 +163,18 @@ echo
 # Write back into both Debug and Release configs in the pbxproj.
 # Match the exact "MARKETING_VERSION = <ver>;" line to avoid clobbering numbers
 # that look similar elsewhere.
-/usr/bin/sed -i '' "s/MARKETING_VERSION = $CURRENT_VERSION;/MARKETING_VERSION = $NEW_VERSION;/g" \
+/usr/bin/sed -i '' \
+    -e "s/MARKETING_VERSION = $CURRENT_VERSION;/MARKETING_VERSION = $NEW_VERSION;/g" \
+    -e "s/CURRENT_PROJECT_VERSION = $CURRENT_BUILD;/CURRENT_PROJECT_VERSION = $NEW_BUILD;/g" \
     "$PROJECT_FILE/project.pbxproj"
 
-# Sanity: the change actually happened.
+# Sanity: the changes actually happened.
 if ! grep -q "MARKETING_VERSION = $NEW_VERSION;" "$PROJECT_FILE/project.pbxproj"; then
     echo "ERROR: MARKETING_VERSION did not update — aborting." >&2
+    exit 1
+fi
+if ! grep -q "CURRENT_PROJECT_VERSION = $NEW_BUILD;" "$PROJECT_FILE/project.pbxproj"; then
+    echo "ERROR: CURRENT_PROJECT_VERSION did not update — aborting." >&2
     exit 1
 fi
 
@@ -238,7 +252,7 @@ NEW_ITEM_XML="    <item>
       <pubDate>$NOW_RFC822</pubDate>
       <enclosure
         url=\"$RELEASE_BASE_URL/$DMG_NAME\"
-        sparkle:version=\"$NEW_VERSION\"
+        sparkle:version=\"$NEW_BUILD\"
         sparkle:shortVersionString=\"$NEW_VERSION\"
         sparkle:edSignature=\"$ED_SIG\"
         length=\"$ENCLOSURE_LEN\"
@@ -258,16 +272,15 @@ EOF
 else
     # Prepend the new <item> right after <channel><title>…</title>.
     TMP_APPCAST="$(mktemp)"
-    awk -v insert="$NEW_ITEM_XML" '
-        /<\/title>/ && !done {
-            print
-            print insert
-            done=1
-            next
-        }
+    TMP_INSERT="$(mktemp)"
+    printf '%s\n' "$NEW_ITEM_XML" > "$TMP_INSERT"
+    awk '
+        NR==FNR { ins = ins $0 "\n"; next }
+        /<\/title>/ && !done { print; printf "%s", ins; done=1; next }
         { print }
-    ' "$APPCAST" >"$TMP_APPCAST"
+    ' "$TMP_INSERT" "$APPCAST" > "$TMP_APPCAST"
     mv "$TMP_APPCAST" "$APPCAST"
+    rm -f "$TMP_INSERT"
 fi
 
 # -------- 7. Upload to GitHub Releases ---------------------------------------
