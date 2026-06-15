@@ -160,10 +160,32 @@ struct AdvancedView: View {
                 if !files.isEmpty {
                     HStack(spacing: 8) {
                         if sourceVolumes.count > 1 {
-                            sourceButton(title: "All Cards", sourceID: nil)
-                            ForEach(sourceVolumes) { volume in
-                                sourceButton(title: volume.name, sourceID: volume.id)
+                            Menu {
+                                Button {
+                                    selectedSourceID = nil
+                                    loadFiles()
+                                } label: {
+                                    Label("All Cards", systemImage: selectedSourceID == nil ? "checkmark" : "")
+                                }
+                                Divider()
+                                ForEach(sourceVolumes) { volume in
+                                    Button {
+                                        selectedSourceID = volume.id
+                                        loadFiles()
+                                    } label: {
+                                        Label(volume.name, systemImage: selectedSourceID == volume.id ? "checkmark" : "")
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(sourceSelectionTitle)
+                                        .font(.manrope(11.5, weight: .semibold))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 9, weight: .bold))
+                                }
                             }
+                            .menuStyle(.borderlessButton)
+                            .frame(minWidth: 120)
                         }
                         filterButton(.all)
                         filterButton(.rated)
@@ -224,16 +246,6 @@ struct AdvancedView: View {
             Text(filterTitle(filter))
         }
         .buttonStyle(AuroraGhostButtonStyle(active: ratingFilter == filter))
-    }
-
-    private func sourceButton(title: String, sourceID: String?) -> some View {
-        Button {
-            selectedSourceID = sourceID
-            loadFiles()
-        } label: {
-            Text(title)
-        }
-        .buttonStyle(AuroraGhostButtonStyle(active: selectedSourceID == sourceID))
     }
 
     private func filterTitle(_ filter: RatingFilter) -> String {

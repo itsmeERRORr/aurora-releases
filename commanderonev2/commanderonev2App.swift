@@ -4,6 +4,13 @@ import SwiftUI
 struct commanderonev2App: App {
     @State private var appState = AppState()
 
+    #if canImport(Sparkle)
+    // Initialised in both Beta and Production, but `SparkleUpdater.init()` only
+    // *starts* the updater for Production. On Beta the menu item below is also
+    // hidden via AppPaths.isBeta.
+    @StateObject private var updater = SparkleUpdater()
+    #endif
+
     init() {
         FontLoader.registerAll()
     }
@@ -15,5 +22,17 @@ struct commanderonev2App: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
+        .commands {
+            #if canImport(Sparkle)
+            if !AppPaths.isBeta {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates…") {
+                        updater.checkForUpdates()
+                    }
+                    .disabled(!updater.canCheckForUpdates)
+                }
+            }
+            #endif
+        }
     }
 }

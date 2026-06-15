@@ -629,10 +629,17 @@ struct WaitingCard: View {
                     .strokeBorder(Color.auroraStroke, lineWidth: 1)
             )
         } else {
-            Button("Choose Destination", action: chooseDestination)
-                .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                .frame(maxWidth: .infinity)
-                .frame(height: 96)
+            VStack(spacing: 2) {
+                Button("Choose Destination", action: chooseDestination)
+                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 96)
+
+                Text("Please choose a destination to import the files")
+                    .font(.manrope(11, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+                    .multilineTextAlignment(.center)
+            }
         }
     }
 
@@ -744,7 +751,7 @@ struct WaitingCard: View {
                 )
 
                 HStack(spacing: 12) {
-                    AuroraMiniToggle(label: "Auto-import", isOn: $appState.autoImport, tint: .auroraCyan)
+                    Spacer()
                     AuroraMiniToggle(label: "Rename", isOn: $appState.renameOnImport, tint: .auroraMagenta)
                     if appState.renameOnImport {
                         Button("Edit") { showRenameEditor = true }
@@ -762,6 +769,7 @@ struct WaitingCard: View {
                             )
                             .buttonStyle(.plain)
                     }
+                    AuroraMiniToggle(label: "Auto-import", isOn: $appState.autoImport, tint: .auroraCyan)
                 }
             }
         }
@@ -786,7 +794,7 @@ struct WaitingCard: View {
 
     private var isImportNowBlocked: Bool {
         let allAlreadyImported = appState.allDestinationFilesAlreadyImported && appState.sourceFileCountForDestinationCheck > 0
-        return importableVolumes.isEmpty || allAlreadyImported
+        return importableVolumes.isEmpty || allAlreadyImported || appState.destinationURL == nil
     }
 
     private var shouldPulseWaitingCard: Bool {
