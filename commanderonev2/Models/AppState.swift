@@ -453,9 +453,9 @@ final class AppState {
     /// StatisticsView observes this to show a "Scanning…" indicator on the card.
     var eventFolderScanningIndices: Set<Int> = []
     /// Queue of bookmarkIndex values waiting for a library folder scan.
-    var scanQueue: [Int] = []
+    private(set) var scanQueue: [Int] = []
     /// The bookmarkIndex currently being scanned by the library scan queue. nil = idle.
-    var currentlyScanningIndex: Int? = nil
+    private(set) var currentlyScanningIndex: Int? = nil
     /// Dedicated StatsRunner for the library scan queue (lazy — created on first use).
     private var libraryScanRunner: StatsRunner?
 
@@ -1487,7 +1487,7 @@ final class AppState {
         drainScanQueue()
     }
 
-    func drainScanQueue() {
+    private func drainScanQueue() {
         guard currentlyScanningIndex == nil, !scanQueue.isEmpty else { return }
         let index = scanQueue.removeFirst()
         currentlyScanningIndex = index
@@ -1509,7 +1509,8 @@ final class AppState {
         }
         let url = URL(fileURLWithPath: path)
 
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             let result = await runner.runStatsForEventFolder(at: url)
             if let r = result, r.totalFilesAnalyzed > 0 {
                 let now = Date()
@@ -1561,6 +1562,18 @@ final class AppState {
         // Clean up scanning indicator: remove the deleted index and shift higher indices down by 1
         eventFolderScanningIndices.remove(index)
         eventFolderScanningIndices = Set(eventFolderScanningIndices.map { $0 > index ? $0 - 1 : $0 })
+        // Update scan queue indices after removal
+        scanQueue = scanQueue.compactMap { i in
+            if i == index { return nil }
+            return i > index ? i - 1 : i
+        }
+        if let s = currentlyScanningIndex {
+            if s == index {
+                currentlyScanningIndex = nil
+            } else if s > index {
+                currentlyScanningIndex = s - 1
+            }
+        }
         // Triggers didSet → syncDisplayNamesCount / syncPeakCounts / syncCachedCounts (all no-ops now)
         eventFolderBookmarks.remove(at: index)
     }
