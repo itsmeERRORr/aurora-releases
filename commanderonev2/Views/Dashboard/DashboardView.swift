@@ -360,6 +360,8 @@ struct TotalLibraryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Spacer(minLength: 0)
+
             Text("Total Library")
                 .font(.manrope(13, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
@@ -391,7 +393,6 @@ struct TotalLibraryCard: View {
                 Divider().frame(height: 22).background(Color.auroraStroke)
                 metaItem(label: "Events", value: "\(eventCount)")
             }
-            Spacer(minLength: 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, AuroraSpacing.heroPaddingH)
