@@ -371,6 +371,8 @@ struct TotalLibraryCard: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
 
+            Spacer(minLength: 0)
+
             Text(subtitle)
                 .font(.manrope(12.5, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
