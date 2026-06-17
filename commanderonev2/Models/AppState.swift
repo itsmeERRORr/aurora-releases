@@ -452,6 +452,12 @@ final class AppState {
     /// Indices of event folders currently being EXIF-scanned in the background.
     /// StatisticsView observes this to show a "Scanning…" indicator on the card.
     var eventFolderScanningIndices: Set<Int> = []
+    /// Queue of bookmarkIndex values waiting for a library folder scan.
+    var scanQueue: [Int] = []
+    /// The bookmarkIndex currently being scanned by the library scan queue. nil = idle.
+    var currentlyScanningIndex: Int? = nil
+    /// Dedicated StatsRunner for the library scan queue (lazy — created on first use).
+    private var libraryScanRunner: StatsRunner?
 
     /// Live results for the "Most photos per event" card.
     /// Stored in AppState so that navigating away and back never triggers a re-scan.
@@ -1467,6 +1473,54 @@ final class AppState {
         }
         refreshEventFolderMediaCounts()
         return newIndex
+    }
+
+    func addLibraryFolder(url: URL) {
+        guard let bookmark = BookmarkManager.saveBookmark(for: url) else { return }
+        let index = addEventFolder(bookmark: bookmark, displayName: url.lastPathComponent)
+        if index < eventFolderIsLibrary.count {
+            eventFolderIsLibrary[index] = true
+        }
+        if !scanQueue.contains(index) {
+            scanQueue.append(index)
+        }
+        drainScanQueue()
+    }
+
+    func drainScanQueue() {
+        guard currentlyScanningIndex == nil, !scanQueue.isEmpty else { return }
+        let index = scanQueue.removeFirst()
+        currentlyScanningIndex = index
+
+        if libraryScanRunner == nil {
+            libraryScanRunner = StatsRunner(appState: self)
+        }
+        guard let runner = libraryScanRunner else {
+            currentlyScanningIndex = nil
+            drainScanQueue()
+            return
+        }
+
+        let path = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+        guard !path.isEmpty else {
+            currentlyScanningIndex = nil
+            drainScanQueue()
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+
+        Task {
+            let result = await runner.runStatsForEventFolder(at: url)
+            if let r = result, r.totalFilesAnalyzed > 0 {
+                let now = Date()
+                EventStatsCache.save(r, forPath: path, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
+                updateEventFolderCache(at: index, count: r.totalFilesAnalyzed, path: path)
+                setEventFolderPeakIfHigher(at: index, count: r.totalFilesAnalyzed)
+                log("Library folder scan complete: \(url.lastPathComponent) — \(r.totalFilesAnalyzed) photos")
+            }
+            currentlyScanningIndex = nil
+            drainScanQueue()
+        }
     }
 
     func isLibraryFolder(at index: Int) -> Bool {
