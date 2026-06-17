@@ -110,6 +110,9 @@ final class AppState {
     var renameOnImport: Bool = false {
         didSet { UserDefaults.standard.set(renameOnImport, forKey: "renameOnImport") }
     }
+    var autoSubfolders: Bool = false {
+        didSet { UserDefaults.standard.set(autoSubfolders, forKey: "autoSubfolders") }
+    }
     var renameTemplate: String = RenameTemplateRenderer.defaultTemplate {
         didSet { UserDefaults.standard.set(renameTemplate, forKey: "renameTemplate") }
     }
@@ -132,15 +135,14 @@ final class AppState {
     }
     var totalStatsReport: StatsReport? {
         didSet {
-            if let stats = totalStatsReport {
-                print("AppState: totalStatsReport updated with \(stats.totalFilesAnalyzed) files, saving...")
-                StatsStorage.save(stats)
-                // Force immediate persistence
-                UserDefaults.standard.synchronize()
-                print("AppState: Forced UserDefaults sync")
-            } else {
-                print("AppState: totalStatsReport set to nil")
+            guard let stats = totalStatsReport else {
                 StatsStorage.clear()
+                return
+            }
+            // Save asynchronously so the MainActor is never blocked by JSON encoding
+            // + file I/O (critical with large libraries of 100k+ photos).
+            Task.detached(priority: .utility) {
+                StatsStorage.save(stats)
             }
         }
     }
@@ -189,6 +191,13 @@ final class AppState {
 
     // MARK: - Import History
     var importHistory: [ImportHistoryEntry] = []
+
+    /// Bookmark indices that are currently being scanned in the background (e.g. auto-scan on event creation).
+    var backgroundScanningBookmarkIndices: Set<Int> = []
+    /// RAW file count per bookmark index, populated just before the scan starts.
+    var backgroundScanFileCount: [Int: Int] = [:]
+    /// When the scan started per bookmark index, used to animate a progress estimate.
+    var backgroundScanStartTimes: [Int: Date] = [:]
 
     /// All configured event folders, shown in the Events sidebar.
     /// The order is user-controlled via drag/drop; new events are inserted at the top.
@@ -459,6 +468,7 @@ final class AppState {
     var eventFolderBookmarks: [Data] = [] {
         didSet {
             syncDisplayNamesCount()
+            syncIsLibraryCount()
             syncPeakCounts()
             syncCachedCounts()
             syncManualDatesCount()
@@ -472,6 +482,10 @@ final class AppState {
     /// Custom display names per folder; same count as eventFolderBookmarks. Empty string = use folder name.
     var eventFolderDisplayNames: [String] = [] {
         didSet { saveEventFolderDisplayNames() }
+    }
+    /// Whether each event folder slot is a library folder (vs. active event). Same count as eventFolderBookmarks.
+    var eventFolderIsLibrary: [Bool] = [] {
+        didSet { saveEventFolderIsLibrary() }
     }
     /// Manual event dates are used only when an event has no automatic import/finalized date.
     var eventFolderManualDates: [Date?] = [] {
@@ -529,6 +543,7 @@ final class AppState {
         }
         renameOnImport = UserDefaults.standard.bool(forKey: "renameOnImport")
         renameTemplate = UserDefaults.standard.string(forKey: "renameTemplate") ?? RenameTemplateRenderer.defaultTemplate
+        autoSubfolders = UserDefaults.standard.bool(forKey: "autoSubfolders")
         if let data = UserDefaults.standard.data(forKey: "destinationBookmark") {
             destinationBookmarkData = data
             destinationURL = BookmarkManager.resolveBookmark(data)
@@ -599,6 +614,11 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([EventSidebarNode].self, from: data) {
             eventSidebarNodes = decoded
         }
+        // Load eventFolderIsLibrary (antes dos bookmarks)
+        if let data = UserDefaults.standard.data(forKey: "eventFolderIsLibraryData"),
+           let decoded = try? PropertyListDecoder().decode([Bool].self, from: data) {
+            eventFolderIsLibrary = decoded
+        }
         // Load event folder bookmarks (o didSet chama syncDisplayNamesCount e syncPeakCounts)
         if let data = UserDefaults.standard.data(forKey: "eventFolderBookmarksData"),
            let decoded = try? PropertyListDecoder().decode([Data].self, from: data) {
@@ -621,6 +641,7 @@ final class AppState {
         }
 
         syncDisplayNamesCount()
+        syncIsLibraryCount()
         syncPeakCounts()
         syncCachedCounts()
         syncManualDatesCount()
@@ -711,6 +732,15 @@ final class AppState {
             eventFolderDisplayNames = Array(eventFolderDisplayNames.prefix(n))
         } else if eventFolderDisplayNames.count < n {
             eventFolderDisplayNames += Array(repeating: "", count: n - eventFolderDisplayNames.count)
+        }
+    }
+
+    private func syncIsLibraryCount() {
+        let n = eventFolderBookmarks.count
+        if eventFolderIsLibrary.count > n {
+            eventFolderIsLibrary = Array(eventFolderIsLibrary.prefix(n))
+        } else if eventFolderIsLibrary.count < n {
+            eventFolderIsLibrary += Array(repeating: false, count: n - eventFolderIsLibrary.count)
         }
     }
 
@@ -1124,6 +1154,11 @@ final class AppState {
         UserDefaults.standard.set(data, forKey: "eventFolderDisplayNamesData")
     }
 
+    private func saveEventFolderIsLibrary() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderIsLibrary) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderIsLibraryData")
+    }
+
     private func saveEventFolderManualDates() {
         let values = eventFolderManualDates.map { $0?.timeIntervalSince1970 ?? -1 }
         UserDefaults.standard.set(values, forKey: "eventFolderManualDatesData")
@@ -1433,6 +1468,11 @@ final class AppState {
         return newIndex
     }
 
+    func isLibraryFolder(at index: Int) -> Bool {
+        guard index >= 0, index < eventFolderIsLibrary.count else { return false }
+        return eventFolderIsLibrary[index]
+    }
+
     func removeEventFolder(at index: Int) {
         guard index >= 0, index < eventFolderBookmarks.count else { return }
         // Remove from all parallel arrays at the correct index BEFORE removing the bookmark,
@@ -1449,6 +1489,7 @@ final class AppState {
         }
         if index < eventFolderBannerOffsets.count { eventFolderBannerOffsets.remove(at: index) }
         if index < eventFolderDisplayNames.count { eventFolderDisplayNames.remove(at: index) }
+        if index < eventFolderIsLibrary.count { eventFolderIsLibrary.remove(at: index) }
         if index < eventFolderManualDates.count { eventFolderManualDates.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
         if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
