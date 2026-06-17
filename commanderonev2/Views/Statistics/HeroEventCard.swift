@@ -180,6 +180,7 @@ struct HeroEventCard: View {
         } else if info.hasData {
             EventThumbnail(
                 eventName: info.name,
+                folderPath: info.folderPath,
                 cornerRadius: 0
             )
             .saturation(0.95)
