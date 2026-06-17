@@ -378,6 +378,16 @@ struct TotalLibraryCard: View {
 
             Divider().background(Color.auroraStroke).padding(.vertical, 6)
 
+            HStack(spacing: 16) {
+                metaItem(label: "Imports", value: "\(appState.importHistory.count)")
+                Divider().frame(height: 22).background(Color.auroraStroke)
+                metaItem(label: "Avg Speed", value: speedString)
+                Divider().frame(height: 22).background(Color.auroraStroke)
+                metaItem(label: "Events", value: "\(eventCount)")
+            }
+
+            Spacer(minLength: 0)
+
             HStack {
                 Spacer()
                 Button {
@@ -389,15 +399,6 @@ struct TotalLibraryCard: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.auroraCyan)
             }
-
-            HStack(spacing: 16) {
-                metaItem(label: "Imports", value: "\(appState.importHistory.count)")
-                Divider().frame(height: 22).background(Color.auroraStroke)
-                metaItem(label: "Avg Speed", value: speedString)
-                Divider().frame(height: 22).background(Color.auroraStroke)
-                metaItem(label: "Events", value: "\(eventCount)")
-            }
-            Spacer(minLength: 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, AuroraSpacing.heroPaddingH)
