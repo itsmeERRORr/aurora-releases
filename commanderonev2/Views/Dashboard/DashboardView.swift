@@ -360,8 +360,6 @@ struct TotalLibraryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Spacer(minLength: 0)
-
             Text("Total Library")
                 .font(.manrope(13, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
@@ -378,13 +376,16 @@ struct TotalLibraryCard: View {
                 .foregroundStyle(Color.auroraMuted)
                 .lineLimit(1)
 
-            HStack {
-                Spacer()
-                Button("Add Folder", action: addLibraryFolders)
-                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
-            }
+            Divider().background(Color.auroraStroke).padding(.vertical, 6)
 
-            Divider().background(Color.auroraStroke)
+            Button {
+                addLibraryFolders()
+            } label: {
+                Label("Add Folder", systemImage: "folder.badge.plus")
+                    .font(.manrope(12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.auroraCyan)
 
             HStack(spacing: 16) {
                 metaItem(label: "Imports", value: "\(appState.importHistory.count)")
@@ -393,6 +394,7 @@ struct TotalLibraryCard: View {
                 Divider().frame(height: 22).background(Color.auroraStroke)
                 metaItem(label: "Events", value: "\(eventCount)")
             }
+            Spacer(minLength: 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, AuroraSpacing.heroPaddingH)
