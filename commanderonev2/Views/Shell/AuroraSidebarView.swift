@@ -307,7 +307,7 @@ struct AuroraSidebarView: View {
                 systemIcon: icon,
                 isActive: selectedItem == .event(bookmarkIndex: bookmarkIndex),
                 compact: true,
-                tooltip: event.name
+                tooltip: shouldShowEventTooltip(event.name, depth: depth) ? event.name : nil
             ) {
                 selectedItem = .event(bookmarkIndex: bookmarkIndex)
             }
@@ -481,6 +481,23 @@ struct AuroraSidebarView: View {
         selectedItem = .event(bookmarkIndex: bookmarkIndex)
     }
 
+
+    // MARK: - Tooltip helpers
+
+    private func shouldShowEventTooltip(_ label: String, depth: Int) -> Bool {
+        let available = AuroraSpacing.sidebarWidth - 20 - CGFloat(depth) * 12 - 24 - 16 - 11
+        return textWidth(label) > available
+    }
+
+    private func shouldShowFolderTooltip(_ label: String, depth: Int) -> Bool {
+        let available = AuroraSpacing.sidebarWidth - 20 - CGFloat(depth) * 12 - 24 - 10 - 16 - 16
+        return textWidth(label) > available
+    }
+
+    private func textWidth(_ label: String) -> CGFloat {
+        let font = NSFont(name: AuroraFontFamily.manrope, size: 13.5) ?? NSFont.systemFont(ofSize: 13.5, weight: .semibold)
+        return (label as NSString).size(withAttributes: [.font: font]).width
+    }
 
     // MARK: - Storage widget
 
