@@ -142,7 +142,7 @@ struct HeroEventCard: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(isEmptyStateExpanded ? "Minimize" : "Expand")
+        .auroraTooltip(isEmptyStateExpanded ? "Minimize" : "Expand")
     }
 
     // MARK: - Right
@@ -180,7 +180,6 @@ struct HeroEventCard: View {
         } else if info.hasData {
             EventThumbnail(
                 eventName: info.name,
-                folderPath: info.folderPath,
                 cornerRadius: 0
             )
             .saturation(0.95)
@@ -364,6 +363,23 @@ struct HeroEventCard: View {
         let eventReport = cachedReport(forPath: report.destinationPath) ?? appState.statsReport
         let bookmarkIndex = matchingBookmarkIndex(for: report.destinationPath)
 
+        // If the last import's destination no longer corresponds to any tracked event
+        // and there are no events at all, show the empty state instead of orphaned data.
+        if bookmarkIndex == nil && appState.uniqueImportDestinations.isEmpty {
+            return LatestEventInfo(
+                name: "No events yet",
+                folderPath: nil,
+                bookmarkIndex: nil,
+                bannerImagePath: nil,
+                meta: nil,
+                description: "Create an event folder and import to see your latest event here.",
+                badge: "Idle",
+                strip: HeroStrip(rawFiles: "—", data: "—", avgISO: "—", topLens: "—", date: "—"),
+                hasData: false,
+                isFinalized: false
+            )
+        }
+
         let isFinalized = appState.finalizedEvent(matchingPath: report.destinationPath) != nil
 
         return LatestEventInfo(
@@ -404,6 +420,7 @@ struct HeroEventCard: View {
     private func latestOpenEventInfo() -> LatestEventInfo? {
         guard let event = appState.uniqueImportDestinations.first(where: {
             appState.finalizedEvent(forBookmarkIndex: $0.bookmarkIndex) == nil
+                && !appState.isLibraryFolder(at: $0.bookmarkIndex)
         }) else { return nil }
 
         let summary = appState.importStatsForEventFolder(at: event.bookmarkIndex)

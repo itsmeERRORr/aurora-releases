@@ -83,6 +83,7 @@ struct DashboardView: View {
             AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →", action: onViewAllEvents)
 
             let items = appState.uniqueImportDestinations
+                .filter { !appState.isLibraryFolder(at: $0.bookmarkIndex) }
                 .compactMap { destination -> (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool)? in
                     guard let event = recentEventDisplay(for: destination) else { return nil }
                     return (
@@ -716,7 +717,9 @@ struct WaitingCard: View {
 
     private var openEvents: [(path: String, name: String, bookmarkIndex: Int)] {
         appState.uniqueImportDestinations.filter { event in
-            !event.path.isEmpty && appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) == nil
+            !event.path.isEmpty
+                && appState.finalizedEvent(forBookmarkIndex: event.bookmarkIndex) == nil
+                && !appState.isLibraryFolder(at: event.bookmarkIndex)
         }
     }
 
