@@ -186,7 +186,39 @@ struct DashboardView: View {
         guard let bookmark = BookmarkManager.saveBookmark(for: folderURL) else {
             return "Aurora could not save access to this folder. Choose a different folder and try again."
         }
-        appState.addEventFolder(bookmark: bookmark, displayName: name)
+        let bookmarkIndex = appState.addEventFolder(bookmark: bookmark, displayName: name)
+
+        // Auto-scan the folder in the background so stats are ready when the user opens the event.
+        guard let runner = statsRunner else { return nil }
+        let folderPath = folderURL.path
+        appState.backgroundScanningBookmarkIndices.insert(bookmarkIndex)
+        appState.backgroundScanStartTimes[bookmarkIndex] = Date()
+        Task {
+            // Count files first so the UI can show a meaningful estimate.
+            let fileCount = VolumeWatcher.countRawFiles(at: folderURL, extensions: appState.supportedExtensions)
+            appState.backgroundScanFileCount[bookmarkIndex] = fileCount
+
+            let result = await runner.runStatsForEventFolder(at: folderURL)
+
+            appState.backgroundScanningBookmarkIndices.remove(bookmarkIndex)
+            appState.backgroundScanFileCount.removeValue(forKey: bookmarkIndex)
+            appState.backgroundScanStartTimes.removeValue(forKey: bookmarkIndex)
+
+            guard let r = result, r.totalFilesAnalyzed > 0 else { return }
+            let now = Date()
+            EventStatsCache.save(r, forPath: folderPath, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
+            appState.updateEventFolderCache(at: bookmarkIndex, count: r.totalFilesAnalyzed, path: folderPath)
+            appState.setEventFolderPeakIfHigher(at: bookmarkIndex, count: r.totalFilesAnalyzed)
+            appState.log("Auto-scan complete: \(name) — \(r.totalFilesAnalyzed) photos")
+            // Merge into global stats off the MainActor so EventStatsView can
+            // load from cache immediately without waiting for the combine + save.
+            let existing = appState.totalStatsReport
+            Task.detached(priority: .utility) {
+                let combined = StatsReport.combine(existing, r)
+                await MainActor.run { appState.totalStatsReport = combined }
+            }
+        }
+
         return nil
     }
 }
@@ -300,6 +332,7 @@ private struct CreateEventSheet: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.message = "Choose the main folder for \(trimmedName)"
         panel.prompt = "Select Folder"
@@ -343,6 +376,15 @@ struct TotalLibraryCard: View {
                 .lineLimit(1)
 
             Divider().background(Color.auroraStroke).padding(.vertical, 6)
+
+            Button {
+                addLibraryFolders()
+            } label: {
+                Label("Add Folder", systemImage: "folder.badge.plus")
+                    .font(.manrope(12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.auroraCyan)
 
             HStack(spacing: 16) {
                 metaItem(label: "Imports", value: "\(appState.importHistory.count)")
@@ -404,6 +446,19 @@ struct TotalLibraryCard: View {
             Text(label)
                 .font(.manrope(10.5, weight: .semibold))
                 .foregroundStyle(Color.auroraFaint)
+        }
+    }
+
+    private func addLibraryFolders() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.message = "Select folders containing RAW files to add to your library"
+        panel.prompt = "Add Folder"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            appState.addLibraryFolder(url: url)
         }
     }
 }
@@ -648,6 +703,7 @@ struct WaitingCard: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.message = "Choose where to import photos"
         panel.prompt = "Select"
@@ -851,7 +907,7 @@ private struct AuroraMiniToggle: View {
             }
         }
         .buttonStyle(.plain)
-        .help(isOn ? "Enabled" : "Disabled")
+        .auroraTooltip(isOn ? "Enabled" : "Disabled")
     }
 }
 
@@ -868,7 +924,6 @@ struct RecentEventThumb: View {
         Button(action: onTap) {
             EventThumbnail(
                 eventName: event.name,
-                folderPath: event.id,
                 cornerRadius: 14,
                 overlay: AnyView(
                     ZStack(alignment: .bottomLeading) {
@@ -942,6 +997,8 @@ struct FileBrowserRow: View {
             AdvancedView(appState: appState) {
                 showAdvanced = false
             }
+            .frame(minWidth: 1100, idealWidth: 1280, minHeight: 638, idealHeight: 638)
+            .environment(\.colorScheme, .dark)
         }
         .onChange(of: appState.activeVolume) { _, volume in
             loadSourceFiles()
