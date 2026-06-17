@@ -360,14 +360,9 @@ struct TotalLibraryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center) {
-                Text("Total Library")
-                    .font(.manrope(13, weight: .semibold))
-                    .foregroundStyle(Color.auroraMuted)
-                Spacer()
-                Button("Add Folder", action: addLibraryFolders)
-                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
-            }
+            Text("Total Library")
+                .font(.manrope(13, weight: .semibold))
+                .foregroundStyle(Color.auroraMuted)
 
             Text(AuroraFormat.count(totalPhotos))
                 .font(.auroraBigNumber)
@@ -381,7 +376,13 @@ struct TotalLibraryCard: View {
                 .foregroundStyle(Color.auroraMuted)
                 .lineLimit(1)
 
-            Divider().background(Color.auroraStroke).padding(.vertical, 6)
+            HStack {
+                Spacer()
+                Button("Add Folder", action: addLibraryFolders)
+                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            }
+
+            Divider().background(Color.auroraStroke)
 
             HStack(spacing: 16) {
                 metaItem(label: "Imports", value: "\(appState.importHistory.count)")
