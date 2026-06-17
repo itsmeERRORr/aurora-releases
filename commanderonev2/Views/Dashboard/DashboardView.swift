@@ -378,14 +378,17 @@ struct TotalLibraryCard: View {
 
             Divider().background(Color.auroraStroke).padding(.vertical, 6)
 
-            Button {
-                addLibraryFolders()
-            } label: {
-                Label("Add Folder", systemImage: "folder.badge.plus")
-                    .font(.manrope(12, weight: .semibold))
+            HStack {
+                Spacer()
+                Button {
+                    addLibraryFolders()
+                } label: {
+                    Label("Add Folder", systemImage: "folder.badge.plus")
+                        .font(.manrope(12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.auroraCyan)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.auroraCyan)
 
             HStack(spacing: 16) {
                 metaItem(label: "Imports", value: "\(appState.importHistory.count)")
