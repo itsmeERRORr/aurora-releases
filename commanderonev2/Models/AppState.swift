@@ -614,7 +614,7 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([EventSidebarNode].self, from: data) {
             eventSidebarNodes = decoded
         }
-        // Load eventFolderIsLibrary (antes dos bookmarks)
+        // Load eventFolderIsLibrary before bookmarks so syncIsLibraryCount() preserves existing flags
         if let data = UserDefaults.standard.data(forKey: "eventFolderIsLibraryData"),
            let decoded = try? PropertyListDecoder().decode([Bool].self, from: data) {
             eventFolderIsLibrary = decoded
@@ -1155,6 +1155,7 @@ final class AppState {
     }
 
     private func saveEventFolderIsLibrary() {
+        guard !isLoadingPersistedState else { return }
         guard let data = try? PropertyListEncoder().encode(eventFolderIsLibrary) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderIsLibraryData")
     }
