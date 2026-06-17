@@ -23,6 +23,8 @@ struct EventStatsView: View {
     @State private var bannerOffsetDraft = EventBannerOffset()
     @State private var bannerDragStartOffset: EventBannerOffset?
     @State private var shareErrorMessage: String?
+    @State private var scanProgress: Double = 0
+    @State private var showLockInfo = false
     @FocusState private var eventNameFieldFocused: Bool
 
     // Import history summary — available instantly, no scan needed
@@ -68,7 +70,11 @@ struct EventStatsView: View {
                 } else if let report = report, report.totalFilesAnalyzed > 0 {
                     statsContent(for: report)
                 } else if hasLoaded {
-                    emptyState
+                    if isBackgroundScanning {
+                        backgroundScanningState
+                    } else {
+                        emptyState
+                    }
                 }
             }
             .padding(.top, 48)
@@ -77,6 +83,25 @@ struct EventStatsView: View {
         }
         .onAppear {
             if !hasLoaded { loadFromCache() }
+        }
+        .onChange(of: isBackgroundScanning) { _, stillScanning in
+            if !stillScanning && report == nil {
+                scanProgress = 1.0
+                loadFromCache()
+            }
+        }
+        .task(id: isBackgroundScanning) {
+            guard isBackgroundScanning else { return }
+            // Use the real scan start time so progress resumes correctly if the
+            // user navigates away and comes back while the scan is still running.
+            let fileCount = backgroundScanFileCount
+            let estimatedSecs = fileCount > 0 ? max(3.0, Double(fileCount) * 0.030) : 30.0
+            let startTime = (bookmarkIndex.flatMap { appState.backgroundScanStartTimes[$0] }) ?? Date()
+            while !Task.isCancelled {
+                let ratio = Date().timeIntervalSince(startTime) / estimatedSecs
+                scanProgress = 1.0 - 1.0 / (1.0 + ratio * 2.0)
+                try? await Task.sleep(for: .milliseconds(400))
+            }
         }
         .onChange(of: destinationPath) { _, _ in
             hasLoaded = false
@@ -100,6 +125,16 @@ struct EventStatsView: View {
     }
 
     // MARK: - Header
+
+    private var isBackgroundScanning: Bool {
+        guard let bookmarkIndex else { return false }
+        return appState.backgroundScanningBookmarkIndices.contains(bookmarkIndex)
+    }
+
+    private var backgroundScanFileCount: Int {
+        guard let bookmarkIndex else { return 0 }
+        return appState.backgroundScanFileCount[bookmarkIndex] ?? 0
+    }
 
     private var diskIsReachable: Bool {
         guard !destinationPath.isEmpty else { return false }
@@ -129,23 +164,32 @@ struct EventStatsView: View {
                 Spacer()
             }
 
-            if let summary = importSummary {
+            if importSummary != nil || bookmarkIndex != nil {
                 VStack(spacing: 0) {
                     Spacer()
-                    Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
-                        .font(.manrope(12, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.92))
-                        .shadow(color: Color.black.opacity(0.6), radius: 6, x: 0, y: 2)
-                        .padding(18)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            LinearGradient(
-                                colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                            .allowsHitTesting(false)
+                    HStack(alignment: .center, spacing: 0) {
+                        if let summary = importSummary {
+                            Text("\(AuroraFormat.count(summary.photoCount)) photos imported")
+                                .font(.manrope(12, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.92))
+                                .shadow(color: Color.black.opacity(0.6), radius: 6, x: 0, y: 2)
+                        }
+                        Spacer()
+                        if let bookmarkIndex, !appState.isLibraryFolder(at: bookmarkIndex) {
+                            lockEventButton
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        LinearGradient(
+                            colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
+                            startPoint: .top,
+                            endPoint: .bottom
                         )
+                        .allowsHitTesting(false)
+                    )
                 }
             }
         }
@@ -179,9 +223,10 @@ struct EventStatsView: View {
                     .clipped()
             }
         } else {
+            // No explicit banner — show the Aurora gradient. The user sets a banner
+            // manually via the Banner menu; we don't auto-pick RAW files here.
             EventThumbnail(
                 eventName: currentEventName,
-                folderPath: destinationPath,
                 cornerRadius: 0
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -338,7 +383,7 @@ struct EventStatsView: View {
                 .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: beginEventNameEdit)
-                .help(bookmarkIndex == nil ? "" : "Click to rename event")
+                .auroraTooltip(bookmarkIndex == nil ? "" : "Click to rename event")
         }
     }
 
@@ -526,6 +571,138 @@ struct EventStatsView: View {
         }
     }
 
+    private var isEventLocked: Bool {
+        guard let bookmarkIndex else { return false }
+        return appState.finalizedEvent(forBookmarkIndex: bookmarkIndex) != nil
+    }
+
+    @ViewBuilder
+    private var lockEventButton: some View {
+        if isEventLocked {
+            // Locked state — amber pill communicating stats are preserved
+            HStack(spacing: 6) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Stats Locked")
+                    .font(.manrope(11, weight: .bold))
+            }
+            .foregroundStyle(Color.auroraGold)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(Color.auroraGold.opacity(0.18))
+                    .overlay(Capsule().strokeBorder(Color.auroraGold.opacity(0.45), lineWidth: 1))
+            )
+            .onTapGesture { confirmUnlock() }
+            .auroraTooltip("Stats are locked. Tap to reopen this event.")
+        } else {
+            // Unlocked state — CTA + info icon
+            HStack(spacing: 6) {
+                Button(action: confirmLock) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Lock Event")
+                            .font(.manrope(11, weight: .bold))
+                    }
+                    .foregroundStyle(.white.opacity(0.75))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(0.10))
+                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+                    )
+                }
+                .buttonStyle(.plain)
+
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .onHover { showLockInfo = $0 }
+                    .popover(isPresented: $showLockInfo, arrowEdge: .bottom) {
+                        lockInfoPopover
+                    }
+            }
+        }
+    }
+
+    private var lockInfoPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 9) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color.auroraViolet)
+                Text("Lock Event")
+                    .font(.sora(14, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+            }
+            .padding(.bottom, 12)
+
+            VStack(alignment: .leading, spacing: 10) {
+                lockInfoRow(
+                    icon: "checkmark.circle.fill", color: .auroraHealthy,
+                    text: "Saves a permanent snapshot of all stats for this event."
+                )
+                lockInfoRow(
+                    icon: "folder.badge.questionmark", color: .auroraGold,
+                    text: "Lock before moving or deleting the folder — guarantees every file contributes to your lifetime stats."
+                )
+                lockInfoRow(
+                    icon: "hand.thumbsup.fill", color: .auroraCyan,
+                    text: "After locking, you're free to move, rename, or delete the folder without losing any data."
+                )
+            }
+        }
+        .padding(16)
+        .frame(width: 272)
+        .background(Color.auroraPanel)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func lockInfoRow(icon: String, color: Color, text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 18)
+            Text(text)
+                .font(.manrope(12, weight: .medium))
+                .foregroundStyle(Color.auroraMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func confirmLock() {
+        guard let bookmarkIndex else { return }
+        let alert = NSAlert()
+        alert.messageText = "Lock \(currentEventName)?"
+        alert.informativeText = "All current stats will be saved permanently. You can reopen this event later if needed."
+        alert.addButton(withTitle: "Lock Event")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if appState.finalizeEvent(at: bookmarkIndex) == nil {
+            let warn = NSAlert()
+            warn.messageText = "No scan data found"
+            warn.informativeText = "Run a scan first using the Refresh button, then lock the event."
+            warn.addButton(withTitle: "OK")
+            warn.runModal()
+        }
+    }
+
+    private func confirmUnlock() {
+        guard let bookmarkIndex else { return }
+        let alert = NSAlert()
+        alert.messageText = "Reopen \(currentEventName)?"
+        alert.informativeText = "The saved snapshot will be removed and the event will return to live counts."
+        alert.addButton(withTitle: "Reopen Event")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        appState.reopenEvent(at: bookmarkIndex)
+    }
+
     private var eventBannerImagePath: String? {
         guard let bookmarkIndex,
               bookmarkIndex >= 0,
@@ -615,6 +792,40 @@ struct EventStatsView: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 160)
+        .auroraStaticCard()
+    }
+
+    private var backgroundScanningState: some View {
+        let fileCount = backgroundScanFileCount
+        let pct = Int((scanProgress * 100).rounded())
+        let subtitle = fileCount > 0
+            ? "Scanning \(fileCount) RAW files…"
+            : "Scanning photos…"
+
+        return VStack(spacing: 14) {
+            HStack {
+                Text(subtitle)
+                    .font(.manrope(15, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+                Spacer()
+                Text("\(pct)%")
+                    .font(.manrope(15, weight: .bold))
+                    .foregroundStyle(Color.auroraViolet)
+                    .monospacedDigit()
+                    .animation(.none, value: pct)
+            }
+
+            ProgressView(value: scanProgress)
+                .tint(Color.auroraViolet)
+                .animation(.linear(duration: 0.4), value: scanProgress)
+
+            Text("Scan time may vary depending on the number of RAW files in this folder.")
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, minHeight: 120)
         .auroraStaticCard()
     }
 
