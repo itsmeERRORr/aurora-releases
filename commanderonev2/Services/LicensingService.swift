@@ -146,6 +146,58 @@ enum LicensingService {
         }
     }
 
+    // MARK: - Cancel subscription
+
+    enum CancelResult {
+        case success(expiresAt: Date?)
+        case notFound
+        case unauthorized
+        case alreadyCancelled
+        case networkError(String)
+    }
+
+    static func cancelSubscription() async -> CancelResult {
+        guard let activation = storedActivation(),
+              let uuid = hardwareUUID() else {
+            return .networkError("Could not read activation or hardware UUID.")
+        }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/cancel-subscription") else {
+            return .networkError("Invalid URL.")
+        }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(anonKey, forHTTPHeaderField: "apikey")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "license_key": activation.key,
+            "mac_uuid": uuid,
+        ])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .networkError("Invalid server response.")
+            }
+            switch http.statusCode {
+            case 200:
+                let expiresAt = (json["expires_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+                return .success(expiresAt: expiresAt)
+            case 400 where (json["error"] as? String) == "Already cancelled":
+                return .alreadyCancelled
+            case 403:
+                return .unauthorized
+            case 404:
+                return .notFound
+            default:
+                return .networkError(json["error"] as? String ?? "Unknown error.")
+            }
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
     // MARK: - Admin: create manual license (Beta only)
     // Calls the admin-create-license Edge Function.
     // Requires ADMIN_SECRET to be configured in Supabase and stored in Keychain.

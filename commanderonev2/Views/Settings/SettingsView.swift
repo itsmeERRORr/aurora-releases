@@ -31,6 +31,9 @@ struct SettingsView: View {
     @State private var licenseIsActive = LicensingService.isActivated()
     @State private var isActivatingLicense = false
     @State private var showKeysManagement = false
+    @State private var showCancelConfirm = false
+    @State private var isCancelling = false
+    @State private var cancelSuccessMessage: String?
 
     var body: some View {
         ScrollView {
@@ -203,12 +206,67 @@ struct SettingsView: View {
             }
             .buttonStyle(.plain)
 
-            Button(action: stripeAction(baseURL: stripePortalURL, email: email)) {
-                Label("Manage subscription / Cancel", systemImage: "arrow.up.right.square")
+            if let msg = cancelSuccessMessage {
+                Text(msg)
                     .font(.manrope(11, weight: .semibold))
-                    .foregroundStyle(Color.auroraMuted)
+                    .foregroundStyle(Color.auroraFaint)
+            } else {
+                Button {
+                    showCancelConfirm = true
+                } label: {
+                    if isCancelling {
+                        Label("Cancelling…", systemImage: "hourglass")
+                            .font(.manrope(11, weight: .semibold))
+                            .foregroundStyle(Color.auroraMuted)
+                    } else {
+                        Label("Cancel subscription", systemImage: "xmark.circle")
+                            .font(.manrope(11, weight: .semibold))
+                            .foregroundStyle(Color.auroraMuted)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isCancelling)
+                .confirmationDialog(
+                    "Cancel subscription?",
+                    isPresented: $showCancelConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("Cancel subscription", role: .destructive) {
+                        performCancellation(activation: activation)
+                    }
+                    Button("Keep subscription", role: .cancel) {}
+                } message: {
+                    if let exp = activation?.expiresAt {
+                        Text("Are you sure? You'll keep full access until \(exp.formatted(date: .long, time: .omitted)).")
+                    } else {
+                        Text("Are you sure you want to cancel your Pro subscription?")
+                    }
+                }
             }
-            .buttonStyle(.plain)
+        }
+    }
+
+    private func performCancellation(activation: LicensingService.StoredActivation?) {
+        isCancelling = true
+        Task { @MainActor in
+            let result = await LicensingService.cancelSubscription()
+            isCancelling = false
+            switch result {
+            case .success(let expiresAt):
+                if let exp = expiresAt {
+                    cancelSuccessMessage = "Sorry to see you go. You keep full access until \(exp.formatted(date: .long, time: .omitted))."
+                } else {
+                    cancelSuccessMessage = "Subscription cancelled. You keep access until the end of your current period."
+                }
+            case .alreadyCancelled:
+                cancelSuccessMessage = "Your subscription was already cancelled."
+            case .notFound:
+                licenseStatus = "License not found on the server."
+            case .unauthorized:
+                licenseStatus = "Could not verify your identity."
+            case .networkError(let msg):
+                licenseStatus = msg
+            }
         }
     }
 
