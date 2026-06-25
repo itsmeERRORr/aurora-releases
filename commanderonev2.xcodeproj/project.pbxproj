@@ -60,6 +60,7 @@
 				8C8FC2F72F28C6CD00200835 /* Sources */,
 				8C8FC2F82F28C6CD00200835 /* Frameworks */,
 				8C8FC2F92F28C6CD00200835 /* Resources */,
+				8C598E772FE158AF00FB18FC /* ShellScript */,
 			);
 			buildRules = (
 			);
@@ -122,6 +123,26 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		8C598E772FE158AF00FB18FC /* ShellScript */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "chmod +x \"$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/Resources/exiftool\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		8C8FC2F72F28C6CD00200835 /* Sources */ = {
@@ -255,7 +276,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = commanderonev2/commanderonev2.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 32;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -267,7 +288,7 @@
 				INFOPLIST_KEY_NSRemovableVolumesUsageDescription = "Aurora needs access to removable camera cards to detect and import RAW files.";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1.3;
+				MARKETING_VERSION = 1.2.20;
 				PRODUCT_BUNDLE_IDENTIFIER = errormedia.commanderonev2.beta;
 				PRODUCT_NAME = "Aurora Beta";
 				SDKROOT = macosx;
@@ -288,7 +309,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = commanderonev2/commanderonev2.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 32;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -303,7 +324,7 @@
 				INFOPLIST_KEY_SUPublicEDKey = "xH+GSsp27B0eJAl/fR4hCf3OyHk+NdhRZ7+VqkQjTbc=";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1.3;
+				MARKETING_VERSION = 1.2.20;
 				PRODUCT_BUNDLE_IDENTIFIER = errormedia.commanderonev2;
 				PRODUCT_NAME = Aurora;
 				SDKROOT = macosx;

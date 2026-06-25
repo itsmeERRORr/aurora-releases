@@ -54,7 +54,7 @@ struct LicenseEntryView: View {
                         .foregroundStyle(Color.auroraViolet)
                         .frame(width: 16)
 
-                    TextField("AURORA-XXXX-XXXX-XXXX", text: $licenseKey)
+                    TextField("", text: $licenseKey, prompt: Text("AURORA-XXXX-XXXX-XXXX").foregroundColor(Color.auroraMuted))
                         .textFieldStyle(.plain)
                         .font(.manrope(13, weight: .medium))
                         .foregroundStyle(Color.auroraTxt)
@@ -123,6 +123,7 @@ struct LicenseEntryView: View {
                 RoundedRectangle(cornerRadius: AuroraRadius.medium)
                     .stroke(Color.auroraStroke, lineWidth: 1)
             )
+            .environment(\.colorScheme, .dark)
         }
     }
 
@@ -133,26 +134,23 @@ struct LicenseEntryView: View {
         isActivating = true
         status = nil
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = LicensingService.validateCode(key)
+        Task { @MainActor in
+            let result = await LicensingService.activate(with: key)
+            isActivating = false
 
-            DispatchQueue.main.async {
-                isActivating = false
-
-                switch result {
-                case .valid:
-                    LicensingService.activate(with: key)
-                    status = .success
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        isPresented = false
-                    }
-                case .invalid:
-                    status = .error("Invalid or expired code.")
-                case .expired:
-                    status = .error("This code has expired.")
-                case .noPublicKey:
-                    status = .error("Licensing not configured.")
-                }
+            switch result {
+            case .success:
+                status = .success
+                try? await Task.sleep(for: .seconds(1))
+                isPresented = false
+            case .notFound:
+                status = .error("License key not found.")
+            case .alreadyActivatedOnAnotherMac:
+                status = .error("This key is already in use on another Mac.")
+            case .inactive(let reason):
+                status = .error(reason)
+            case .networkError(let msg):
+                status = .error(msg)
             }
         }
     }

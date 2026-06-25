@@ -12,6 +12,8 @@ struct SettingsView: View {
     @State private var showCopyDataConfirm = false
     @State private var showDeleteEventsConfirm = false
     @State private var showResetDashboardConfirm = false
+    @State private var showMockDataConfirm = false
+    @State private var mockDataStatus: String?
     @State private var deleteEventsStatus: String?
     @State private var copyDataStatus: String?
     @State private var publishBumpKind = "patch"
@@ -27,9 +29,8 @@ struct SettingsView: View {
     @State private var licenseKey = ""
     @State private var licenseStatus: String?
     @State private var licenseIsActive = LicensingService.isActivated()
-    @State private var betaGenExpiryDays = 0
-    @State private var betaGenResult: String?
-    @State private var betaGenCopied = false
+    @State private var isActivatingLicense = false
+    @State private var showKeysManagement = false
 
     var body: some View {
         ScrollView {
@@ -49,6 +50,10 @@ struct SettingsView: View {
         .scrollIndicators(.hidden)
         .onAppear {
             loadTelegramSettings()
+        }
+        .sheet(isPresented: $showKeysManagement) {
+            KeysManagementView()
+                .frame(minWidth: 600, minHeight: 500)
         }
         .alert("Reset all stats?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -76,67 +81,323 @@ struct SettingsView: View {
 
     // MARK: - License
 
+    // MARK: - Stripe URLs
+    private let stripeProURL      = "https://buy.stripe.com/test_28E3cx0Jgb6IceT2ny8Zq00"
+    private let stripeLifetimeURL = "https://buy.stripe.com/test_7sY00l0Jggr2a6LbY88Zq02"
+    // TODO: substituir pelo link do Customer Portal quando estiver em produção
+    private let stripePortalURL   = "https://billing.stripe.com/p/login/YOUR_PORTAL_LINK"
+
     private var licenseSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             AuroraPanelHeader(title: "License")
 
             VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 12) {
-                    IconChip(systemName: "key.fill", color: licenseIsActive ? .auroraHealthy : .auroraLive)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(licenseIsActive ? "Activated" : "Not Activated")
-                            .font(.manrope(13, weight: .bold))
-                            .foregroundStyle(Color.auroraTxt)
-                        Text("Enter an activation code to activate Aurora.")
-                            .font(.manrope(11, weight: .medium))
-                            .foregroundStyle(Color.auroraFaint)
-                    }
-                    Spacer()
-                    if licenseIsActive {
-                        Button("Deactivate") {
-                            LicensingService.deactivate()
-                            licenseIsActive = false
-                            licenseStatus = "Deactivated."
-                            showLicenseOverlay = true
-                        }
-                        .buttonStyle(AuroraGhostButtonStyle())
-                    }
-                }
-
-                if !licenseIsActive {
-                    HStack(spacing: 10) {
-                        TextField("AURORA-XXXX-XXXX-XXXX", text: $licenseKey)
-                            .textFieldStyle(.plain)
-                            .font(.manrope(12, weight: .medium))
-                            .foregroundStyle(Color.auroraTxt)
-                            .padding(8)
-                            .background(Color.auroraPanel)
-                            .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
-                        Button("Activate") {
-                            let code = licenseKey.trimmingCharacters(in: .whitespaces)
-                            guard !code.isEmpty else { return }
-                            if LicensingService.activate(with: code) {
-                                licenseIsActive = true
-                                licenseStatus = nil
-                                licenseKey = ""
-                            } else {
-                                licenseStatus = "Invalid or expired code."
-                            }
-                        }
-                        .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                        .disabled(licenseKey.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
+                if licenseIsActive {
+                    activatedLicenseView
+                } else {
+                    notActivatedView
                 }
 
                 if let status = licenseStatus {
                     Text(status)
                         .font(.manrope(11, weight: .semibold))
-                        .foregroundStyle(status.contains("Invalid") || status.contains("Deactivated") ? .red : .green)
+                        .foregroundStyle(status.contains("not found") || status.contains("use on") || status.contains("Deactivated") ? .red : .green)
                 }
             }
             .padding(.horizontal, 6)
         }
         .auroraStaticCard()
+    }
+
+    @ViewBuilder
+    private var activatedLicenseView: some View {
+        let activation = LicensingService.storedActivation()
+        let plan = activation?.plan ?? "pro"
+        let email = activation?.customerEmail
+
+        switch plan {
+        case "lifetime":
+            lifetimePlanRow(email: email)
+        case "free":
+            freePlanRow(email: email)
+        default:
+            proPlanRow(activation: activation, email: email)
+        }
+    }
+
+    private func lifetimePlanRow(email: String?) -> some View {
+        HStack(spacing: 12) {
+            IconChip(systemName: "infinity", color: .auroraGold, size: 36, iconScale: 0.5)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Lifetime License")
+                        .font(.manrope(13, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    planBadge("LIFETIME", color: .auroraGold)
+                }
+                Text("Full access forever. Thank you for supporting Aurora.")
+                    .font(.manrope(11, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+            }
+            Spacer()
+            deactivateButton
+        }
+    }
+
+    private func proPlanRow(activation: LicensingService.StoredActivation?, email: String?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                IconChip(systemName: "key.fill", color: .auroraCyan, size: 36, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Pro License")
+                            .font(.manrope(13, weight: .bold))
+                            .foregroundStyle(Color.auroraTxt)
+                        planBadge("PRO", color: .auroraCyan)
+                    }
+                    if let exp = activation?.expiresAt {
+                        Text("Active until \(exp.formatted(date: .long, time: .omitted))")
+                            .font(.manrope(11, weight: .medium))
+                            .foregroundStyle(Color.auroraFaint)
+                    } else {
+                        Text("Active")
+                            .font(.manrope(11, weight: .medium))
+                            .foregroundStyle(Color.auroraFaint)
+                    }
+                }
+                Spacer()
+                deactivateButton
+            }
+
+            // Lifetime upgrade banner
+            Button(action: stripeAction(baseURL: stripeLifetimeURL, email: email)) {
+                HStack(spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.auroraGold.opacity(0.15))
+                            .frame(width: 36, height: 36)
+                        Image(systemName: "infinity")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(Color.auroraGold)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Upgrade to Lifetime")
+                            .font(.manrope(13, weight: .black))
+                            .foregroundStyle(Color.auroraTxt)
+                        Text("Pay once. No renewals. Yours forever.")
+                            .font(.manrope(11, weight: .medium))
+                            .foregroundStyle(Color.auroraFaint)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Color.auroraGold)
+                }
+                .padding(12)
+                .background(Color.auroraGold.opacity(0.07))
+                .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
+                .overlay(
+                    RoundedRectangle(cornerRadius: AuroraRadius.small)
+                        .stroke(Color.auroraGold.opacity(0.35), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+
+            Button(action: stripeAction(baseURL: stripePortalURL, email: email)) {
+                Label("Manage subscription / Cancel", systemImage: "arrow.up.right.square")
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(Color.auroraMuted)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func freePlanRow(email: String?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                IconChip(systemName: "key.fill", color: .auroraFaint, size: 36, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Free License")
+                            .font(.manrope(13, weight: .bold))
+                            .foregroundStyle(Color.auroraTxt)
+                        planBadge("FREE", color: .auroraFaint)
+                    }
+                    Text("Upgrade to unlock all features.")
+                        .font(.manrope(11, weight: .medium))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+                Spacer()
+                deactivateButton
+            }
+            upgradeCards(email: email)
+        }
+    }
+
+    private var notActivatedView: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                IconChip(systemName: "key.fill", color: .auroraLive, size: 36, iconScale: 0.5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Not Activated")
+                        .font(.manrope(13, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    Text("Enter your license key or choose a plan below.")
+                        .font(.manrope(11, weight: .medium))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                TextField("AURORA-XXXX-XXXX-XXXX", text: $licenseKey)
+                    .textFieldStyle(.plain)
+                    .font(.manrope(12, weight: .medium))
+                    .foregroundStyle(Color.auroraTxt)
+                    .padding(8)
+                    .background(Color.auroraPanel)
+                    .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
+                Button(isActivatingLicense ? "Checking…" : "Activate") {
+                    let code = licenseKey.trimmingCharacters(in: .whitespaces)
+                    guard !code.isEmpty else { return }
+                    isActivatingLicense = true
+                    licenseStatus = nil
+                    Task { @MainActor in
+                        let result = await LicensingService.activate(with: code)
+                        isActivatingLicense = false
+                        switch result {
+                        case .success:
+                            appState.refreshLicenseStatus()
+                            licenseIsActive = true
+                            licenseKey = ""
+                        case .notFound:
+                            licenseStatus = "License key not found."
+                        case .alreadyActivatedOnAnotherMac:
+                            licenseStatus = "Key already in use on another Mac."
+                        case .inactive(let reason):
+                            licenseStatus = reason
+                        case .networkError(let msg):
+                            licenseStatus = msg
+                        }
+                    }
+                }
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+                .disabled(licenseKey.trimmingCharacters(in: .whitespaces).isEmpty || isActivatingLicense)
+            }
+
+            upgradeCards(email: nil)
+        }
+    }
+
+    private func upgradeCards(email: String?) -> some View {
+        HStack(spacing: 10) {
+            upgradeCard(
+                icon: "bolt.fill",
+                title: "Pro",
+                description: "Monthly or yearly.\nCancel any time.",
+                accent: Color.auroraCyan,
+                label: "Get Pro",
+                baseURL: stripeProURL,
+                email: email
+            )
+            upgradeCard(
+                icon: "infinity",
+                title: "Lifetime",
+                description: "Pay once.\nYours forever.",
+                accent: Color.auroraGold,
+                label: "Get Lifetime",
+                baseURL: stripeLifetimeURL,
+                email: email
+            )
+        }
+    }
+
+    private func upgradeCard(icon: String, title: String, description: String, accent: Color, label: String, baseURL: String, email: String?) -> some View {
+        Button(action: stripeAction(baseURL: baseURL, email: email)) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(accent)
+                    Text(title)
+                        .font(.manrope(15, weight: .black))
+                        .foregroundStyle(Color.auroraTxt)
+                    Spacer()
+                }
+                Text(description)
+                    .font(.manrope(11, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(2)
+
+                Text(label)
+                    .font(.manrope(12, weight: .bold))
+                    .foregroundStyle(accent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(accent.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(accent.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
+            .overlay(
+                RoundedRectangle(cornerRadius: AuroraRadius.small)
+                    .stroke(accent.opacity(0.4), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Shared components
+
+    private var deactivateButton: some View {
+        Button("Deactivate") {
+            LicensingService.deactivate()
+            appState.refreshLicenseStatus()
+            licenseIsActive = false
+            licenseStatus = nil
+        }
+        .buttonStyle(AuroraGhostButtonStyle())
+    }
+
+    private func planBadge(_ label: String, color: Color) -> some View {
+        Text(label)
+            .font(.manrope(9, weight: .black))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15))
+            .clipShape(Capsule())
+    }
+
+    private enum StripeButtonStyle { case gradient, ghost }
+
+    @ViewBuilder
+    private func stripeButton(label: String, icon: String, baseURL: String, email: String?, style: StripeButtonStyle) -> some View {
+        let action = stripeAction(baseURL: baseURL, email: email)
+        if style == .gradient {
+            Button(action: action) { Label(label, systemImage: icon) }
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+        } else {
+            Button(action: action) { Label(label, systemImage: icon) }
+                .buttonStyle(AuroraGhostButtonStyle())
+        }
+    }
+
+    private func stripeAction(baseURL: String, email: String?) -> () -> Void {
+        {
+            var urlString = baseURL
+            let sep = baseURL.contains("?") ? "&" : "?"
+            if let email, !email.isEmpty,
+               let encoded = email.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                urlString += "\(sep)prefilled_email=\(encoded)&client_reference_id=aurora-app"
+            } else {
+                urlString += "\(sep)client_reference_id=aurora-app"
+            }
+            if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
+        }
     }
 
     // MARK: - Beta Key Generator
@@ -147,80 +408,20 @@ struct SettingsView: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 12) {
-                    IconChip(systemName: "wand.and.stars", color: .auroraViolet)
+                    IconChip(systemName: "key.fill", color: .auroraHealthy)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Generate Activation Code")
+                        Text("Manage Named Keys")
                             .font(.manrope(13, weight: .bold))
                             .foregroundStyle(Color.auroraTxt)
-                        Text("Generate a code anyone can use to activate Aurora on their Mac.")
+                        Text("Create Supabase licenses for friends or colleagues.")
                             .font(.manrope(11, weight: .medium))
                             .foregroundStyle(Color.auroraFaint)
                     }
-                }
-
-                if let activation = LicensingService.storedActivation() {
-                    HStack(spacing: 8) {
-                        Text("UUID: \(activation.uuid)")
-                            .font(.manrope(10, weight: .medium))
-                            .foregroundStyle(Color.auroraFaint)
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(activation.uuid, forType: .string)
-                        } label: {
-                            Image(systemName: "doc.on.doc")
-                                .font(.system(size: 9))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.auroraMuted)
-                    }
-                }
-
-                HStack(spacing: 10) {
-                    Text("Expiry")
-                        .font(.manrope(12, weight: .semibold))
-                        .foregroundStyle(Color.auroraTxt)
-                    ForEach([0, 7, 30, 90, 365], id: \.self) { days in
-                        Button(days == 0 ? "None" : "\(days)d") { betaGenExpiryDays = days }
-                            .buttonStyle(AuroraGhostButtonStyle(active: betaGenExpiryDays == days))
-                    }
                     Spacer()
-                    Button("Generate") {
-                        let code = LicensingService.generateActivationCode(expiryDays: betaGenExpiryDays)
-                        betaGenResult = code
-                        betaGenCopied = false
+                    Button("Keys →") {
+                        showKeysManagement = true
                     }
                     .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                    .disabled(!LicensingService.keyPairExists())
-                }
-
-                if !LicensingService.keyPairExists() {
-                    Text("No key pair found. Run: python3 scripts/generate-license-key.py --gen-key")
-                        .font(.manrope(11, weight: .semibold))
-                        .foregroundStyle(.orange)
-                }
-
-                if let result = betaGenResult {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(result)
-                                .font(.manrope(10, weight: .medium))
-                                .foregroundStyle(Color.auroraTxt)
-                                .lineLimit(3)
-                                .textSelection(.enabled)
-                            Spacer()
-                            Button("Copy") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(result, forType: .string)
-                                betaGenCopied = true
-                            }
-                            .buttonStyle(AuroraGhostButtonStyle())
-                        }
-                        if betaGenCopied {
-                            Text("Copied to clipboard!")
-                                .font(.manrope(11, weight: .semibold))
-                                .foregroundStyle(.green)
-                        }
-                    }
                 }
             }
             .padding(.horizontal, 6)
@@ -241,6 +442,9 @@ struct SettingsView: View {
                 toggleRow(label: "Auto-eject",
                           help: "Eject the card once the import finishes.",
                           binding: $appState.autoEject)
+                toggleRow(label: "Auto-subfolders",
+                          help: "Organize imports into Year/Date subfolders automatically (e.g. 2026/14-06-2026).",
+                          binding: $appState.autoSubfolders)
                 modePicker
             }
             .padding(.horizontal, 6)
@@ -736,6 +940,26 @@ struct SettingsView: View {
                         Button("Reset All") { showResetDashboardConfirm = true }
                             .buttonStyle(AuroraGhostButtonStyle())
                     }
+
+                    HStack(spacing: 12) {
+                        IconChip(systemName: "sparkles", color: .auroraCyan)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Generate Mock Data")
+                                .font(.manrope(13, weight: .bold))
+                                .foregroundStyle(Color.auroraTxt)
+                            Text("Creates football event data, stats and import history for demo/promo purposes.")
+                                .font(.manrope(11, weight: .medium))
+                                .foregroundStyle(Color.auroraFaint)
+                        }
+                        Spacer()
+                        Button("Generate") { showMockDataConfirm = true }
+                            .buttonStyle(AuroraGhostButtonStyle())
+                    }
+                    if let mockDataStatus {
+                        Text(mockDataStatus)
+                            .font(.manrope(11, weight: .semibold))
+                            .foregroundStyle(mockDataStatus.contains("Done") ? .green : Color.auroraMuted)
+                    }
                 }
             }
             .padding(.horizontal, 6)
@@ -758,6 +982,12 @@ struct SettingsView: View {
             Button("Reset Everything", role: .destructive) { resetDashboard() }
         } message: {
             Text("This will erase ALL data: events, stats, history, banners, import settings and logs. The app will be like new. This cannot be undone.")
+        }
+        .alert("Generate Mock Data?", isPresented: $showMockDataConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Generate") { generateMockData() }
+        } message: {
+            Text("This will create football event data, stats and import history. Existing data will be replaced.")
         }
     }
 
@@ -964,5 +1194,493 @@ struct SettingsView: View {
 
         // 8. Log
         appState.log("Dashboard factory reset — all data cleared", level: .warning)
+    }
+
+    // MARK: - Mock Data Generator
+
+    private func generateMockData() {
+        let fm = FileManager.default
+        let cal = Calendar.current
+        let root = AppPaths.applicationSupportRoot
+
+        func makeDate(year: Int, month: Int, day: Int, hour: Int = 14, minute: Int = 30) -> Date {
+            var c = DateComponents()
+            c.year = year; c.month = month; c.day = day; c.hour = hour; c.minute = minute
+            return cal.date(from: c) ?? Date()
+        }
+        func makePath(_ name: String) -> String {
+            root.appendingPathComponent("mock_events/\(name)").path
+        }
+
+        // MARK: - Events (diverse categories)
+        struct MockEvent {
+            let name: String
+            let photos: Int
+            let gigabytes: Double
+            let source: String
+            let year: Int, month: Int, day: Int
+            let cameras: [(make: String, model: String, pct: Double)]
+            let lenses: [(make: String, model: String, pct: Double)]
+            let searchTerm: String
+        }
+
+        let events: [MockEvent] = [
+            // Football
+            MockEvent(name: "Benfica vs Porto", photos: 1824, gigabytes: 168, source: "CF-AB-256GB",
+                      year: 2026, month: 1, day: 15,
+                      cameras: [("Sony", "ILCE-9M3", 0.55), ("Sony", "ILCE-7M4", 0.25), ("Canon", "EOS R5", 0.12), ("Nikon", "Z 8", 0.08)],
+                      lenses: [("Sony", "FE 400mm F2.8 GM OSS", 0.30), ("Sony", "FE 70-200mm F2.8 GM II", 0.25), ("Sony", "FE 24-70mm F2.8 GM", 0.25), ("Sony", "FE 14mm F1.8 GM", 0.20)],
+                      searchTerm: "football+stadium+night+lights"),
+            MockEvent(name: "Sporting — Champions League", photos: 2400, gigabytes: 220, source: "CF-AB-256GB",
+                      year: 2025, month: 12, day: 10,
+                      cameras: [("Sony", "ILCE-9M3", 0.60), ("Sony", "ILCE-1", 0.40)],
+                      lenses: [("Sony", "FE 400mm F2.8 GM OSS", 0.35), ("Sony", "FE 70-200mm F2.8 GM II", 0.30), ("Sony", "FE 135mm F1.8 GM", 0.20), ("Sony", "FE 16-35mm F2.8 GM", 0.15)],
+                      searchTerm: "soccer+champions+league+goal"),
+            MockEvent(name: "World Cup Qualifier", photos: 5200, gigabytes: 84.7, source: "CF-AB-256GB",
+                      year: 2025, month: 11, day: 18,
+                      cameras: [("Sony", "ILCE-1", 0.50), ("Sony", "ILCE-9M3", 0.35), ("Sony", "ILCE-7RM5", 0.15)],
+                      lenses: [("Sony", "FE 600mm F4 GM OSS", 0.28), ("Sony", "FE 400mm F2.8 GM OSS", 0.25), ("Sony", "FE 70-200mm F2.8 GM II", 0.22), ("Sony", "FE 24-70mm F2.8 GM", 0.15), ("Sony", "FE 14mm F1.8 GM", 0.10)],
+                      searchTerm: "world+cup+football+celebration"),
+            MockEvent(name: "FA Cup Semi-Final", photos: 2800, gigabytes: 45.2, source: "CF-AB-256GB",
+                      year: 2025, month: 10, day: 5,
+                      cameras: [("Sony", "ILCE-9M3", 0.50), ("Sony", "ILCE-7M4", 0.30), ("Sony", "ILCE-7SM3", 0.20)],
+                      lenses: [("Sony", "FE 300mm F2.8 GM OSS", 0.28), ("Sony", "FE 70-200mm F2.8 GM II", 0.25), ("Sony", "FE 24-70mm F2.8 GM", 0.25), ("Sony", "FE 85mm F1.4 GM", 0.22)],
+                      searchTerm: "football+cup+match+action"),
+            // Music festivals
+            MockEvent(name: "NOS Alive — Day 1", photos: 3100, gigabytes: 285, source: "SD-PG-128GB",
+                      year: 2026, month: 2, day: 20,
+                      cameras: [("Sony", "ILCE-9M3", 0.45), ("Sony", "ILCE-7M4", 0.35), ("Leica", "Q3", 0.20)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.35), ("Sony", "FE 70-200mm F2.8 GM II", 0.25), ("Sony", "FE 50mm F1.4 GM", 0.20), ("Sony", "FE 16-35mm F2.8 GM", 0.20)],
+                      searchTerm: "music+festival+crowd+stage+lights"),
+            MockEvent(name: "MEO Arena — Coldplay", photos: 3800, gigabytes: 350, source: "CF-AB-256GB",
+                      year: 2026, month: 5, day: 28,
+                      cameras: [("Sony", "ILCE-9M3", 0.50), ("Sony", "ILCE-7M4", 0.30), ("Canon", "EOS R5", 0.20)],
+                      lenses: [("Sony", "FE 70-200mm F2.8 GM II", 0.30), ("Sony", "FE 24-70mm F2.8 GM", 0.30), ("Sony", "FE 50mm F1.4 GM", 0.25), ("Canon", "RF 70-200mm F2.8L", 0.15)],
+                      searchTerm: "concert+arena+band+performance+stage"),
+            MockEvent(name: "Rock in Rio — Main Stage", photos: 4100, gigabytes: 378, source: "CF-AB-256GB",
+                      year: 2025, month: 9, day: 22,
+                      cameras: [("Sony", "ILCE-9M3", 0.55), ("Sony", "ILCE-1", 0.25), ("Canon", "EOS R5", 0.20)],
+                      lenses: [("Sony", "FE 70-200mm F2.8 GM II", 0.30), ("Sony", "FE 24-70mm F2.8 GM", 0.25), ("Sony", "FE 50mm F1.4 GM", 0.20), ("Canon", "RF 50mm F1.2L", 0.15), ("Sony", "FE 16-35mm F2.8 GM", 0.10)],
+                      searchTerm: "rock+concert+stage+pyrotechnics+crowd"),
+            // Esports
+            MockEvent(name: "ESL Pro League Finals", photos: 4200, gigabytes: 390, source: "CF-AB-256GB",
+                      year: 2026, month: 4, day: 10,
+                      cameras: [("Sony", "ILCE-9M3", 0.50), ("Sony", "ILCE-7M4", 0.30), ("Nikon", "Z 8", 0.20)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.35), ("Sony", "FE 70-200mm F2.8 GM II", 0.25), ("Nikon", "Z 70-200mm f/2.8", 0.20), ("Sony", "FE 50mm F1.4 GM", 0.20)],
+                      searchTerm: "esports+gaming+tournament+arena+screens"),
+            MockEvent(name: "Valorant Champions Tour", photos: 2800, gigabytes: 258, source: "SD-PG-128GB",
+                      year: 2025, month: 11, day: 5,
+                      cameras: [("Sony", "ILCE-7M4", 0.45), ("Sony", "ILCE-9M3", 0.35), ("Canon", "EOS R5", 0.20)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.30), ("Sony", "FE 50mm F1.4 GM", 0.25), ("Canon", "RF 50mm F1.2L", 0.25), ("Sony", "FE 85mm F1.4 GM", 0.20)],
+                      searchTerm: "esports+gaming+competition+neon"),
+            // Product / commercial
+            MockEvent(name: "Watch Shoot — TAG Heuer", photos: 980, gigabytes: 92, source: "CF-AB-256GB",
+                      year: 2026, month: 3, day: 5,
+                      cameras: [("Sony", "ILCE-7RM5", 0.60), ("Leica", "Q3", 0.40)],
+                      lenses: [("Sony", "FE 90mm F2.8 Macro", 0.40), ("Sony", "FE 50mm F1.4 GM", 0.35), ("Leica", "Summilux 28mm", 0.25)],
+                      searchTerm: "luxury+watch+product+photography+studio"),
+            MockEvent(name: "Studio — Fashion Lookbook", photos: 2200, gigabytes: 203, source: "CF-AB-256GB",
+                      year: 2026, month: 6, day: 12,
+                      cameras: [("Sony", "ILCE-7RM5", 0.50), ("Canon", "EOS R5", 0.30), ("Sony", "ILCE-7M4", 0.20)],
+                      lenses: [("Sony", "FE 85mm F1.4 GM", 0.35), ("Canon", "RF 50mm F1.2L", 0.30), ("Sony", "FE 24-70mm F2.8 GM", 0.20), ("Sony", "FE 135mm F1.8 GM", 0.15)],
+                      searchTerm: "fashion+photoshoot+studio+model+lighting"),
+            // Wedding / portrait
+            MockEvent(name: "Wedding — Ana & Tiago", photos: 5400, gigabytes: 498, source: "CF-AB-256GB",
+                      year: 2026, month: 4, day: 25,
+                      cameras: [("Sony", "ILCE-9M3", 0.45), ("Sony", "ILCE-7M4", 0.35), ("Canon", "EOS R5", 0.20)],
+                      lenses: [("Sony", "FE 70-200mm F2.8 GM II", 0.28), ("Sony", "FE 24-70mm F2.8 GM", 0.25), ("Sony", "FE 85mm F1.4 GM", 0.22), ("Canon", "RF 50mm F1.2L", 0.15), ("Sony", "FE 35mm F1.4 GM", 0.10)],
+                      searchTerm: "wedding+couple+romantic+flowers+bouquet"),
+            // Nature / bird watching
+            MockEvent(name: "Bird Watch — Sintra", photos: 2100, gigabytes: 195, source: "SD-PG-128GB",
+                      year: 2026, month: 3, day: 18,
+                      cameras: [("Sony", "ILCE-9M3", 0.70), ("Sony", "ILCE-7RM5", 0.30)],
+                      lenses: [("Sony", "FE 200-600mm F5.6-6.3 G", 0.50), ("Sony", "FE 100-400mm F4.5-5.6 GM", 0.30), ("Sony", "FE 600mm F4 GM OSS", 0.20)],
+                      searchTerm: "bird+wildlife+nature+forest+telephoto"),
+            MockEvent(name: "Faro Boat Trip — Dolphins", photos: 1560, gigabytes: 144, source: "SD-PG-128GB",
+                      year: 2026, month: 6, day: 8,
+                      cameras: [("Sony", "ILCE-9M3", 0.60), ("Sony", "ILCE-7M4", 0.40)],
+                      lenses: [("Sony", "FE 100-400mm F4.5-5.6 GM", 0.40), ("Sony", "FE 70-200mm F2.8 GM II", 0.35), ("Sony", "FE 24-70mm F2.8 GM", 0.25)],
+                      searchTerm: "dolphins+ocean+sea+boat+blue+water"),
+            // Travel / street
+            MockEvent(name: "Lisbon Street Photography", photos: 980, gigabytes: 90, source: "SD-PG-128GB",
+                      year: 2026, month: 6, day: 14,
+                      cameras: [("Leica", "Q3", 0.50), ("Sony", "ILCE-7M4", 0.30), ("Sony", "ILCE-9M3", 0.20)],
+                      lenses: [("Leica", "Summilux 28mm", 0.50), ("Sony", "FE 35mm F1.4 GM", 0.30), ("Sony", "FE 50mm F1.4 GM", 0.20)],
+                      searchTerm: "lisbon+street+tram+architecture+yellow"),
+            MockEvent(name: "Porto — Ribeira District", photos: 1200, gigabytes: 110, source: "SD-PG-128GB",
+                      year: 2026, month: 5, day: 3,
+                      cameras: [("Sony", "ILCE-7M4", 0.45), ("Leica", "Q3", 0.35), ("Sony", "ILCE-9M3", 0.20)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.35), ("Leica", "Summilux 28mm", 0.35), ("Sony", "FE 50mm F1.4 GM", 0.30)],
+                      searchTerm: "porto+river+douro+bridge+colorful+houses"),
+            // Sport (non-football)
+            MockEvent(name: "Maratona de Lisboa", photos: 1680, gigabytes: 155, source: "SD-PG-128GB",
+                      year: 2025, month: 10, day: 18,
+                      cameras: [("Sony", "ILCE-9M3", 0.55), ("Sony", "ILCE-7M4", 0.30), ("Nikon", "Z 8", 0.15)],
+                      lenses: [("Sony", "FE 70-200mm F2.8 GM II", 0.30), ("Sony", "FE 24-70mm F2.8 GM", 0.30), ("Sony", "FE 100-400mm F4.5-5.6 GM", 0.25), ("Nikon", "Z 70-200mm f/2.8", 0.15)],
+                      searchTerm: "marathon+running+city+race+athletes"),
+            MockEvent(name: "Training Session — Academy", photos: 890, gigabytes: 82, source: "SD-PG-128GB",
+                      year: 2026, month: 5, day: 15,
+                      cameras: [("Sony", "ILCE-7M4", 0.50), ("Sony", "ILCE-9M3", 0.30), ("Canon", "EOS R5", 0.20)],
+                      lenses: [("Sony", "FE 70-200mm F2.8 GM II", 0.35), ("Sony", "FE 24-70mm F2.8 GM", 0.30), ("Canon", "RF 70-200mm F2.8L", 0.20), ("Sony", "FE 50mm F1.4 GM", 0.15)],
+                      searchTerm: "football+training+academy+practice+field"),
+            // Personal
+            MockEvent(name: "Family BBQ — Summer", photos: 420, gigabytes: 38, source: "SD-PG-128GB",
+                      year: 2025, month: 8, day: 14,
+                      cameras: [("Sony", "ILCE-7M4", 0.60), ("Leica", "Q3", 0.40)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.40), ("Leica", "Summilux 28mm", 0.35), ("Sony", "FE 50mm F1.4 GM", 0.25)],
+                      searchTerm: "family+bbq+summer+outdoor+garden+food"),
+            MockEvent(name: "Sunset — Cascais", photos: 340, gigabytes: 31, source: "SD-PG-128GB",
+                      year: 2025, month: 7, day: 6,
+                      cameras: [("Sony", "ILCE-7M4", 0.50), ("Leica", "Q3", 0.50)],
+                      lenses: [("Sony", "FE 24-70mm F2.8 GM", 0.35), ("Leica", "Summilux 28mm", 0.35), ("Sony", "FE 50mm F1.4 GM", 0.30)],
+                      searchTerm: "sunset+beach+cascais+ocean+golden+hour")
+        ]
+
+        // MARK: - Build per-event finalized snapshots + import history
+        var allImportHistory: [ImportHistoryEntry] = []
+        var allFinalizedEvents: [FinalizedEvent] = []
+
+        // Older events (before 2026-05) are finalized; newer ones are active
+        let finalizedCutoff = makeDate(year: 2026, month: 5, day: 1)
+
+        for event in events {
+            let eventDate = makeDate(year: event.year, month: event.month, day: event.day)
+            let isFinalized = eventDate < finalizedCutoff
+
+            let eventCameraCounts = event.cameras.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
+            let eventLensCounts = event.lenses.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
+
+            let topLenses = event.lenses.enumerated().map { i, l in
+                StatsReport.LensStat(make: l.make, model: l.model, count: Int(Double(event.photos) * l.pct), rank: i + 1)
+            }
+            let cameras = event.cameras.map { StatsReport.CameraStat(make: $0.make, model: $0.model, count: Int(Double(event.photos) * $0.pct)) }
+            let mainCamera = cameras.max(by: { $0.count < $1.count })
+
+            let snapshot = StatsReport(
+                topLenses: topLenses,
+                mostUsedCamera: mainCamera,
+                shutterSpeeds: [
+                    StatsReport.ShutterStat(rawValue: 1.0/2000.0, count: Int(Double(event.photos) * 0.25)),
+                    StatsReport.ShutterStat(rawValue: 1.0/1000.0, count: Int(Double(event.photos) * 0.35)),
+                    StatsReport.ShutterStat(rawValue: 1.0/500.0, count: Int(Double(event.photos) * 0.20)),
+                    StatsReport.ShutterStat(rawValue: 1.0/250.0, count: Int(Double(event.photos) * 0.12)),
+                    StatsReport.ShutterStat(rawValue: 1.0/125.0, count: Int(Double(event.photos) * 0.08))
+                ],
+                totalFilesAnalyzed: event.photos,
+                rawOutput: "[]",
+                avgISO: Double.random(in: 400...2400),
+                avgAperture: Double.random(in: 2.0...4.0),
+                avgFocalLength: Double.random(in: 50...250),
+                totalBytes: Int64(event.gigabytes * 1024 * 1024 * 1024),
+                totalDuration: Int.random(in: 1800...7200),
+                importCount: Int.random(in: 1...3),
+                lensCounts: eventLensCounts,
+                cameraCounts: eventCameraCounts,
+                orientationCounts: ["landscape": Int(Double(event.photos) * 0.55), "portrait": Int(Double(event.photos) * 0.45)]
+            )
+
+            if isFinalized {
+                let fe = FinalizedEvent(
+                    name: event.name,
+                    snapshot: snapshot,
+                    totalBytes: Int64(event.gigabytes * 1024 * 1024 * 1024),
+                    photoCount: event.photos,
+                    firstImportDate: eventDate,
+                    lastImportDate: eventDate,
+                    finalizedAt: cal.date(byAdding: .day, value: 1, to: eventDate) ?? eventDate,
+                    lastKnownPath: makePath(event.name)
+                )
+                allFinalizedEvents.append(fe)
+            }
+
+            // Import history: 1-3 sessions per event
+            let sessionCount = Int.random(in: 1...3)
+            for s in 0..<sessionCount {
+                let sessionDate = cal.date(byAdding: .hour, value: s * 6, to: eventDate) ?? eventDate
+                let fraction = s == 0 ? 0.6 : (s == 1 ? 0.3 : 0.1)
+                let sessionFiles = max(Int(Double(event.photos) * fraction), 10)
+                let sessionBytes = Int64(Double(sessionFiles) * 20.0 * 1024 * 1024)
+                allImportHistory.append(ImportHistoryEntry(
+                    date: sessionDate,
+                    sourceName: event.source,
+                    destinationPath: makePath(event.name),
+                    fileCount: sessionFiles,
+                    totalBytes: sessionBytes
+                ))
+            }
+        }
+
+        allImportHistory.sort { $0.date > $1.date }
+
+        // MARK: - Sidebar arrays
+        let count = events.count
+        appState.eventFolderBookmarks = Array(repeating: Data(), count: count)
+        appState.eventFolderDisplayNames = events.map { $0.name }
+        appState.eventFolderCachedPaths = events.map { makePath($0.name) }
+        appState.eventFolderPeakRawCounts = events.map { $0.photos + Int.random(in: 50...300) }
+        appState.eventFolderCachedCounts = events.map { $0.photos }
+        appState.eventFolderCachedJPGCounts = events.map { Int(Double($0.photos) * Double.random(in: 0.08...0.18)) }
+        appState.eventFolderManualDates = events.map { makeDate(year: $0.year, month: $0.month, day: $0.day) }
+        appState.eventFolderBannerImagePaths = Array(repeating: "", count: count)
+        appState.eventFolderBannerOffsets = Array(repeating: EventBannerOffset(), count: count)
+        appState.eventFolderOrder = Array(0..<count)
+        appState.eventSidebarNodes = events.indices.map { .event(index: $0) }
+        appState.activeEventFolderIndex = 0
+
+        // MARK: - Curated pic IDs per event category
+        let picIDs: [Int] = [
+            1044,  // football/stadium
+            1074,  // football night
+            1059,  // sports action
+            1060,  // stadium
+            1039,  // concert crowd
+            1040,  // concert stage
+            1041,  // music festival
+            118,   // esports/gaming
+            1080,  // gaming setup
+            250,   // product/watch
+            1062,  // fashion studio
+            1064,  // wedding
+            1015,  // river landscape
+            1036,  // ocean/dolphins
+            1042,  // street photography
+            1043,  // city architecture
+            1029,  // running/marathon
+            1047,  // training field
+            1025,  // outdoor/summer
+            1038   // sunset beach
+        ]
+
+        // MARK: - Create mock event folders with sample images on disk
+        let rawExtensions = ["arw", "cr2", "cr3", "nef", "dng"]
+        let imagesPerEvent = 12
+
+        for (i, event) in events.enumerated() {
+            let eventDir = URL(fileURLWithPath: makePath(event.name))
+            try? fm.createDirectory(at: eventDir, withIntermediateDirectories: true)
+
+            let batchGroup = DispatchGroup()
+            for j in 0..<imagesPerEvent {
+                batchGroup.enter()
+                let picID = (picIDs[i % picIDs.count] + j * 7) % 200 + 10
+                let urlString = "https://picsum.photos/id/\(picID)/6000/4000"
+                guard let url = URL(string: urlString) else { batchGroup.leave(); continue }
+
+                let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+                    defer { batchGroup.leave() }
+                    guard let data = data, let img = NSImage(data: data),
+                          let tiff = img.tiffRepresentation,
+                          let rep = NSBitmapImageRep(data: tiff) else { return }
+
+                    let isRaw = j < (imagesPerEvent * 60 / 100)
+                    let ext = isRaw ? rawExtensions[j % rawExtensions.count] : "jpg"
+                    let filename = String(format: "IMG_%04d.%@", j + 1, ext)
+                    let fileURL = eventDir.appendingPathComponent(filename)
+
+                    if let imgData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9]) {
+                        try? imgData.write(to: fileURL)
+                    }
+                }
+                task.resume()
+            }
+            batchGroup.wait()
+        }
+
+        // MARK: - Shared EXIF distribution dictionaries
+        let isoCounts: [String: Int] = ["100": 800, "200": 1200, "400": 2400, "800": 3100, "1600": 1800, "3200": 900, "6400": 400]
+        let apertureCounts: [String: Int] = ["1.4": 600, "2.0": 1400, "2.8": 3200, "4.0": 2100, "5.6": 1500, "8.0": 800, "11": 400, "16": 200]
+        let focalCounts: [String: Int] = ["14": 300, "24": 1800, "35": 1500, "50": 2200, "70": 1100, "85": 900, "100": 600, "135": 800, "200": 1200, "400": 1600, "600": 400]
+
+        // MARK: - Pre-populate EventStatsCache for each mock event
+        for (i, event) in events.enumerated() {
+            let eventPath = makePath(event.name)
+            let rawCount = Int(Double(event.photos) * 0.6)
+
+            let eventCameraCounts = event.cameras.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
+            let eventLensCounts = event.lenses.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
+
+            let cachedReport = StatsReport(
+                topLenses: event.lenses.prefix(5).enumerated().map { idx, l in
+                    StatsReport.LensStat(make: l.make, model: l.model, count: Int(Double(event.photos) * l.pct), rank: idx + 1)
+                },
+                mostUsedCamera: StatsReport.CameraStat(make: event.cameras[0].make, model: event.cameras[0].model, count: Int(Double(event.photos) * event.cameras[0].pct)),
+                shutterSpeeds: [
+                    StatsReport.ShutterStat(rawValue: 1.0/2000.0, count: Int(Double(event.photos) * 0.25)),
+                    StatsReport.ShutterStat(rawValue: 1.0/1000.0, count: Int(Double(event.photos) * 0.35)),
+                    StatsReport.ShutterStat(rawValue: 1.0/500.0, count: Int(Double(event.photos) * 0.20)),
+                    StatsReport.ShutterStat(rawValue: 1.0/250.0, count: Int(Double(event.photos) * 0.12)),
+                    StatsReport.ShutterStat(rawValue: 1.0/125.0, count: Int(Double(event.photos) * 0.08))
+                ],
+                totalFilesAnalyzed: event.photos,
+                rawOutput: "[]",
+                avgISO: Double.random(in: 400...2400),
+                avgAperture: Double.random(in: 1.8...5.6),
+                avgFocalLength: Double.random(in: 24...200),
+                totalBytes: Int64(event.gigabytes * 1024 * 1024 * 1024),
+                totalDuration: Int.random(in: 1800...7200),
+                importCount: 1,
+                lensCounts: eventLensCounts,
+                cameraCounts: eventCameraCounts,
+                shutterCounts: [1.0/2000: Int(Double(event.photos)*0.25), 1.0/1000: Int(Double(event.photos)*0.35), 1.0/500: Int(Double(event.photos)*0.20)],
+                isoCounts: isoCounts,
+                apertureCounts: apertureCounts,
+                focalCounts: focalCounts,
+                orientationCounts: ["landscape": Int(Double(event.photos)*0.55), "portrait": Int(Double(event.photos)*0.45)],
+                isoSum: Double.random(in: 400...2400) * Double(event.photos),
+                isoCount: event.photos,
+                apertureSum: Double.random(in: 1.8...5.6) * Double(event.photos),
+                apertureCount: event.photos,
+                focalSum: Double.random(in: 24...200) * Double(event.photos),
+                focalCount: event.photos
+            )
+            EventStatsCache.save(cachedReport, forPath: eventPath, scanDate: Date(), rawFileCountAtScan: rawCount)
+        }
+
+        // MARK: - Download real banner images (picsum.photos)
+        let bannerDir = AppPaths.subdirectory("event_banners")
+        try? fm.createDirectory(at: bannerDir, withIntermediateDirectories: true)
+
+        let group = DispatchGroup()
+        var bannerPaths = Array(repeating: "", count: count)
+
+        for i in 0..<count {
+            group.enter()
+            let picID = picIDs[i % picIDs.count]
+            let urlString = "https://picsum.photos/id/\(picID)/800/400"
+            guard let url = URL(string: urlString) else { group.leave(); continue }
+
+            let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+                defer { group.leave() }
+                guard let data = data, let img = NSImage(data: data) else { return }
+
+                let filename = events[i].name.replacingOccurrences(of: " ", with: "_")
+                    .replacingOccurrences(of: "/", with: "-")
+                    .replacingOccurrences(of: "&", with: "and") + ".jpg"
+                let fileURL = bannerDir.appendingPathComponent(filename)
+
+                // Crop to center at thumbnail aspect ratio (44:34 ≈ 1.29:1)
+                if let cgImg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    let targetAspect: CGFloat = 44.0 / 34.0
+                    let imgW = CGFloat(cgImg.width)
+                    let imgH = CGFloat(cgImg.height)
+                    let imgAspect = imgW / imgH
+
+                    var cropRect: CGRect
+                    if imgAspect > targetAspect {
+                        let newW = imgH * targetAspect
+                        cropRect = CGRect(x: (imgW - newW) / 2, y: 0, width: newW, height: imgH)
+                    } else {
+                        let newH = imgW / targetAspect
+                        cropRect = CGRect(x: 0, y: (imgH - newH) / 2, width: imgW, height: newH)
+                    }
+
+                    if let cropped = cgImg.cropping(to: cropRect) {
+                        let rep = NSBitmapImageRep(cgImage: cropped)
+                        if let jpg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                            try? jpg.write(to: fileURL)
+                            bannerPaths[i] = fileURL.path
+                        }
+                    }
+                }
+            }
+            task.resume()
+        }
+
+        group.wait()
+        appState.eventFolderBannerImagePaths = bannerPaths
+
+        // Link finalized events to their bookmarks
+        appState.eventFolderFinalizedEventID = Array(repeating: nil, count: count)
+        for fe in allFinalizedEvents {
+            if let idx = events.firstIndex(where: { $0.name == fe.name }) {
+                appState.eventFolderFinalizedEventID[idx] = fe.id
+            }
+        }
+
+        // MARK: - Total stats report (merged across all events)
+        let totalPhotos = events.reduce(0) { $0 + $1.photos }
+        let totalBytes = events.reduce(Int64(0)) { $0 + Int64($1.gigabytes * 1024 * 1024 * 1024) }
+
+        var mergedCameraCounts: [String: Int] = [:]
+        var mergedLensCounts: [String: Int] = [:]
+        for event in events {
+            for (key, pct) in event.cameras.map({ ("\($0.make)|\($0.model)", $0.pct) }) {
+                mergedCameraCounts[key, default: 0] += Int(Double(event.photos) * pct)
+            }
+            for (key, pct) in event.lenses.map({ ("\($0.make)|\($0.model)", $0.pct) }) {
+                mergedLensCounts[key, default: 0] += Int(Double(event.photos) * pct)
+            }
+        }
+
+        let mergedTopLenses = mergedLensCounts
+            .sorted { $0.value > $1.value }
+            .prefix(8)
+            .enumerated()
+            .map { entry -> StatsReport.LensStat in
+                let parts = entry.element.key.split(separator: "|", maxSplits: 1)
+                return StatsReport.LensStat(make: String(parts[0]), model: String(parts[1]), count: entry.element.value, rank: entry.offset + 1)
+            }
+
+        let monthCounts: [String: Int] = allImportHistory.reduce(into: [String: Int]()) { result, entry in
+            let fmt = DateFormatter()
+            fmt.dateFormat = "MMM yyyy"
+            let key = fmt.string(from: entry.date)
+            result[key, default: 0] += entry.fileCount
+        }
+
+        let shutterCounts: [Double: Int] = [1.0/8000: 400, 1.0/4000: 800, 1.0/2000: 2200, 1.0/1000: 3800, 1.0/500: 2200, 1.0/250: 1100, 1.0/125: 700]
+
+        let totalStats = StatsReport(
+            topLenses: Array(mergedTopLenses),
+            mostUsedCamera: StatsReport.CameraStat(make: "Sony", model: "ILCE-9M3", count: mergedCameraCounts["Sony|ILCE-9M3"] ?? Int(Double(totalPhotos) * 0.45)),
+            shutterSpeeds: shutterCounts.map { StatsReport.ShutterStat(rawValue: $0.key, count: $0.value) }.sorted { $0.rawValue > $1.rawValue },
+            totalFilesAnalyzed: totalPhotos,
+            rawOutput: "[]",
+            avgISO: 1100,
+            avgAperture: 2.8,
+            avgFocalLength: 135,
+            totalBytes: totalBytes,
+            totalDuration: 18000,
+            importCount: allImportHistory.count,
+            firstImportDate: allImportHistory.last?.date,
+            lensCounts: mergedLensCounts,
+            cameraCounts: mergedCameraCounts,
+            shutterCounts: shutterCounts,
+            isoCounts: isoCounts,
+            apertureCounts: apertureCounts,
+            focalCounts: focalCounts,
+            orientationCounts: ["landscape": Int(Double(totalPhotos) * 0.55), "portrait": Int(Double(totalPhotos) * 0.45)],
+            isoSum: 1100 * Double(totalPhotos),
+            isoCount: totalPhotos,
+            apertureSum: 2.8 * Double(totalPhotos),
+            apertureCount: totalPhotos,
+            focalSum: 135 * Double(totalPhotos),
+            focalCount: totalPhotos,
+            monthCounts: monthCounts
+        )
+
+        // MARK: - Last import report (hero card)
+        let lastEvent = events.last!
+        appState.lastImportReport = ImportReport(
+            sourceVolumeName: lastEvent.source,
+            sourcePath: "/Volumes/\(lastEvent.source)/DCIM",
+            destinationPath: makePath(lastEvent.name),
+            fileCount: lastEvent.photos,
+            totalBytes: Int64(lastEvent.gigabytes * 1024 * 1024 * 1024),
+            duration: Double.random(in: 60...300),
+            averageSpeed: Double.random(in: 80_000_000...250_000_000),
+            importedFiles: []
+        )
+
+        // MARK: - Persist everything
+        appState.totalStatsReport = totalStats
+        appState.finalizedEvents = allFinalizedEvents
+        StatsStorage.save(totalStats)
+        ImportHistoryStorage.save(allImportHistory)
+        appState.importHistory = allImportHistory
+        FinalizedEventsStore.saveAll(allFinalizedEvents)
+
+        appState.log("Mock data generated: \(events.count) events, \(totalPhotos) photos, \(allImportHistory.count) imports", level: .info)
+        mockDataStatus = "Done — \(events.count) events, \(totalPhotos) photos, \(allImportHistory.count) imports."
     }
 }

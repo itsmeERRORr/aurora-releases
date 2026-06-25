@@ -36,7 +36,7 @@ final class StatsRunner {
             appState.log("Processing \(importedFiles.count) imported files")
 
             // Run exiftool OFF the main thread to avoid blocking UI
-            var report = await Task.detached {
+            let exifResult = await Task.detached {
                 Self.runExiftoolStats(
                     exiftoolPath: exiftoolPath,
                     files: importedFiles,
@@ -44,11 +44,23 @@ final class StatsRunner {
                 )
             }.value
 
+            var report = exifResult.report
             report.totalBytes = totalBytes
             report.totalDuration = Int(duration)
             report.firstImportDate = Date()
             appState.statsReport = report
             appState.log("Stats complete: \(report.totalFilesAnalyzed) files analyzed")
+            logCameraShutterAvailability(report, context: "import")
+            Task.detached(priority: .background) { await AnalyticsService.logStats(report) }
+
+            // Persist the complete raw EXIF records for future feature derivation.
+            let rawJSON = exifResult.rawJSON
+            let destPath = destinationPath
+            if !rawJSON.isEmpty {
+                Task.detached(priority: .background) {
+                    EventRawMetadataStore.append(rawJSON, forPath: destPath)
+                }
+            }
 
             if report.totalFilesAnalyzed == 0 {
                 appState.log("⚠️ No files analyzed - check that exiftool can read your RAW files", level: .warning)
@@ -67,12 +79,13 @@ final class StatsRunner {
             report.firstImportDate = Date()
             appState.statsReport = report
             appState.log("Stats complete (mdls): \(report.totalFilesAnalyzed) files analyzed")
+            logCameraShutterAvailability(report, context: "import mdls fallback")
         }
     }
 
     /// Run EXIF stats for files in an event folder. Returns the report without updating appState.
     /// Uses exiftool -r (recursive) to avoid ARG_MAX limits and unnecessary file-listing on NAS.
-    func runStatsForEventFolder(at url: URL) async -> StatsReport? {
+    func runStatsForEventFolder(at url: URL, quality: EventStatsScanQuality = .full) async -> StatsReport? {
         let extensions = appState.supportedExtensions
 
         guard let exiftoolPath = findExiftool() else {
@@ -94,7 +107,8 @@ final class StatsRunner {
             Self.runExiftoolStatsForFolder(
                 exiftoolPath: exiftoolPath,
                 folderURL: url,
-                extensions: extensions
+                extensions: extensions,
+                quality: quality
             )
         }.value
 
@@ -104,18 +118,82 @@ final class StatsRunner {
         r.totalBytes = 0
         r.totalDuration = 0
         r.firstImportDate = nil
-        guard r.totalFilesAnalyzed > 0 else { return nil }
+        guard r.totalFilesAnalyzed > 0 else {
+            appState.log("Folder EXIF scan failed (\(quality.label)): \(r.rawOutput.prefix(300))", level: .warning)
+            return nil
+        }
+        logCameraShutterAvailability(r, context: "folder \(quality.label) scan")
+        Task.detached(priority: .background) { await AnalyticsService.logStats(r) }
         return r
     }
 
-    private func findExiftool() -> String? {
-        let paths = ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) {
-                return p
-            }
+    /// Run EXIF stats for an event folder in file batches so Added Folder deep scans can show
+    /// real processed/total progress and keep partial work if a later batch fails.
+    func runStatsForEventFolderInBatches(
+        at url: URL,
+        quality: EventStatsScanQuality = .full,
+        batchSize: Int = 100,
+        progress: @escaping @MainActor (_ processed: Int, _ total: Int, _ partialReport: StatsReport?) -> Void
+    ) async -> StatsReport? {
+        let extensions = appState.supportedExtensions
+
+        guard let exiftoolPath = findExiftool() else {
+            return await runStatsForEventFolder(at: url, quality: quality)
         }
-        return nil
+
+        let files = await Task.detached {
+            VolumeWatcher.listRawFiles(at: url, extensions: extensions)
+        }.value
+        guard !files.isEmpty else { return nil }
+
+        await progress(0, files.count, nil)
+
+        var combined: StatsReport?
+        var processed = 0
+        let safeBatchSize = max(1, batchSize)
+
+        for batch in files.chunked(into: safeBatchSize) {
+            if Task.isCancelled { break }
+            let filePaths = batch.map(\.path)
+            let report = await Task.detached {
+                Self.runExiftoolStatsForFiles(
+                    exiftoolPath: exiftoolPath,
+                    files: filePaths,
+                    quality: quality,
+                    timeoutSeconds: 300
+                )
+            }.value
+
+            processed += batch.count
+
+            if report.totalFilesAnalyzed > 0 {
+                combined = StatsReport.combine(combined, report)
+            } else {
+                appState.log("Folder EXIF batch failed (\(quality.label)): \(report.rawOutput.prefix(220))", level: .warning)
+            }
+            await progress(processed, files.count, combined)
+        }
+
+        guard var result = combined, result.totalFilesAnalyzed > 0 else { return nil }
+        result.totalBytes = 0
+        result.totalDuration = 0
+        result.firstImportDate = nil
+        logCameraShutterAvailability(result, context: "folder \(quality.label) batch scan")
+        return result
+    }
+
+    private func logCameraShutterAvailability(_ report: StatsReport, context: String) {
+        guard !report.cameraCounts.isEmpty else { return }
+        if report.cameraMaxShutterCounts.isEmpty {
+            appState.log("No mechanical shutter count tags found during \(context) for \(report.cameraCounts.count) camera model(s). Electronic shutter RAWs often omit this.", level: .warning)
+        } else {
+            let cameras = report.cameraMaxShutterCounts.keys.sorted().joined(separator: ", ")
+            appState.log("Mechanical shutter count tags found during \(context): \(cameras)")
+        }
+    }
+
+    private func findExiftool() -> String? {
+        ExiftoolInstallerService.installedExiftoolPath()
     }
 
     // MARK: - Static methods (run off main thread)
@@ -156,7 +234,8 @@ final class StatsRunner {
     private nonisolated static func runExiftoolStatsForFolder(
         exiftoolPath: String,
         folderURL: URL,
-        extensions: Set<String>
+        extensions: Set<String>,
+        quality: EventStatsScanQuality
     ) -> StatsReport {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exiftoolPath)
@@ -168,52 +247,17 @@ final class StatsRunner {
             extArgs += ["-ext", ext.lowercased(), "-ext", ext.uppercased()]
         }
 
-        // Create a temporary filelist with only RAW files to avoid exiftool processing non-RAW files
-        let fm = FileManager.default
-        var rawFiles: [String] = []
-        let lowercaseExtensions = extensions.map { $0.lowercased() }
-        if let enumerator = fm.enumerator(at: folderURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-            for case let fileURL as URL in enumerator {
-                let ext = fileURL.pathExtension.lowercased()
-                if lowercaseExtensions.contains(ext) {
-                    rawFiles.append(fileURL.path)
-                }
-            }
-        }
-        
-        var arguments: [String]
-        var filelistPath: String?
-        if !rawFiles.isEmpty {
-            // Write an argfile for exiftool (-@ flag): flags first, then file paths, one per line.
-            // This is the correct way to pass a large file list without hitting ARG_MAX.
-            filelistPath = NSTemporaryDirectory() + "exiftool_argfile_\(UUID().uuidString).txt"
-            let flags = [
-                "-json",
-                "-q",
-                "-fast",
-                "-m",
-                "-ignoreMinorErrors",
-                "-LensModel", "-LensID",
-                "-Make", "-Model",
-                "-ExposureTime", "-ShutterSpeedValue",
-                "-FocalLength", "-FNumber",
-                // ISO + Sony's alternate ISO fields. On Sony bodies the EXIF
-                // `ISO` tag can be capped at a reference value (often 400)
-                // while the real ISO used is written to ISOSpeed or
-                // RecommendedExposureIndex (SensitivityType=3). Read all
-                // three plus Sony MakerNote variants so the parser can pick
-                // the largest as the effective ISO.
-                "-ISO", "-ISOSpeed", "-RecommendedExposureIndex", "-ISOSetting", "-SonyISO",
-                "-ImageWidth", "-ImageHeight", "-ExifImageWidth", "-ExifImageHeight", "-Orientation",
-                "-DateTimeOriginal", "-CreateDate", "-DateCreated"
-            ]
-            let argfileContents = (flags + rawFiles).joined(separator: "\n")
-            try? argfileContents.write(toFile: filelistPath!, atomically: true, encoding: .utf8)
-            arguments = ["-@", filelistPath!]
-        } else {
-            // No RAW files found - return empty result without running exiftool
-            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "No RAW files found in folder", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
-        }
+        var arguments = [
+            "-r",
+            "-json",
+            "-q",
+            "-m",
+            "-ignoreMinorErrors"
+        ]
+        arguments.append(quality == .quick ? "-fast2" : "-fast")
+        arguments.append(contentsOf: extArgs)
+        arguments.append(contentsOf: folderScanTags(for: quality))
+        arguments.append(folderURL.path)
 
         process.arguments = arguments
 
@@ -241,42 +285,106 @@ final class StatsRunner {
         process.waitUntilExit()
         let exitCode = process.terminationStatus
 
-        // Clean up temp filelist if used
-        if let path = filelistPath {
-            try? FileManager.default.removeItem(atPath: path)
-        }
-
         let rawOutput = String(data: stdoutData, encoding: .utf8) ?? ""
 
         if rawOutput.isEmpty {
             return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool empty output (exit \(exitCode))", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
         }
 
-        return parseExiftoolJSON(rawOutput, fileCount: rawFiles.count)
+        return parseExiftoolJSON(rawOutput)
     }
 
-    private nonisolated static func runExiftoolStats(exiftoolPath: String, files: [String], destinationPath: String) -> StatsReport {
+    private nonisolated static func runExiftoolStatsForFiles(
+        exiftoolPath: String,
+        files: [String],
+        quality: EventStatsScanQuality,
+        timeoutSeconds: Double
+    ) -> StatsReport {
+        guard !files.isEmpty else {
+            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "empty batch", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exiftoolPath)
 
-        // Build arguments: exiftool -json [fields] file1 file2 file3...
         var arguments = [
             "-json",
-            "-LensModel", "-LensID",
-            "-Make", "-Model",
-            "-ExposureTime", "-ShutterSpeedValue",
-            "-FocalLength", "-FNumber",
-            // See the bulk-scan path for why we read all three ISO-ish tags
-            // (Sony writes the real ISO to RecommendedExposureIndex when the
-            // standard ISO field is capped at a reference value).
-            "-ISO", "-ISOSpeed", "-RecommendedExposureIndex", "-ISOSetting", "-SonyISO",
-            "-ImageWidth", "-ImageHeight", "-ExifImageWidth", "-ExifImageHeight", "-Orientation",
-            "-DateTimeOriginal", "-CreateDate", "-DateCreated"
+            "-q",
+            "-m",
+            "-ignoreMinorErrors"
         ]
-
-        // Add all imported files as arguments
+        arguments.append(quality == .quick ? "-fast2" : "-fast")
+        arguments.append(contentsOf: folderScanTags(for: quality))
         arguments.append(contentsOf: files)
+        process.arguments = arguments
 
+        let stdoutPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool launch error: \(error)", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
+        }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds) {
+            if process.isRunning { process.terminate() }
+        }
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let exitCode = process.terminationStatus
+        let rawOutput = String(data: stdoutData, encoding: .utf8) ?? ""
+
+        if rawOutput.isEmpty {
+            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool empty batch output (exit \(exitCode))", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
+        }
+
+        return parseExiftoolJSON(rawOutput)
+    }
+
+    private nonisolated static func folderScanTags(for quality: EventStatsScanQuality) -> [String] {
+        switch quality {
+        case .quick:
+            return [
+                "-LensModel",
+                "-Make", "-Model",
+                "-ExposureTime", "-ShutterSpeedValue",
+                "-FocalLength", "-FNumber",
+                "-ISO", "-ISOSpeed",
+                "-DateTimeOriginal", "-CreateDate", "-SubSecTimeOriginal", "-SubSecCreateDate"
+            ]
+        case .partial, .full:
+            return [
+                "-LensModel", "-LensID",
+                "-Make", "-Model",
+                "-ExposureTime", "-ShutterSpeedValue",
+                "-FocalLength", "-FNumber",
+                // ISO + Sony's alternate ISO fields. On Sony bodies the EXIF
+                // `ISO` tag can be capped at a reference value (often 400)
+                // while the real ISO used is written to ISOSpeed or
+                // RecommendedExposureIndex (SensitivityType=3). Read all
+                // three plus Sony MakerNote variants so the parser can pick
+                // the largest as the effective ISO.
+                "-ISO", "-ISOSpeed", "-RecommendedExposureIndex", "-ISOSetting", "-SonyISO",
+                "-ImageWidth", "-ImageHeight", "-ExifImageWidth", "-ExifImageHeight", "-Orientation",
+                "-DateTimeOriginal", "-CreateDate", "-DateCreated", "-SubSecTimeOriginal", "-SubSecCreateDate",
+                // Camera body shutter count — field name varies by manufacturer
+                "-ShutterCount", "-ImageCount", "-ActuationCount"
+            ]
+        }
+    }
+
+    private nonisolated static func runExiftoolStats(exiftoolPath: String, files: [String], destinationPath: String) -> (report: StatsReport, rawJSON: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: exiftoolPath)
+
+        // -json with no field filters → exiftool returns every tag it can read.
+        // This is the complete raw record used both for StatsReport derivation
+        // and for long-term archival in EventRawMetadataStore.
+        var arguments = ["-json"]
+        arguments.append(contentsOf: files)
         process.arguments = arguments
 
         let stdoutPipe = Pipe()
@@ -287,7 +395,7 @@ final class StatsRunner {
         do {
             try process.run()
         } catch {
-            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool launch error: \(error)", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
+            return (StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool launch error: \(error)", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:]), "")
         }
 
         // IMPORTANT: Read pipe data BEFORE waitUntilExit to avoid deadlock.
@@ -303,13 +411,13 @@ final class StatsRunner {
         let errOutput = String(data: stderrData, encoding: .utf8) ?? ""
 
         if rawOutput.isEmpty {
-            return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool empty output. exit=\(exitCode) stderr: \(errOutput.prefix(300))", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
+            return (StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "exiftool empty output. exit=\(exitCode) stderr: \(errOutput.prefix(300))", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:]), "")
         }
 
-        return parseExiftoolJSON(rawOutput, fileCount: files.count)
+        return (parseExiftoolJSON(rawOutput), rawOutput)
     }
 
-    private nonisolated static func parseExiftoolJSON(_ json: String, fileCount: Int) -> StatsReport {
+    private nonisolated static func parseExiftoolJSON(_ json: String) -> StatsReport {
         guard let data = json.data(using: .utf8),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return StatsReport(topLenses: [], mostUsedCamera: nil, shutterSpeeds: [], totalFilesAnalyzed: 0, rawOutput: "JSON parse failed. Raw: \(json.prefix(500))", avgISO: nil, avgAperture: nil, avgFocalLength: nil, lensCounts: [:], cameraCounts: [:], shutterCounts: [:], isoSum: 0, isoCount: 0, apertureSum: 0, apertureCount: 0, focalSum: 0, focalCount: 0, monthCounts: [:], weekCounts: [:], yearCounts: [:])
@@ -325,6 +433,9 @@ final class StatsRunner {
         var monthCounts: [String: Int] = [:]
         var weekCounts: [String: Int] = [:]
         var yearCounts: [String: Int] = [:]
+        var captureTimestampsByDay: [String: [Double]] = [:]
+        var cameraMaxShutterCounts: [String: Int] = [:]
+        var cameraLastSeenDates: [String: Date] = [:]
         var isoSum = 0.0
         var isoCount = 0
         var maxISO: Double?
@@ -341,9 +452,14 @@ final class StatsRunner {
         var minShutterSpeed: Double?
 
         let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
         dateFormatter.dateFormat = "yyyy:MM:dd HH:mm:ss" // exiftool format
         let monthFormatter = DateFormatter()
+        monthFormatter.locale = Locale(identifier: "en_US_POSIX")
         monthFormatter.dateFormat = "MMM yyyy"
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
         let isoCalendar = Calendar(identifier: .iso8601)
 
         // Helper: returns true for "---", "----", etc. (Sony no-lens accidental shots)
@@ -370,9 +486,12 @@ final class StatsRunner {
             }
 
             let model = entry["Model"] as? String ?? ""
+            let cameraKey = model.isEmpty ? "" : "\(make)|\(model)"
             if !model.isEmpty {
-                let key = "\(make)|\(model)"
-                cameraCounts[key, default: 0] += 1
+                cameraCounts[cameraKey, default: 0] += 1
+                if let sc = Self.effectiveShutterCount(from: entry) {
+                    cameraMaxShutterCounts[cameraKey] = max(cameraMaxShutterCounts[cameraKey] ?? 0, sc)
+                }
             }
 
             let shutterValue: Double? = {
@@ -452,60 +571,21 @@ final class StatsRunner {
             }
 
             // Date Taken (try multiple date fields)
-            var dateFound = false
-
-            // Try DateTimeOriginal first (most common for photos)
-            if let dateStr = entry["DateTimeOriginal"] as? String {
-                #if DEBUG
-                if monthCounts.isEmpty {
-                    print("StatsRunner: First DateTimeOriginal found: '\(dateStr)'")
-                }
-                #endif
-                if let date = dateFormatter.date(from: dateStr) {
-                    let monthKey = monthFormatter.string(from: date)
-                    monthCounts[monthKey, default: 0] += 1
-                    let weekOfYear = isoCalendar.component(.weekOfYear, from: date)
-                    let weekYear = isoCalendar.component(.yearForWeekOfYear, from: date)
-                    let weekKey = String(format: "%d-W%02d", weekYear, weekOfYear)
-                    weekCounts[weekKey, default: 0] += 1
-                    let yearKey = String(isoCalendar.component(.year, from: date))
-                    yearCounts[yearKey, default: 0] += 1
-                    dateFound = true
-                }
-            }
-
-            // Try CreateDate as fallback
-            if !dateFound, let dateStr = entry["CreateDate"] as? String {
-                #if DEBUG
-                if monthCounts.isEmpty {
-                    print("StatsRunner: First CreateDate found: '\(dateStr)'")
-                }
-                #endif
-                if let date = dateFormatter.date(from: dateStr) {
-                    let monthKey = monthFormatter.string(from: date)
-                    monthCounts[monthKey, default: 0] += 1
-                    let weekOfYear = isoCalendar.component(.weekOfYear, from: date)
-                    let weekYear = isoCalendar.component(.yearForWeekOfYear, from: date)
-                    let weekKey = String(format: "%d-W%02d", weekYear, weekOfYear)
-                    weekCounts[weekKey, default: 0] += 1
-                    let yearKey = String(isoCalendar.component(.year, from: date))
-                    yearCounts[yearKey, default: 0] += 1
-                    dateFound = true
-                }
-            }
-
-            // Try DateCreated as another fallback
-            if !dateFound, let dateStr = entry["DateCreated"] as? String {
-                if let date = dateFormatter.date(from: dateStr) {
-                    let monthKey = monthFormatter.string(from: date)
-                    monthCounts[monthKey, default: 0] += 1
-                    let weekOfYear = isoCalendar.component(.weekOfYear, from: date)
-                    let weekYear = isoCalendar.component(.yearForWeekOfYear, from: date)
-                    let weekKey = String(format: "%d-W%02d", weekYear, weekOfYear)
-                    weekCounts[weekKey, default: 0] += 1
-                    let yearKey = String(isoCalendar.component(.year, from: date))
-                    yearCounts[yearKey, default: 0] += 1
-                    dateFound = true
+            let capturedDate = Self.captureDate(from: entry, dateFormatter: dateFormatter)
+            let dateFound = capturedDate != nil
+            if let date = capturedDate {
+                let monthKey = monthFormatter.string(from: date)
+                monthCounts[monthKey, default: 0] += 1
+                let weekOfYear = isoCalendar.component(.weekOfYear, from: date)
+                let weekYear = isoCalendar.component(.yearForWeekOfYear, from: date)
+                let weekKey = String(format: "%d-W%02d", weekYear, weekOfYear)
+                weekCounts[weekKey, default: 0] += 1
+                let yearKey = String(isoCalendar.component(.year, from: date))
+                yearCounts[yearKey, default: 0] += 1
+                let dayKey = dayFormatter.string(from: date)
+                captureTimestampsByDay[dayKey, default: []].append(date.timeIntervalSince1970)
+                if !cameraKey.isEmpty {
+                    cameraLastSeenDates[cameraKey] = max(cameraLastSeenDates[cameraKey] ?? .distantPast, date)
                 }
             }
 
@@ -550,7 +630,9 @@ final class StatsRunner {
             cameraStat = StatsReport.CameraStat(
                 make: String(parts.first ?? ""),
                 model: String(parts.last ?? ""),
-                count: topCamera.value
+                count: topCamera.value,
+                maxShutterCount: cameraMaxShutterCounts[topCamera.key],
+                lastSeenDate: cameraLastSeenDates[topCamera.key]
             )
         } else {
             cameraStat = nil
@@ -597,8 +679,56 @@ final class StatsRunner {
             focalCount: focalCount,
             monthCounts: monthCounts,
             weekCounts: weekCounts,
-            yearCounts: yearCounts
+            yearCounts: yearCounts,
+            captureTimestampsByDay: captureTimestampsByDay,
+            cameraMaxShutterCounts: cameraMaxShutterCounts,
+            cameraLastSeenDates: cameraLastSeenDates
         )
+    }
+
+    private nonisolated static func effectiveShutterCount(from entry: [String: Any]) -> Int? {
+        let candidates: [Any?] = [entry["ShutterCount"], entry["ImageCount"], entry["ActuationCount"], entry["ReleaseCount"]]
+        for candidate in candidates {
+            if let i = candidate as? Int, i > 0 { return i }
+            if let d = candidate as? Double, d > 0 { return Int(d) }
+            if let s = candidate as? String, let i = Int(s), i > 0 { return i }
+        }
+        return nil
+    }
+
+    private nonisolated static func captureDate(from entry: [String: Any], dateFormatter: DateFormatter) -> Date? {
+        if let date = parseExifDate(entry["DateTimeOriginal"], subsec: entry["SubSecTimeOriginal"], dateFormatter: dateFormatter) {
+            return date
+        }
+        if let date = parseExifDate(entry["CreateDate"], subsec: entry["SubSecCreateDate"], dateFormatter: dateFormatter) {
+            return date
+        }
+        return parseExifDate(entry["DateCreated"], subsec: nil, dateFormatter: dateFormatter)
+    }
+
+    private nonisolated static func parseExifDate(_ value: Any?, subsec: Any?, dateFormatter: DateFormatter) -> Date? {
+        guard let raw = value as? String else { return nil }
+        let base = String(raw.prefix(19))
+        guard var date = dateFormatter.date(from: base) else { return nil }
+        if let fraction = parseSubsecond(subsec) {
+            date = date.addingTimeInterval(fraction)
+        }
+        return date
+    }
+
+    private nonisolated static func parseSubsecond(_ value: Any?) -> TimeInterval? {
+        let string: String?
+        if let intValue = value as? Int {
+            string = String(intValue)
+        } else if let doubleValue = value as? Double {
+            string = String(Int(doubleValue))
+        } else {
+            string = value as? String
+        }
+        guard let string else { return nil }
+        let digits = string.filter { $0.isNumber }
+        guard !digits.isEmpty, let value = Double("0." + digits) else { return nil }
+        return value
     }
 
     private nonisolated static func parseFraction(_ str: String) -> Double? {
@@ -884,5 +1014,14 @@ final class StatsRunner {
         let parts = line.split(separator: "=", maxSplits: 1)
         guard parts.count == 2 else { return "" }
         return parts[1].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "")
+    }
+}
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        return stride(from: 0, to: count, by: size).map { start in
+            Array(self[start..<Swift.min(start + size, count)])
+        }
     }
 }

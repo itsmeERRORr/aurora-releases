@@ -1,207 +1,234 @@
 import Foundation
-import CryptoKit
 import IOKit
 
-/// Offline licensing service. Uses two-part activation:
+/// Online licensing via Supabase.
 ///
-/// 1. **Activation code** — issued without a UUID, contains expiry + features.
-///    Format: `AURORA-<base64url-payload>-<base64url-signature>`
-///    Payload: `{"code":"<random>","exp":<timestamp>,"feat":<flags>}`
+/// Activation calls the `validate-license` Edge Function which:
+///   - Verifies the key exists in the DB and is active/not-expired
+///   - Binds the Mac UUID on first use (rejects on a different Mac)
+///   - Updates `last_seen_at` on subsequent validations
 ///
-/// 2. **Bound key** — stored in Keychain after first use. Combines the
-///    activation code with the Mac's hardware UUID so it only works on that Mac.
-///
+/// The result is cached in Keychain so the app works offline after the first activation.
+/// A silent background revalidation runs at launch to catch revoked/expired keys.
 enum LicensingService {
 
-    // MARK: - Public key (P256 ECDSA)
+    // MARK: - Supabase config
 
-    private static let publicKeyBase64 = "BCrf1xnjFeHTCd++S3bkVUEoYfDLWf4RWfE8ensOhi2CBISwvWisXA0hPO0NfQtew9iRqBfULjKRkuKIpJqrzP4="
+    static let supabaseURL = "https://aknpnxdgbatrcketoaku.supabase.co"
+    static let anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFrbnBueGRnYmF0cmNrZXRvYWt1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODg3MzUsImV4cCI6MjA5Nzk2NDczNX0.YmgppbIpYJAffHRtwcBNEE_UqAeBqBuYaZlaxam5Gss"
 
-    private static let publicKey: P256.Signing.PublicKey? = {
-        guard let data = Data(base64Encoded: publicKeyBase64) else { return nil }
-        return try? P256.Signing.PublicKey(x963Representation: data)
-    }()
-
-    // MARK: - Keychain
+    // MARK: - Keychain keys
 
     private static let keychainService = "errormedia.aurora.license"
     private static let keychainAccount = "activatedKey"
+    static let adminTokenKeychainAccount = "adminToken"
 
     // MARK: - Hardware UUID
 
     static func hardwareUUID() -> String? {
         var masterPort: mach_port_t = 0
         guard IOMasterPort(mach_host_self(), &masterPort) == KERN_SUCCESS else { return nil }
-
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(masterPort, IOServiceMatching("IOPlatformExpertDevice"), &iterator) == KERN_SUCCESS else { return nil }
         defer { IOObjectRelease(iterator) }
-
         let service = IOIteratorNext(iterator)
         guard service != 0 else { return nil }
         defer { IOObjectRelease(service) }
-
-        if let uuid = IORegistryEntryCreateCFProperty(service, "IOPlatformUUID" as CFString, nil, 0)?.takeRetainedValue() as? String {
-            return uuid
-        }
-        return nil
+        return IORegistryEntryCreateCFProperty(service, "IOPlatformUUID" as CFString, nil, 0)?.takeRetainedValue() as? String
     }
 
-    // MARK: - Activation code validation
+    // MARK: - Stored activation (Keychain cache)
 
-    enum CodeValidationResult {
-        case valid(expiry: Date?, features: UInt32)
-        case invalid
-        case expired
-        case noPublicKey
-    }
-
-    /// Validate an activation code (without UUID check).
-    static func validateCode(_ code: String) -> CodeValidationResult {
-        guard let pub = publicKey else { return .noPublicKey }
-
-        let parts = code.split(separator: "-").map(String.init)
-        guard parts.count == 3,
-              parts[0] == "AURORA" else { return .invalid }
-
-        guard let payloadData = base64URLDecode(parts[1]),
-              let signatureData = base64URLDecode(parts[2]) else { return .invalid }
-
-        guard let signature = try? P256.Signing.ECDSASignature(derRepresentation: signatureData) else { return .invalid }
-
-        guard pub.isValidSignature(signature, for: payloadData) else { return .invalid }
-
-        guard let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return .invalid }
-
-        if let exp = json["exp"] as? TimeInterval, exp > 0 {
-            if Date().timeIntervalSince1970 > exp { return .expired }
-        }
-
-        let features = json["feat"] as? UInt32 ?? 0
-        let expiry: Date? = {
-            if let exp = json["exp"] as? TimeInterval, exp > 0 {
-                return Date(timeIntervalSince1970: exp)
-            }
-            return nil
-        }()
-
-        return .valid(expiry: expiry, features: features)
-    }
-
-    // MARK: - Stored activation (code + UUID)
-
-    /// The JSON stored in Keychain: `{"code":"...","uuid":"..."}`
-    private struct StoredActivation: Codable {
-        let code: String
+    struct StoredActivation: Codable {
+        let key: String
         let uuid: String
+        let plan: String
+        var expiresAt: Date?
+        var customerEmail: String?
+        let activatedAt: Date
     }
 
-    /// Check if the app is currently activated (stored code is valid + UUID matches).
+    static func hasStoredKey() -> Bool {
+        KeychainStore.string(service: keychainService, account: keychainAccount) != nil
+    }
+
+    /// Synchronous check — reads from Keychain cache. Safe to call on main thread.
     static func isActivated() -> Bool {
-        guard let storedJSON = KeychainStore.string(service: keychainService, account: keychainAccount),
-              let data = storedJSON.data(using: .utf8),
-              let activation = try? JSONDecoder().decode(StoredActivation.self, from: data) else { return false }
-
-        // Verify code signature + expiry
-        switch validateCode(activation.code) {
-        case .valid: break
-        default: return false
-        }
-
-        // Verify UUID matches this machine
-        if let hw = hardwareUUID(), hw != activation.uuid { return false }
-
+        guard let a = storedActivation() else { return false }
+        if let exp = a.expiresAt, exp < Date() { return false }
         return true
     }
 
-    /// Activate with an activation code. Binds to current machine's UUID.
-    @discardableResult
-    static func activate(with code: String) -> Bool {
-        switch validateCode(code) {
-        case .valid:
-            guard let uuid = hardwareUUID() else { return false }
-            let activation = StoredActivation(code: code, uuid: uuid)
-            if let data = try? JSONEncoder().encode(activation),
-               let json = String(data: data, encoding: .utf8) {
-                KeychainStore.setString(json, service: keychainService, account: keychainAccount)
-                return true
-            }
-            return false
-        default:
-            return false
-        }
+    static func storedActivation() -> StoredActivation? {
+        guard let json = KeychainStore.string(service: keychainService, account: keychainAccount),
+              let data = json.data(using: .utf8) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(StoredActivation.self, from: data)
     }
 
-    /// Deactivate (clear stored key).
+    private static func save(_ activation: StoredActivation) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(activation),
+              let json = String(data: data, encoding: .utf8) else { return }
+        KeychainStore.setString(json, service: keychainService, account: keychainAccount)
+    }
+
     static func deactivate() {
         KeychainStore.remove(service: keychainService, account: keychainAccount)
     }
 
-    /// Return the stored activation info, if any.
-    static func storedActivation() -> (code: String, uuid: String)? {
-        guard let storedJSON = KeychainStore.string(service: keychainService, account: keychainAccount),
-              let data = storedJSON.data(using: .utf8),
-              let activation = try? JSONDecoder().decode(StoredActivation.self, from: data) else { return nil }
-        return (activation.code, activation.uuid)
+    // MARK: - Activation result
+
+    enum ActivationResult {
+        case success(plan: String, expiresAt: Date?, email: String?)
+        case notFound
+        case alreadyActivatedOnAnotherMac
+        case inactive(reason: String)
+        case networkError(String)
     }
 
-    // MARK: - Base64URL helpers
+    // MARK: - Activate (online — calls validate-license Edge Function)
 
-    private static func base64URLDecode(_ s: String) -> Data? {
-        var base64 = s.replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let padding = (4 - base64.count % 4) % 4
-        base64 += String(repeating: "=", count: padding)
-        return Data(base64Encoded: base64)
-    }
-
-    static func base64URLEncode(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-    }
-
-    // MARK: - Activation code generation (Beta only)
-
-    private static let keyPairDir: URL = {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aurora-license-keypair")
-    }()
-
-    private static var privateKeyPemPath: URL {
-        keyPairDir.appendingPathComponent("private_key.pem")
-    }
-
-    /// Check if a key pair exists on disk.
-    static func keyPairExists() -> Bool {
-        FileManager.default.fileExists(atPath: privateKeyPemPath.path)
-    }
-
-    /// Generate an activation code (not bound to any UUID).
-    static func generateActivationCode(expiryDays: Int = 0) -> String? {
-        guard let privateKeyData = try? Data(contentsOf: privateKeyPemPath) else { return nil }
-
-        let pemString = String(data: privateKeyData, encoding: .utf8) ?? ""
-        let base64 = pemString
-            .replacingOccurrences(of: "-----BEGIN PRIVATE KEY-----", with: "")
-            .replacingOccurrences(of: "-----END PRIVATE KEY-----", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .trimmingCharacters(in: .whitespaces)
-        guard let derData = Data(base64Encoded: base64) else { return nil }
-        guard let privateKey = try? P256.Signing.PrivateKey(derRepresentation: derData) else { return nil }
-
-        // Random activation code
-        let code = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16).uppercased()
-
-        var payload: [String: Any] = ["code": code, "feat": 0]
-        if expiryDays > 0 {
-            payload["exp"] = Int(Date().timeIntervalSince1970) + (expiryDays * 86400)
+    @discardableResult
+    static func activate(with key: String) async -> ActivationResult {
+        guard let uuid = hardwareUUID() else {
+            return .networkError("Could not read hardware UUID.")
         }
-        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return nil }
-        guard let signature = try? privateKey.signature(for: payloadData) else { return nil }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/validate-license") else {
+            return .networkError("Invalid URL.")
+        }
 
-        let payloadB64 = base64URLEncode(payloadData)
-        let sigB64 = base64URLEncode(signature.derRepresentation)
-        return "AURORA-\(payloadB64)-\(sigB64)"
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(anonKey, forHTTPHeaderField: "apikey")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["license_key": key, "mac_uuid": uuid])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .networkError("Invalid server response.")
+            }
+
+            if http.statusCode == 200, json["valid"] as? Bool == true {
+                let plan = json["plan"] as? String ?? "pro"
+                let email = json["customer_email"] as? String
+                let expiresAt = (json["expires_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+
+                save(StoredActivation(key: key, uuid: uuid, plan: plan, expiresAt: expiresAt, customerEmail: email, activatedAt: Date()))
+                return .success(plan: plan, expiresAt: expiresAt, email: email)
+            }
+
+            let errorMsg = json["error"] as? String ?? "Unknown error."
+            switch http.statusCode {
+            case 404: return .notFound
+            case 403 where errorMsg.contains("another Mac"): return .alreadyActivatedOnAnotherMac
+            case 403: return .inactive(reason: errorMsg)
+            default: return .networkError(errorMsg)
+            }
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Background revalidation (call at app launch, non-blocking)
+
+    static func revalidateInBackground() {
+        guard let activation = storedActivation() else { return }
+        Task.detached(priority: .background) {
+            let result = await activate(with: activation.key)
+            // If the key was revoked server-side, deactivate locally on next launch
+            if case .inactive = result { await MainActor.run { deactivate() } }
+            if case .notFound = result { await MainActor.run { deactivate() } }
+        }
+    }
+
+    // MARK: - Admin: create manual license (Beta only)
+    // Calls the admin-create-license Edge Function.
+    // Requires ADMIN_SECRET to be configured in Supabase and stored in Keychain.
+
+    enum AdminCreateResult {
+        case success(licenseKey: String)
+        case unauthorized
+        case networkError(String)
+    }
+
+    static func adminCreateLicense(name: String, plan: String, email: String?) async -> AdminCreateResult {
+        guard let secret = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount),
+              !secret.isEmpty else {
+            return .unauthorized
+        }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-create-license") else {
+            return .networkError("Invalid URL.")
+        }
+
+        var body: [String: Any] = ["name": name, "plan": plan]
+        if let email, !email.isEmpty { body["email"] = email }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("Bearer \(secret)", forHTTPHeaderField: "authorization")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .networkError("Invalid server response.")
+            }
+            if http.statusCode == 401 { return .unauthorized }
+            if http.statusCode == 200, let key = json["license_key"] as? String {
+                return .success(licenseKey: key)
+            }
+            return .networkError(json["error"] as? String ?? "Unknown error.")
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    static func adminRevokeLicense(key: String) async -> AdminCreateResult {
+        guard let secret = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount),
+              !secret.isEmpty else {
+            return .unauthorized
+        }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-revoke-license") else {
+            return .networkError("Invalid URL.")
+        }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("Bearer \(secret)", forHTTPHeaderField: "authorization")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["license_key": key])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .networkError("Invalid server response.")
+            }
+            if http.statusCode == 401 { return .unauthorized }
+            if http.statusCode == 200 { return .success(licenseKey: key) }
+            return .networkError(json["error"] as? String ?? "Unknown error.")
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    static func saveAdminToken(_ token: String) {
+        KeychainStore.setString(token, service: keychainService, account: adminTokenKeychainAccount)
+    }
+
+    static func hasAdminToken() -> Bool {
+        guard let t = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount) else { return false }
+        return !t.isEmpty
+    }
+
+    static func clearAdminToken() {
+        KeychainStore.remove(service: keychainService, account: adminTokenKeychainAccount)
     }
 }
