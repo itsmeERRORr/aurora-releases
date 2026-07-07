@@ -48,10 +48,10 @@ struct AuroraStatusBarView: View {
 
     private var queueItem: some View {
         HStack(spacing: 9) {
-            Image(systemName: "list.bullet")
+            Image(systemName: appState.importState == .generatingStats ? "chart.bar.doc.horizontal" : "list.bullet")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Color.auroraFaint)
-            Text("Import queue: \(queueCount) item\(queueCount == 1 ? "" : "s")")
+            Text(queueText)
                 .font(.manrope(11.5, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
         }
@@ -146,6 +146,13 @@ struct AuroraStatusBarView: View {
         case .scanning, .importing, .verifying, .generatingStats: return 1
         default: return 0
         }
+    }
+
+    private var queueText: String {
+        if appState.importState == .generatingStats {
+            return "Background task: Stats"
+        }
+        return "Import queue: \(queueCount) item\(queueCount == 1 ? "" : "s")"
     }
 
     private var lastImportText: String {

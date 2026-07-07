@@ -11,12 +11,16 @@ struct ContentView: View {
     @State private var activeImportEngines: [String: ImportEngine] = [:]
     @State private var statsRunner: StatsRunner?
     @State private var showProgressOverlay = false
+    @State private var showLicenseExpiredAlert = false
     @State private var selectedNavItem: NavigationItem = .statistics
     @State private var showAutoImportOverlay = false
     @State private var autoImportCountdown = 5
     @State private var autoImportTask: Task<Void, Never>?
     @State private var eventCountsRefreshTask: Task<Void, Never>?
     @State private var telegramDailySummaryTask: Task<Void, Never>?
+    @State private var licenseRevalidationTask: Task<Void, Never>?
+    @State private var exiftoolInstalled = ExiftoolInstallerService.isInstalled
+    @State private var exiftoolInstallStarted = false
 
     var body: some View {
         ZStack {
@@ -27,8 +31,19 @@ struct ContentView: View {
                     AuroraSidebarView(selectedItem: $selectedNavItem, appState: appState)
 
                     ZStack {
-                        mainContent
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        VStack(spacing: 0) {
+                            if !exiftoolInstalled {
+                                exiftoolBanner
+                            }
+
+                            if appState.isTrialMode {
+                                trialBanner
+                            }
+
+                            mainContent
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                         if showProgressOverlay {
                             Color.black.opacity(0.55).ignoresSafeArea()
@@ -51,6 +66,27 @@ struct ContentView: View {
                         .gridCellColumns(2)
                 }
             }
+
+            // Covers the whole window (sidebar included) rather than living inside
+            // the main-content ZStack, so clicking the sidebar also closes it.
+            if appState.galleryFullscreenIndex != nil {
+                Button {
+                    appState.galleryFullscreenIndex = nil
+                } label: {
+                    Color.black.opacity(0.55).ignoresSafeArea()
+                }
+                .buttonStyle(.plain)
+
+                GalleryFullscreenView(
+                    photos: appState.galleryFullscreenPhotos,
+                    index: Binding(
+                        get: { appState.galleryFullscreenIndex ?? 0 },
+                        set: { appState.galleryFullscreenIndex = $0 }
+                    ),
+                    onDismiss: { appState.galleryFullscreenIndex = nil }
+                )
+                .padding(40)
+            }
         }
         .frame(minWidth: 1280, minHeight: 800)
         .ignoresSafeArea()
@@ -61,6 +97,7 @@ struct ContentView: View {
         .onDisappear {
             stopEventCountsRefreshTimer()
             stopTelegramDailySummaryScheduler()
+            licenseRevalidationTask?.cancel()
         }
         .onReceive(NotificationCenter.default.publisher(for: .cardDetected)) { _ in
             selectedNavItem = .dashboard
@@ -71,11 +108,28 @@ struct ContentView: View {
         .onChange(of: appState.autoImport) { _, isEnabled in
             if !isEnabled { cancelAutoImportCountdown() }
         }
+        .onChange(of: appState.importState) { _, state in
+            if state == .generatingStats { cancelAutoImportCountdown() }
+        }
         .onChange(of: appState.destinationURL) { _, _ in
             volumeWatcher?.refreshMountedVolumes()
         }
+        .onChange(of: showLicenseOverlay) { _, isPresented in
+            if !isPresented { appState.refreshLicenseStatus() }
+        }
+        .onChange(of: appState.trialAccessBlockedToken) { _, _ in
+            if appState.trialAccessBlockedMessage != nil {
+                showLicenseOverlay = true
+            }
+        }
+        .alert("License Expired", isPresented: $showLicenseExpiredAlert) {
+            Button("OK") {}
+        } message: {
+            Text("Your Aurora license has expired. Renew your license to continue importing.")
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                refreshExiftoolStatus()
                 startEventCountsRefreshTimer()
             } else {
                 stopEventCountsRefreshTimer()
@@ -101,9 +155,12 @@ struct ContentView: View {
                 onSelectEvent: selectEventFromDashboard
             )
         case .statistics:
-            StatisticsView(appState: appState, statsRunner: statsRunner) { bookmarkIndex in
-                guard let eventIndex = appState.uniqueImportDestinations.firstIndex(where: { $0.bookmarkIndex == bookmarkIndex }) else { return }
-                selectedNavItem = .event(index: eventIndex)
+            StatisticsView(
+                appState: appState,
+                statsRunner: statsRunner,
+                onStartImport: { selectedNavItem = .dashboard }
+            ) { bookmarkIndex in
+                selectedNavItem = .event(bookmarkIndex: bookmarkIndex)
             }
         case .activity:
             ActivityView(appState: appState)
@@ -113,15 +170,13 @@ struct ContentView: View {
             SettingsView(appState: appState, showLicenseOverlay: $showLicenseOverlay)
         case .logs:
             LogsView(appState: appState)
-        case .event(let index):
+        case .event(let bookmarkIndex):
+            let event = appState.uniqueImportDestinations.first(where: { $0.bookmarkIndex == bookmarkIndex })
             EventStatsView(
                 appState: appState,
-                destinationPath: index < appState.uniqueImportDestinations.count
-                    ? appState.uniqueImportDestinations[index].path : "",
-                eventName: index < appState.uniqueImportDestinations.count
-                    ? appState.uniqueImportDestinations[index].name : "",
-                bookmarkIndex: index < appState.uniqueImportDestinations.count
-                    ? appState.uniqueImportDestinations[index].bookmarkIndex : nil,
+                destinationPath: event?.path ?? "",
+                eventName: event?.name ?? "",
+                bookmarkIndex: event != nil ? bookmarkIndex : nil,
                 statsRunner: statsRunner
             )
         }
@@ -131,14 +186,14 @@ struct ContentView: View {
 
     private func selectEventFromDashboard(_ event: EventAggregate) {
         let eventPath = normalizedPath(event.id)
-        guard let index = appState.uniqueImportDestinations.firstIndex(where: { destination in
+        guard let dest = appState.uniqueImportDestinations.first(where: { destination in
             let destinationPath = normalizedPath(destination.path)
             return destinationPath == eventPath
                 || destinationPath.hasPrefix(eventPath + "/")
                 || eventPath.hasPrefix(destinationPath + "/")
         }) else { return }
 
-        selectedNavItem = .event(index: index)
+        selectedNavItem = .event(bookmarkIndex: dest.bookmarkIndex)
     }
 
     private func normalizedPath(_ path: String) -> String {
@@ -147,13 +202,131 @@ struct ContentView: View {
 
     private func setupServices() {
         guard volumeWatcher == nil else { return }
+        refreshExiftoolStatus()
         let watcher = VolumeWatcher(appState: appState)
         volumeWatcher = watcher
         statsRunner = StatsRunner(appState: appState)
         watcher.startWatching()
         startEventCountsRefreshTimer()
         startTelegramDailySummaryScheduler()
+        // Revalidate immediately (updates the live gate — this is what migrates a
+        // legacy unsigned cache to a signed one on first launch of this version),
+        // then keep re-checking hourly.
+        Task { @MainActor in await performLicenseRevalidation() }
+        startLicenseRevalidationTimer()
+        // Pull the authoritative trial count from the server — this corrects a
+        // deleted/edited local counter back up to what the server remembers.
+        Task { @MainActor in await appState.syncTrialUsage() }
         appState.log("App started — Aurora v1.0")
+    }
+
+    private var trialBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: appState.trialUsage.isExhausted ? "lock.fill" : "sparkles")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(appState.trialUsage.isExhausted ? Color.auroraMagenta : Color.auroraCyan)
+
+            Text(appState.trialUsage.isExhausted
+                 ? "Trial limit reached. Activate Aurora to keep importing and adding folders."
+                 : "\(appState.trialStatusText) - imports and added folders count as trial actions.")
+                .font(.manrope(12, weight: .semibold))
+                .foregroundStyle(Color.auroraTxt)
+                .lineLimit(1)
+
+            Spacer(minLength: 12)
+
+            Button("Enter License Key") {
+                showLicenseOverlay = true
+            }
+            .buttonStyle(AuroraGradientButtonStyle(compact: true))
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(
+            Rectangle()
+                .fill(Color.auroraPanel.opacity(0.96))
+                .overlay(
+                    LinearGradient(
+                        colors: [Color.auroraCyan.opacity(0.12), Color.auroraViolet.opacity(0.08)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+        )
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundStyle(Color.auroraStroke),
+            alignment: .bottom
+        )
+    }
+
+    private var exiftoolBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "camera.metering.matrix")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(Color.auroraCyan)
+
+            Text("Aurora needs ExifTool to run complete camera, lens and exposure stats.")
+                .font(.manrope(12, weight: .semibold))
+                .foregroundStyle(Color.auroraTxt)
+                .lineLimit(1)
+
+            Spacer(minLength: 12)
+
+            Button(exiftoolInstallStarted ? "Installing…" : "Install") {
+                installExiftool()
+            }
+            .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            .disabled(exiftoolInstallStarted)
+
+            Button("Recheck") {
+                refreshExiftoolStatus()
+            }
+            .buttonStyle(AuroraGhostButtonStyle())
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(
+            Rectangle()
+                .fill(Color.auroraPanel.opacity(0.96))
+                .overlay(
+                    LinearGradient(
+                        colors: [Color.auroraCyan.opacity(0.14), Color.auroraMagenta.opacity(0.08)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+        )
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundStyle(Color.auroraStroke),
+            alignment: .bottom
+        )
+    }
+
+    private func installExiftool() {
+        exiftoolInstallStarted = ExiftoolInstallerService.openHomebrewInstallerInTerminal()
+        refreshExiftoolStatusAfterDelay()
+    }
+
+    private func refreshExiftoolStatus() {
+        exiftoolInstalled = ExiftoolInstallerService.isInstalled
+        if exiftoolInstalled {
+            exiftoolInstallStarted = false
+        }
+    }
+
+    private func refreshExiftoolStatusAfterDelay() {
+        Task { @MainActor in
+            for _ in 0..<24 {
+                try? await Task.sleep(for: .seconds(5))
+                refreshExiftoolStatus()
+                if exiftoolInstalled { return }
+            }
+            exiftoolInstallStarted = false
+        }
     }
 
     private func startEventCountsRefreshTimer() {
@@ -189,6 +362,37 @@ struct ContentView: View {
     private func stopTelegramDailySummaryScheduler() {
         telegramDailySummaryTask?.cancel()
         telegramDailySummaryTask = nil
+    }
+
+    // MARK: - License revalidation (runs every hour while app is open)
+
+    private func startLicenseRevalidationTimer() {
+        licenseRevalidationTask = Task.detached(priority: .background) {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3600))
+                guard !Task.isCancelled else { break }
+                await performLicenseRevalidation()
+            }
+        }
+    }
+
+    @MainActor
+    private func performLicenseRevalidation() async {
+        guard let stored = LicensingService.storedActivation() else { return }
+        let result = await LicensingService.activate(with: stored.key)
+        switch result {
+        case .inactive, .notFound:
+            LicensingService.deactivate()
+            appState.refreshLicenseStatus()
+            showLicenseOverlay = true
+        case .success:
+            // Refresh the live gate: this is what re-signs and re-activates a legacy
+            // (pre-signing) cache that read as not-activated at synchronous startup.
+            appState.refreshLicenseStatus()
+        default:
+            // Network error etc. — leave the current (cached) state untouched.
+            break
+        }
     }
 
     private func attemptTelegramDailySummarySend() async {
@@ -262,7 +466,9 @@ struct ContentView: View {
     }
 
     private func startAutoImportCountdown() {
+        guard appState.canUseTrialAction() else { return }
         guard appState.autoImport, appState.destinationURL != nil else { return }
+        guard isImportStartAllowed else { return }
         guard autoImportTask == nil else { return }
 
         autoImportCountdown = 5
@@ -273,6 +479,10 @@ struct ContentView: View {
                 try? await Task.sleep(for: .seconds(1))
                 if Task.isCancelled { return }
                 if !appState.autoImport {
+                    await MainActor.run { cancelAutoImportCountdown() }
+                    return
+                }
+                if !isImportStartAllowed {
                     await MainActor.run { cancelAutoImportCountdown() }
                     return
                 }
@@ -326,6 +536,8 @@ struct ContentView: View {
             }
         }
 
+        guard appState.consumeTrialAction("import") else { return }
+
         if importSources.count > 1 {
             startMultiCardImport(sources: Array(importSources.prefix(2)), destination: dest)
             return
@@ -373,7 +585,7 @@ struct ContentView: View {
                     )
                     : nil
                 let result = try await importEngine.importFiles(
-                    from: files, to: dest, mode: engineMode, renameOptions: renameOptions
+                    from: files, to: dest, mode: engineMode, createSubfolder: appState.autoSubfolders, renameOptions: renameOptions
                 ) { progress in
                     Task { @MainActor in
                         appState.importProgress.completedFiles = progress.completedFiles
@@ -383,6 +595,8 @@ struct ContentView: View {
                         appState.importProgress.currentFileName = progress.currentFileName
                         appState.importProgress.bytesPerSecond = progress.bytesPerSecond
                         appState.importProgress.skippedFiles = progress.skippedFiles
+                        appState.importProgress.failedFiles = progress.failedFiles
+                        appState.importProgress.copiedAfterMoveFailureFiles = progress.copiedAfterMoveFailureFiles
                         appState.importProgress.statusMessage = progress.statusMessage
                     }
                 }
@@ -401,24 +615,23 @@ struct ContentView: View {
                 )
                 appState.lastImportReport = report
                 appState.log("Import complete: \(report.summary)")
+                logImportOutcome(result, prefix: nil)
                 if result.skippedFiles > 0 {
                     appState.log("Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s") already present in destination")
                 }
 
                 if result.importedFiles.isEmpty {
-                    if result.skippedFiles > 0 {
-                        appState.sourceFileCountForDestinationCheck = result.skippedFiles
-                        appState.allDestinationFilesAlreadyImported = true
-                        appState.sourceFilesImportStatusMessage = "All \(result.skippedFiles) files are already imported"
-                    }
+                    appState.sourceFileCountForDestinationCheck = result.skippedFiles + result.failedFiles
+                    appState.allDestinationFilesAlreadyImported = result.failedFiles == 0 && result.skippedFiles > 0
+                    appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: result.skippedFiles, failedFiles: result.failedFiles, copiedAfterMoveFailureFiles: result.copiedAfterMoveFailureFiles, allSkipped: result.failedFiles == 0)
                     try? await Task.sleep(for: .seconds(1))
                     showProgressOverlay = false
                     appState.importState = .idle
                     return
-                } else if result.skippedFiles > 0 {
-                    appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                } else if result.skippedFiles > 0 || result.failedFiles > 0 {
+                    appState.sourceFileCountForDestinationCheck = result.skippedFiles + result.failedFiles
                     appState.allDestinationFilesAlreadyImported = false
-                    appState.sourceFilesImportStatusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+                    appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: result.skippedFiles, failedFiles: result.failedFiles, copiedAfterMoveFailureFiles: result.copiedAfterMoveFailureFiles, allSkipped: false)
                 }
 
                 if appState.autoEject {
@@ -436,6 +649,7 @@ struct ContentView: View {
                     try? await Task.sleep(for: .milliseconds(800))
                 }
 
+                showProgressOverlay = false
                 appState.importState = .generatingStats
                 appState.log("Generating stats...")
                 await statsRunner?.runStats(
@@ -457,6 +671,7 @@ struct ContentView: View {
                     ImportHistoryStorage.add(historyEntry)
                     appState.importHistory = ImportHistoryStorage.load()
                     appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: result.destinationPath)
+                    appState.refreshJPGDayCacheForImportedDestination(result.destinationPath)
                     appState.recordTelegramDailyImport(
                         sourceName: source.name,
                         destinationPath: result.destinationPath,
@@ -468,7 +683,6 @@ struct ContentView: View {
                     Task { await attemptTelegramDailySummarySend() }
                 }
                 try? await Task.sleep(for: .seconds(1))
-                showProgressOverlay = false
                 selectedNavItem = .statistics
 
                 try? await Task.sleep(for: .seconds(1))
@@ -592,6 +806,8 @@ struct ContentView: View {
             let failed = outcomes.filter { $0.errorMessage != nil }
             let importedOutcomes = successful.filter { !$0.result.importedFiles.isEmpty }
             let skippedFiles = successful.reduce(0) { $0 + $1.result.skippedFiles }
+            let failedFiles = successful.reduce(0) { $0 + $1.result.failedFiles }
+            let copiedAfterMoveFailureFiles = successful.reduce(0) { $0 + $1.result.copiedAfterMoveFailureFiles }
 
             if !failed.isEmpty {
                 let message = failed.map { "\($0.source.name): \($0.errorMessage ?? "unknown error")" }.joined(separator: " · ")
@@ -601,11 +817,9 @@ struct ContentView: View {
             }
 
             if importedOutcomes.isEmpty {
-                if skippedFiles > 0 {
-                    appState.sourceFileCountForDestinationCheck = skippedFiles
-                    appState.allDestinationFilesAlreadyImported = true
-                    appState.sourceFilesImportStatusMessage = "All \(skippedFiles) files are already imported"
-                }
+                appState.sourceFileCountForDestinationCheck = skippedFiles + failedFiles
+                appState.allDestinationFilesAlreadyImported = failedFiles == 0 && skippedFiles > 0
+                appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: skippedFiles, failedFiles: failedFiles, copiedAfterMoveFailureFiles: copiedAfterMoveFailureFiles, allSkipped: failedFiles == 0)
                 try? await Task.sleep(for: .seconds(1))
                 showProgressOverlay = false
                 appState.importState = failed.isEmpty ? .idle : .error(appState.importProgress.failureMessage ?? "Import failed")
@@ -615,12 +829,13 @@ struct ContentView: View {
                 return
             }
 
-            if skippedFiles > 0 {
-                appState.sourceFileCountForDestinationCheck = skippedFiles
+            if skippedFiles > 0 || failedFiles > 0 || copiedAfterMoveFailureFiles > 0 {
+                appState.sourceFileCountForDestinationCheck = skippedFiles + failedFiles
                 appState.allDestinationFilesAlreadyImported = false
-                appState.sourceFilesImportStatusMessage = "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s")"
+                appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: skippedFiles, failedFiles: failedFiles, copiedAfterMoveFailureFiles: copiedAfterMoveFailureFiles, allSkipped: false)
             }
 
+            showProgressOverlay = false
             appState.importState = .generatingStats
             appState.log("Generating stats for \(importedOutcomes.count) card import\(importedOutcomes.count == 1 ? "" : "s")...")
 
@@ -653,6 +868,7 @@ struct ContentView: View {
                 ImportHistoryStorage.add(historyEntry)
                 appState.importHistory = ImportHistoryStorage.load()
                 appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: outcome.result.destinationPath)
+                appState.refreshJPGDayCacheForImportedDestination(outcome.result.destinationPath)
                 appState.recordTelegramDailyImport(
                     sourceName: outcome.source.name,
                     destinationPath: outcome.result.destinationPath,
@@ -683,7 +899,6 @@ struct ContentView: View {
             Task { await attemptTelegramDailySummarySend() }
 
             try? await Task.sleep(for: .seconds(1))
-            showProgressOverlay = false
             selectedNavItem = .statistics
             appState.importJobs = []
 
@@ -745,6 +960,7 @@ struct ContentView: View {
                 from: files,
                 to: dest,
                 mode: mode,
+                createSubfolder: appState.autoSubfolders,
                 renameOptions: renameOptions,
                 reservationCoordinator: reservationCoordinator
             ) { progress in
@@ -758,6 +974,8 @@ struct ContentView: View {
                         startTime: Date(),
                         bytesPerSecond: progress.bytesPerSecond,
                         skippedFiles: progress.skippedFiles,
+                        failedFiles: progress.failedFiles,
+                        copiedAfterMoveFailureFiles: progress.copiedAfterMoveFailureFiles,
                         statusMessage: progress.statusMessage
                     )
                     if let existing = appState.importJobs.first(where: { $0.id == source.id })?.progress.startTime {
@@ -769,7 +987,8 @@ struct ContentView: View {
 
             await MainActor.run {
                 updateMultiImportJob(sourceID: source.id, state: .done, progress: completedProgress(for: source.id, result: result))
-                appState.log("\(source.name): import complete (\(result.importedFiles.count) files, \(result.skippedFiles) skipped)")
+                appState.log("\(source.name): import complete (\(result.importedFiles.count) files, \(result.skippedFiles) skipped, \(result.copiedAfterMoveFailureFiles) copied after move failure, \(result.failedFiles) failed)")
+                logImportOutcome(result, prefix: source.name)
             }
 
             if !result.importedFiles.isEmpty, appState.autoEject {
@@ -830,8 +1049,10 @@ struct ContentView: View {
         progress.bytesPerSecond = result.averageSpeed
         progress.currentFileName = result.importedFiles.isEmpty ? "No new files" : "Done"
         progress.skippedFiles = result.skippedFiles
-        if result.skippedFiles > 0 {
-            progress.statusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+        progress.failedFiles = result.failedFiles
+        progress.copiedAfterMoveFailureFiles = result.copiedAfterMoveFailureFiles
+        if result.skippedFiles > 0 || result.failedFiles > 0 || result.copiedAfterMoveFailureFiles > 0 {
+            progress.statusMessage = Self.importOutcomeMessage(skippedFiles: result.skippedFiles, failedFiles: result.failedFiles, copiedAfterMoveFailureFiles: result.copiedAfterMoveFailureFiles, allSkipped: false)
         }
         return progress
     }
@@ -847,6 +1068,8 @@ struct ContentView: View {
         let transferredBytes = jobs.reduce(Int64(0)) { $0 + $1.progress.transferredBytes }
         let speed = jobs.reduce(0.0) { $0 + $1.progress.bytesPerSecond }
         let skipped = jobs.reduce(0) { $0 + $1.progress.skippedFiles }
+        let failed = jobs.reduce(0) { $0 + $1.progress.failedFiles }
+        let copiedAfterMoveFailure = jobs.reduce(0) { $0 + $1.progress.copiedAfterMoveFailureFiles }
         let activeNames = jobs
             .filter { if case .importing = $0.state { return true }; return false }
             .map(\.sourceName)
@@ -859,9 +1082,47 @@ struct ContentView: View {
             startTime: startTime,
             bytesPerSecond: speed,
             skippedFiles: skipped,
-            statusMessage: skipped > 0 ? "Skipped \(skipped) duplicate file\(skipped == 1 ? "" : "s")" : nil,
+            failedFiles: failed,
+            copiedAfterMoveFailureFiles: copiedAfterMoveFailure,
+            statusMessage: Self.importOutcomeMessage(skippedFiles: skipped, failedFiles: failed, copiedAfterMoveFailureFiles: copiedAfterMoveFailure, allSkipped: false),
             failureMessage: appState.importProgress.failureMessage
         )
+    }
+
+    @MainActor
+    private func logImportOutcome(_ result: ImportResult, prefix: String?) {
+        let label = prefix.map { "\($0): " } ?? ""
+        if result.copiedAfterMoveFailureFiles > 0 {
+            let movedFiles = max(result.fileCount - result.copiedAfterMoveFailureFiles, 0)
+            appState.log("\(label)Moved \(movedFiles) file\(movedFiles == 1 ? "" : "s"); copied \(result.copiedAfterMoveFailureFiles) because source delete failed", level: .warning)
+            let diagnosticsToLog = result.moveFallbackDiagnostics.prefix(20)
+            for diagnostic in diagnosticsToLog {
+                appState.log("\(label)Move fallback diagnostic: \(diagnostic)", level: .warning)
+            }
+            if result.moveFallbackDiagnostics.count > diagnosticsToLog.count {
+                appState.log("\(label)Move fallback diagnostic: \(result.moveFallbackDiagnostics.count - diagnosticsToLog.count) additional file\(result.moveFallbackDiagnostics.count - diagnosticsToLog.count == 1 ? "" : "s") omitted", level: .warning)
+            }
+        } else if appState.importMode == .move {
+            appState.log("\(label)Moved \(result.fileCount) file\(result.fileCount == 1 ? "" : "s")")
+        }
+        if result.failedFiles > 0 {
+            appState.log("\(label)Failed \(result.failedFiles) locked or unreadable file\(result.failedFiles == 1 ? "" : "s")", level: .warning)
+        }
+    }
+
+    private static func importOutcomeMessage(skippedFiles: Int, failedFiles: Int, copiedAfterMoveFailureFiles: Int, allSkipped: Bool) -> String? {
+        var messages: [String] = []
+        if skippedFiles > 0 {
+            let prefix = allSkipped ? "All" : "Skipped"
+            messages.append("\(prefix) \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s")\(allSkipped ? " already imported" : "")")
+        }
+        if copiedAfterMoveFailureFiles > 0 {
+            messages.append("Copied \(copiedAfterMoveFailureFiles) because source delete failed")
+        }
+        if failedFiles > 0 {
+            messages.append("Failed \(failedFiles) locked or unreadable file\(failedFiles == 1 ? "" : "s")")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: ". ")
     }
 
     private func pauseImport() {

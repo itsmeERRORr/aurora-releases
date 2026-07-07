@@ -80,21 +80,33 @@ final class VolumeWatcher {
             let resourceValues = try? url.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsInternalKey])
             let name = resourceValues?.volumeName ?? url.lastPathComponent
             let isRemovable = resourceValues?.volumeIsRemovable ?? false
+            let isExternal = isExternalVolume(
+                isRemovable: isRemovable,
+                isLocal: resourceValues?.volumeIsLocal ?? false,
+                isInternal: resourceValues?.volumeIsInternal ?? false
+            )
+
+            if isExternal {
+                appState.refreshReachableEventJPGDayCaches(reason: "external volume scan")
+            }
 
             if shouldProcessVolume(url, name: name, isRemovable: isRemovable, isLocal: resourceValues?.volumeIsLocal ?? false, isInternal: resourceValues?.volumeIsInternal ?? false) {
-                if let info = makeVolumeInfo(from: url) {
-                    if let index = appState.mountedVolumes.firstIndex(where: { $0.path == info.path }) {
+                let extensions = appState.supportedExtensions
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard let info = await self.makeVolumeInfoAsync(from: url, extensions: extensions) else { return }
+                    if let index = self.appState.mountedVolumes.firstIndex(where: { $0.path == info.path }) {
                         var updated = info
-                        updated.isActive = appState.activeVolume?.path == info.path && info.rawFileCount > 0
-                        appState.mountedVolumes[index] = updated
-                        if appState.activeVolume?.path == info.path {
-                            appState.activeVolume = info.rawFileCount > 0 ? updated : nil
+                        updated.isActive = self.appState.activeVolume?.path == info.path && info.rawFileCount > 0
+                        self.appState.mountedVolumes[index] = updated
+                        if self.appState.activeVolume?.path == info.path {
+                            self.appState.activeVolume = info.rawFileCount > 0 ? updated : nil
                         }
                     } else {
-                        appState.mountedVolumes.append(info)
-                        appState.log("Found card: \(info.name) (\(info.rawFileCount) RAW files)")
+                        self.appState.mountedVolumes.append(info)
+                        self.appState.log("Found card: \(info.name) (\(info.rawFileCount) RAW files)")
                         if info.rawFileCount > 0 {
-                            activateVolume(info)
+                            self.activateVolume(info)
                         }
                     }
                 }
@@ -106,6 +118,15 @@ final class VolumeWatcher {
         let resourceValues = try? path.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsInternalKey])
         let name = resourceValues?.volumeName ?? path.lastPathComponent
         let isRemovable = resourceValues?.volumeIsRemovable ?? false
+        let isExternal = isExternalVolume(
+            isRemovable: isRemovable,
+            isLocal: resourceValues?.volumeIsLocal ?? false,
+            isInternal: resourceValues?.volumeIsInternal ?? false
+        )
+
+        if isExternal {
+            appState.refreshReachableEventJPGDayCaches(reason: "mounted \(name)")
+        }
 
         guard shouldProcessVolume(
             path,
@@ -117,15 +138,18 @@ final class VolumeWatcher {
 
         appState.log("Detected card mount: \(name)")
 
-        if let info = makeVolumeInfo(from: path) {
-            appState.mountedVolumes.removeAll { $0.path == info.path }
-            appState.mountedVolumes.append(info)
-            appState.log("Card \(info.name): \(info.rawFileCount) RAW files found")
+        let extensions = appState.supportedExtensions
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let info = await self.makeVolumeInfoAsync(from: path, extensions: extensions) else { return }
+            self.appState.mountedVolumes.removeAll { $0.path == info.path }
+            self.appState.mountedVolumes.append(info)
+            self.appState.log("Card \(info.name): \(info.rawFileCount) RAW files found")
 
             if info.rawFileCount > 0 {
-                activateVolume(info)
-                if appState.autoImport && appState.destinationURL != nil {
-                    appState.log("Auto-import triggered for \(info.name)")
+                self.activateVolume(info)
+                if self.appState.autoImport && self.appState.destinationURL != nil {
+                    self.appState.log("Auto-import triggered for \(info.name)")
                     NotificationCenter.default.post(name: .startAutoImport, object: nil)
                 }
             }
@@ -158,10 +182,15 @@ final class VolumeWatcher {
 
     private func shouldProcessVolume(_ url: URL, name: String, isRemovable: Bool, isLocal: Bool, isInternal: Bool) -> Bool {
         guard name != "Macintosh HD", !isDestinationVolume(url) else { return false }
-        if name == "Untitled" || isRemovable { return true }
-        // CFexpress readers over Thunderbolt may appear as local, non-internal
-        // volumes rather than removable/ejectable media.
-        return isLocal && !isInternal
+        // Must be removable or a CF Express reader over Thunderbolt (local, non-internal)
+        guard isExternalVolume(isRemovable: isRemovable, isLocal: isLocal, isInternal: isInternal) else { return false }
+        // Require a DCIM folder — the universal camera card standard (SD, CF Express).
+        // This filters out external SSDs and NVMe drives that have no camera structure.
+        return FileManager.default.fileExists(atPath: url.appendingPathComponent("DCIM").path)
+    }
+
+    private func isExternalVolume(isRemovable: Bool, isLocal: Bool, isInternal: Bool) -> Bool {
+        isRemovable || (isLocal && !isInternal)
     }
 
     private func isDestinationVolume(_ volumeURL: URL) -> Bool {
@@ -203,11 +232,18 @@ final class VolumeWatcher {
         }
     }
 
-    private func makeVolumeInfo(from url: URL) -> VolumeInfo? {
+    // Recursively enumerating a whole card/reader can take seconds on large
+    // shoots, so the count runs off the main thread — calling this
+    // synchronously from `scanExistingVolumes()`/`handleMountInternal()` (as
+    // it used to) blocked all UI, including scroll, right at app launch or
+    // whenever a card was inserted.
+    private func makeVolumeInfoAsync(from url: URL, extensions: Set<String>) async -> VolumeInfo? {
         let resourceValues = try? url.resourceValues(forKeys: [.volumeNameKey, .volumeIsRemovableKey])
         let name = resourceValues?.volumeName ?? url.lastPathComponent
 
-        let rawCount = countRawFiles(at: url)
+        let rawCount = await Task.detached(priority: .utility) {
+            Self.countRawFiles(at: url, extensions: extensions)
+        }.value
         if rawCount > 0 {
             SecurityBookmarkManager.shared.saveBookmark(for: url)
         }
@@ -225,6 +261,17 @@ final class VolumeWatcher {
         Self.countRawFiles(at: url, extensions: appState.supportedExtensions)
     }
 
+    /// Whether `url` sits on a local volume (internal disk or direct-attached
+    /// storage) rather than a network share (NAS/SMB/AFP). Used to size exiftool
+    /// batches: local disks can take much bigger batches safely, but a NAS's higher
+    /// per-file I/O latency means a stalled/slow batch is more likely, so it keeps
+    /// the smaller, more conservative batch size. Defaults to `true` (local) when
+    /// the volume can't be queried, matching the existing (pre-NAS-detection)
+    /// behavior instead of silently making an unrecognized volume the slow path.
+    nonisolated static func isLocalVolume(at url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal ?? true
+    }
+
     /// Count RAW files recursively in a folder (including subfolders). Thread-safe; can be called from background.
     /// - Parameter modifiedOnOrAfter: if non-nil, only count files with contentModificationDate >= this date (e.g. last 12 months).
     nonisolated static func countRawFiles(at url: URL, extensions: Set<String>, modifiedOnOrAfter: Date? = nil) -> Int {
@@ -240,7 +287,6 @@ final class VolumeWatcher {
         ) else { return 0 }
         var count = 0
         for case let fileURL as URL in enumerator {
-            guard (try? fileURL.checkResourceIsReachable()) ?? false else { continue }
             let ext = fileURL.pathExtension.lowercased()
             guard extensions.contains(ext) else { continue }
             if let cutoff = modifiedOnOrAfter {
@@ -270,10 +316,6 @@ final class VolumeWatcher {
 
         var files: [URL] = []
         for case let fileURL as URL in enumerator {
-            // Skip files that cause I/O errors
-            guard (try? fileURL.checkResourceIsReachable()) ?? false else {
-                continue
-            }
             let ext = fileURL.pathExtension.lowercased()
             if appState.supportedExtensions.contains(ext) {
                 files.append(fileURL)
@@ -295,7 +337,6 @@ final class VolumeWatcher {
         ) else { return [] }
         var files: [URL] = []
         for case let fileURL as URL in enumerator {
-            guard (try? fileURL.checkResourceIsReachable()) ?? false else { continue }
             let ext = fileURL.pathExtension.lowercased()
             if extensions.contains(ext) {
                 files.append(fileURL)

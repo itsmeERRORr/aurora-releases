@@ -26,6 +26,7 @@ struct SettingsView: View {
     @State private var hasSavedTelegramBotToken = false
     @State private var telegramStatus: String?
     @State private var isSendingTelegramTest = false
+    @State private var analyticsOptOut = UserDefaults.standard.bool(forKey: "aurora.analyticsOptOut")
     @State private var licenseKey = ""
     @State private var licenseStatus: String?
     @State private var licenseIsActive = LicensingService.isActivated()
@@ -84,11 +85,11 @@ struct SettingsView: View {
 
     // MARK: - License
 
-    // MARK: - Stripe URLs
-    private let stripeProURL      = "https://buy.stripe.com/test_28E3cx0Jgb6IceT2ny8Zq00"
-    private let stripeLifetimeURL = "https://buy.stripe.com/test_7sY00l0Jggr2a6LbY88Zq02"
-    // TODO: substituir pelo link do Customer Portal quando estiver em produção
-    private let stripePortalURL   = "https://billing.stripe.com/p/login/YOUR_PORTAL_LINK"
+    // MARK: - Stripe URLs (LIVE)
+    private let stripeProMonthlyURL = "https://buy.stripe.com/aFa28kcXN9je92J6dl6J205"      // Pro monthly (5.99€ +VAT/month)
+    private let stripeProYearlyURL  = "https://buy.stripe.com/7sY5kwe1R9je4MtatB6J203"      // Pro yearly (59€ +VAT/yr)
+    private let stripeLifetimeURL   = "https://buy.stripe.com/bJe5kwcXNeDydiZ59h6J204"      // Lifetime (100€ +VAT/1 time-payment)
+    private let stripePortalURL     = "https://billing.stripe.com/p/login/aFa28k5vl1QM0wdeJR6J200"      // Customer Portal
 
     private var licenseSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -158,14 +159,15 @@ struct SettingsView: View {
                             .foregroundStyle(Color.auroraTxt)
                         planBadge("PRO", color: .auroraCyan)
                     }
-                    if let exp = activation?.expiresAt {
-                        Text("Active until \(exp.formatted(date: .long, time: .omitted))")
-                            .font(.manrope(11, weight: .medium))
-                            .foregroundStyle(Color.auroraFaint)
-                    } else {
+                    HStack(spacing: 4) {
                         Text("Active")
                             .font(.manrope(11, weight: .medium))
-                            .foregroundStyle(Color.auroraFaint)
+                            .foregroundStyle(Color.auroraHealthy)
+                        if let exp = activation?.expiresAt {
+                            Text("· until \(exp.formatted(date: .abbreviated, time: .omitted))")
+                                .font(.manrope(11, weight: .medium))
+                                .foregroundStyle(Color.auroraFaint)
+                        }
                     }
                 }
                 Spacer()
@@ -211,39 +213,58 @@ struct SettingsView: View {
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
             } else {
-                Button {
-                    showCancelConfirm = true
-                } label: {
-                    if isCancelling {
-                        Label("Cancelling…", systemImage: "hourglass")
-                            .font(.manrope(11, weight: .semibold))
-                            .foregroundStyle(Color.auroraMuted)
-                    } else {
-                        Label("Cancel subscription", systemImage: "xmark.circle")
+                HStack(spacing: 16) {
+                    Button {
+                        openStripeCustomerPortal()
+                    } label: {
+                        Label("Manage subscription", systemImage: "creditcard")
                             .font(.manrope(11, weight: .semibold))
                             .foregroundStyle(Color.auroraMuted)
                     }
-                }
-                .buttonStyle(.plain)
-                .disabled(isCancelling)
-                .confirmationDialog(
-                    "Cancel subscription?",
-                    isPresented: $showCancelConfirm,
-                    titleVisibility: .visible
-                ) {
-                    Button("Cancel subscription", role: .destructive) {
-                        performCancellation(activation: activation)
+                    .buttonStyle(.plain)
+
+                    Button {
+                        showCancelConfirm = true
+                    } label: {
+                        if isCancelling {
+                            Label("Cancelling…", systemImage: "hourglass")
+                                .font(.manrope(11, weight: .semibold))
+                                .foregroundStyle(Color.auroraMuted)
+                        } else {
+                            Label("Cancel subscription", systemImage: "xmark.circle")
+                                .font(.manrope(11, weight: .semibold))
+                                .foregroundStyle(Color.auroraMuted)
+                        }
                     }
-                    Button("Keep subscription", role: .cancel) {}
-                } message: {
-                    if let exp = activation?.expiresAt {
-                        Text("Are you sure? You'll keep full access until \(exp.formatted(date: .long, time: .omitted)).")
-                    } else {
-                        Text("Are you sure you want to cancel your Pro subscription?")
+                    .buttonStyle(.plain)
+                    .disabled(isCancelling)
+                    .confirmationDialog(
+                        "Cancel subscription?",
+                        isPresented: $showCancelConfirm,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Cancel subscription", role: .destructive) {
+                            performCancellation(activation: activation)
+                        }
+                        Button("Keep subscription", role: .cancel) {}
+                    } message: {
+                        if let exp = activation?.expiresAt {
+                            Text("Are you sure? You'll keep full access until \(exp.formatted(date: .long, time: .omitted)).")
+                        } else {
+                            Text("Are you sure you want to cancel your Pro subscription?")
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Opens Stripe's hosted Customer Portal, where the user manages their own
+    /// payment method, billing address and invoices — separate from the in-app
+    /// "Cancel subscription" flow, which calls our own Edge Function directly.
+    private func openStripeCustomerPortal() {
+        guard let url = URL(string: stripePortalURL) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private func performCancellation(activation: LicensingService.StoredActivation?) {
@@ -347,6 +368,14 @@ struct SettingsView: View {
         }
     }
 
+    /// One priced call-to-action on an upgrade card (e.g. "5.99€ +VAT/month" → the
+    /// Pro monthly Stripe link). A card can show more than one — Pro shows monthly
+    /// and yearly side by side; Lifetime shows its single one-time price.
+    private struct UpgradeCTA {
+        let label: String
+        let baseURL: String
+    }
+
     private func upgradeCards(email: String?) -> some View {
         HStack(spacing: 10) {
             upgradeCard(
@@ -354,8 +383,10 @@ struct SettingsView: View {
                 title: "Pro",
                 description: "Monthly or yearly.\nCancel any time.",
                 accent: Color.auroraCyan,
-                label: "Get Pro",
-                baseURL: stripeProURL,
+                ctas: [
+                    UpgradeCTA(label: "5.99€ +VAT/month", baseURL: stripeProMonthlyURL),
+                    UpgradeCTA(label: "59€ +VAT/yr", baseURL: stripeProYearlyURL),
+                ],
                 email: email
             )
             upgradeCard(
@@ -363,61 +394,72 @@ struct SettingsView: View {
                 title: "Lifetime",
                 description: "Pay once.\nYours forever.",
                 accent: Color.auroraGold,
-                label: "Get Lifetime",
-                baseURL: stripeLifetimeURL,
+                ctas: [
+                    UpgradeCTA(label: "100€ +VAT/1 time-payment", baseURL: stripeLifetimeURL),
+                ],
                 email: email
             )
         }
     }
 
-    private func upgradeCard(icon: String, title: String, description: String, accent: Color, label: String, baseURL: String, email: String?) -> some View {
-        Button(action: stripeAction(baseURL: baseURL, email: email)) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: icon)
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(accent)
-                    Text(title)
-                        .font(.manrope(15, weight: .black))
-                        .foregroundStyle(Color.auroraTxt)
-                    Spacer()
-                }
-                Text(description)
-                    .font(.manrope(11, weight: .medium))
-                    .foregroundStyle(Color.auroraFaint)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .lineSpacing(2)
-
-                Text(label)
-                    .font(.manrope(12, weight: .bold))
+    private func upgradeCard(icon: String, title: String, description: String, accent: Color, ctas: [UpgradeCTA], email: String?) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .bold))
                     .foregroundStyle(accent)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 7)
-                    .background(accent.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Text(title)
+                    .font(.manrope(15, weight: .black))
+                    .foregroundStyle(Color.auroraTxt)
+                Spacer()
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(accent.opacity(0.05))
-            .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
-            .overlay(
-                RoundedRectangle(cornerRadius: AuroraRadius.small)
-                    .stroke(accent.opacity(0.4), lineWidth: 1)
-            )
+            Text(description)
+                .font(.manrope(11, weight: .medium))
+                .foregroundStyle(Color.auroraFaint)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineSpacing(2)
+
+            HStack(spacing: 6) {
+                ForEach(ctas, id: \.label) { cta in
+                    Button(action: stripeAction(baseURL: cta.baseURL, email: email)) {
+                        Text(cta.label)
+                            .font(.manrope(12, weight: .bold))
+                            .foregroundStyle(accent)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .padding(.horizontal, 4)
+                            .background(accent.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
-        .buttonStyle(.plain)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(accent.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
+        .overlay(
+            RoundedRectangle(cornerRadius: AuroraRadius.small)
+                .stroke(accent.opacity(0.4), lineWidth: 1)
+        )
     }
 
     // MARK: - Shared components
 
+    @ViewBuilder
     private var deactivateButton: some View {
-        Button("Deactivate") {
-            LicensingService.deactivate()
-            appState.refreshLicenseStatus()
-            licenseIsActive = false
-            licenseStatus = nil
+        if AppPaths.isBeta {
+            Button("Deactivate") {
+                LicensingService.deactivate()
+                appState.refreshLicenseStatus()
+                licenseIsActive = false
+                licenseStatus = nil
+            }
+            .buttonStyle(AuroraGhostButtonStyle())
         }
-        .buttonStyle(AuroraGhostButtonStyle())
     }
 
     private func planBadge(_ label: String, color: Color) -> some View {
@@ -501,7 +543,7 @@ struct SettingsView: View {
                           help: "Eject the card once the import finishes.",
                           binding: $appState.autoEject)
                 toggleRow(label: "Auto-subfolders",
-                          help: "Organize imports into Year/Date subfolders automatically (e.g. 2026/14-06-2026).",
+                          help: "Organize imports into Year/Date subfolders automatically (e.g. 2026/2026-06-14).",
                           binding: $appState.autoSubfolders)
                 modePicker
             }
@@ -963,6 +1005,28 @@ struct SettingsView: View {
                         .buttonStyle(AuroraGhostButtonStyle())
                 }
 
+                HStack(spacing: 12) {
+                    IconChip(systemName: "chart.bar.xaxis", color: .auroraFaint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Share anonymous usage stats")
+                            .font(.manrope(13, weight: .bold))
+                            .foregroundStyle(Color.auroraTxt)
+                        Text("Helps improve Aurora. No personal data like names, emails, or event names are collected — only camera models, lenses, and shooting settings.")
+                            .font(.manrope(11, weight: .medium))
+                            .foregroundStyle(Color.auroraFaint)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { !analyticsOptOut },
+                        set: { enabled in
+                            analyticsOptOut = !enabled
+                            UserDefaults.standard.set(!enabled, forKey: "aurora.analyticsOptOut")
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+
                 if AppPaths.isBeta {
                     HStack(spacing: 12) {
                         IconChip(systemName: "trash.circle.fill", color: .auroraLive)
@@ -1269,6 +1333,49 @@ struct SettingsView: View {
         func makePath(_ name: String) -> String {
             root.appendingPathComponent("mock_events/\(name)").path
         }
+        func dayKey(_ date: Date) -> String {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd"
+            return formatter.string(from: date)
+        }
+        func mockCaptureTimestamps(photoCount: Int, startDate: Date) -> [String: [Double]] {
+            let dayCount = photoCount >= 3600 ? 3 : (photoCount >= 1800 ? 2 : 1)
+            var remaining = photoCount
+            var result: [String: [Double]] = [:]
+
+            for dayOffset in 0..<dayCount {
+                let date = cal.date(byAdding: .day, value: dayOffset, to: startDate) ?? startDate
+                let daysLeft = max(dayCount - dayOffset, 1)
+                let count = dayOffset == dayCount - 1 ? remaining : max(1, remaining / daysLeft)
+                remaining -= count
+
+                let dayStart = cal.startOfDay(for: date).timeIntervalSince1970
+                let coverageStart = dayStart + Double(10 + dayOffset) * 3600
+                let coverageSeconds = Double(5 + (photoCount / 1800) + dayOffset) * 3600
+                let spacing = max(1.0, coverageSeconds / Double(max(count, 1)))
+                result[dayKey(date)] = (0..<count).map { idx in
+                    coverageStart + Double(idx) * spacing
+                }
+            }
+            return result
+        }
+        func cameraMetadata(
+            for cameras: [(make: String, model: String, pct: Double)],
+            eventDate: Date,
+            eventIndex: Int
+        ) -> (maxShutterCounts: [String: Int], lastSeenDates: [String: Date]) {
+            var shutterCounts: [String: Int] = [:]
+            var lastSeen: [String: Date] = [:]
+            for (idx, camera) in cameras.enumerated() {
+                let key = "\(camera.make)|\(camera.model)"
+                lastSeen[key] = cal.date(byAdding: .hour, value: idx * 2, to: eventDate) ?? eventDate
+                if camera.make.lowercased().contains("sony") || camera.make.lowercased().contains("canon") || camera.make.lowercased().contains("nikon") {
+                    shutterCounts[key] = 18_000 + eventIndex * 3_750 + idx * 8_500
+                }
+            }
+            return (shutterCounts, lastSeen)
+        }
 
         // MARK: - Events (diverse categories)
         struct MockEvent {
@@ -1401,7 +1508,7 @@ struct SettingsView: View {
         // Older events (before 2026-05) are finalized; newer ones are active
         let finalizedCutoff = makeDate(year: 2026, month: 5, day: 1)
 
-        for event in events {
+        for (eventIndex, event) in events.enumerated() {
             let eventDate = makeDate(year: event.year, month: event.month, day: event.day)
             let isFinalized = eventDate < finalizedCutoff
 
@@ -1412,7 +1519,18 @@ struct SettingsView: View {
                 StatsReport.LensStat(make: l.make, model: l.model, count: Int(Double(event.photos) * l.pct), rank: i + 1)
             }
             let cameras = event.cameras.map { StatsReport.CameraStat(make: $0.make, model: $0.model, count: Int(Double(event.photos) * $0.pct)) }
-            let mainCamera = cameras.max(by: { $0.count < $1.count })
+            let captureTimestampsByDay = mockCaptureTimestamps(photoCount: event.photos, startDate: eventDate)
+            let cameraMeta = cameraMetadata(for: event.cameras, eventDate: eventDate, eventIndex: eventIndex)
+            let mainCamera = cameras.max(by: { $0.count < $1.count }).map { camera in
+                let key = "\(camera.make)|\(camera.model)"
+                return StatsReport.CameraStat(
+                    make: camera.make,
+                    model: camera.model,
+                    count: camera.count,
+                    maxShutterCount: cameraMeta.maxShutterCounts[key],
+                    lastSeenDate: cameraMeta.lastSeenDates[key]
+                )
+            }
 
             let snapshot = StatsReport(
                 topLenses: topLenses,
@@ -1434,7 +1552,10 @@ struct SettingsView: View {
                 importCount: Int.random(in: 1...3),
                 lensCounts: eventLensCounts,
                 cameraCounts: eventCameraCounts,
-                orientationCounts: ["landscape": Int(Double(event.photos) * 0.55), "portrait": Int(Double(event.photos) * 0.45)]
+                orientationCounts: ["landscape": Int(Double(event.photos) * 0.55), "portrait": Int(Double(event.photos) * 0.45)],
+                captureTimestampsByDay: captureTimestampsByDay,
+                cameraMaxShutterCounts: cameraMeta.maxShutterCounts,
+                cameraLastSeenDates: cameraMeta.lastSeenDates
             )
 
             if isFinalized {
@@ -1454,7 +1575,9 @@ struct SettingsView: View {
             // Import history: 1-3 sessions per event
             let sessionCount = Int.random(in: 1...3)
             for s in 0..<sessionCount {
-                let sessionDate = cal.date(byAdding: .hour, value: s * 6, to: eventDate) ?? eventDate
+                let sessionDate = s == 2
+                    ? (cal.date(byAdding: .day, value: 1, to: eventDate) ?? eventDate)
+                    : (cal.date(byAdding: .hour, value: s * 6, to: eventDate) ?? eventDate)
                 let fraction = s == 0 ? 0.6 : (s == 1 ? 0.3 : 0.1)
                 let sessionFiles = max(Int(Double(event.photos) * fraction), 10)
                 let sessionBytes = Int64(Double(sessionFiles) * 20.0 * 1024 * 1024)
@@ -1556,12 +1679,22 @@ struct SettingsView: View {
 
             let eventCameraCounts = event.cameras.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
             let eventLensCounts = event.lenses.reduce(into: [String: Int]()) { $0["\($1.make)|\($1.model)"] = Int(Double(event.photos) * $1.pct) }
+            let eventDate = makeDate(year: event.year, month: event.month, day: event.day)
+            let captureTimestampsByDay = mockCaptureTimestamps(photoCount: event.photos, startDate: eventDate)
+            let cameraMeta = cameraMetadata(for: event.cameras, eventDate: eventDate, eventIndex: i)
+            let primaryCameraKey = "\(event.cameras[0].make)|\(event.cameras[0].model)"
 
             let cachedReport = StatsReport(
                 topLenses: event.lenses.prefix(5).enumerated().map { idx, l in
                     StatsReport.LensStat(make: l.make, model: l.model, count: Int(Double(event.photos) * l.pct), rank: idx + 1)
                 },
-                mostUsedCamera: StatsReport.CameraStat(make: event.cameras[0].make, model: event.cameras[0].model, count: Int(Double(event.photos) * event.cameras[0].pct)),
+                mostUsedCamera: StatsReport.CameraStat(
+                    make: event.cameras[0].make,
+                    model: event.cameras[0].model,
+                    count: Int(Double(event.photos) * event.cameras[0].pct),
+                    maxShutterCount: cameraMeta.maxShutterCounts[primaryCameraKey],
+                    lastSeenDate: cameraMeta.lastSeenDates[primaryCameraKey]
+                ),
                 shutterSpeeds: [
                     StatsReport.ShutterStat(rawValue: 1.0/2000.0, count: Int(Double(event.photos) * 0.25)),
                     StatsReport.ShutterStat(rawValue: 1.0/1000.0, count: Int(Double(event.photos) * 0.35)),
@@ -1589,7 +1722,10 @@ struct SettingsView: View {
                 apertureSum: Double.random(in: 1.8...5.6) * Double(event.photos),
                 apertureCount: event.photos,
                 focalSum: Double.random(in: 24...200) * Double(event.photos),
-                focalCount: event.photos
+                focalCount: event.photos,
+                captureTimestampsByDay: captureTimestampsByDay,
+                cameraMaxShutterCounts: cameraMeta.maxShutterCounts,
+                cameraLastSeenDates: cameraMeta.lastSeenDates
             )
             EventStatsCache.save(cachedReport, forPath: eventPath, scanDate: Date(), rawFileCountAtScan: rawCount)
         }
@@ -1661,12 +1797,28 @@ struct SettingsView: View {
 
         var mergedCameraCounts: [String: Int] = [:]
         var mergedLensCounts: [String: Int] = [:]
-        for event in events {
+        var mergedCaptureTimestampsByDay: [String: [Double]] = [:]
+        var mergedCameraMaxShutterCounts: [String: Int] = [:]
+        var mergedCameraLastSeenDates: [String: Date] = [:]
+        for (eventIndex, event) in events.enumerated() {
+            let eventDate = makeDate(year: event.year, month: event.month, day: event.day)
             for (key, pct) in event.cameras.map({ ("\($0.make)|\($0.model)", $0.pct) }) {
                 mergedCameraCounts[key, default: 0] += Int(Double(event.photos) * pct)
             }
             for (key, pct) in event.lenses.map({ ("\($0.make)|\($0.model)", $0.pct) }) {
                 mergedLensCounts[key, default: 0] += Int(Double(event.photos) * pct)
+            }
+            for (day, timestamps) in mockCaptureTimestamps(photoCount: event.photos, startDate: eventDate) {
+                mergedCaptureTimestampsByDay[day, default: []].append(contentsOf: timestamps)
+            }
+            let meta = cameraMetadata(for: event.cameras, eventDate: eventDate, eventIndex: eventIndex)
+            for (key, count) in meta.maxShutterCounts {
+                mergedCameraMaxShutterCounts[key] = max(mergedCameraMaxShutterCounts[key] ?? 0, count)
+            }
+            for (key, date) in meta.lastSeenDates {
+                if date > (mergedCameraLastSeenDates[key] ?? .distantPast) {
+                    mergedCameraLastSeenDates[key] = date
+                }
             }
         }
 
@@ -1687,10 +1839,17 @@ struct SettingsView: View {
         }
 
         let shutterCounts: [Double: Int] = [1.0/8000: 400, 1.0/4000: 800, 1.0/2000: 2200, 1.0/1000: 3800, 1.0/500: 2200, 1.0/250: 1100, 1.0/125: 700]
+        let topCameraKey = "Sony|ILCE-9M3"
 
         let totalStats = StatsReport(
             topLenses: Array(mergedTopLenses),
-            mostUsedCamera: StatsReport.CameraStat(make: "Sony", model: "ILCE-9M3", count: mergedCameraCounts["Sony|ILCE-9M3"] ?? Int(Double(totalPhotos) * 0.45)),
+            mostUsedCamera: StatsReport.CameraStat(
+                make: "Sony",
+                model: "ILCE-9M3",
+                count: mergedCameraCounts[topCameraKey] ?? Int(Double(totalPhotos) * 0.45),
+                maxShutterCount: mergedCameraMaxShutterCounts[topCameraKey],
+                lastSeenDate: mergedCameraLastSeenDates[topCameraKey]
+            ),
             shutterSpeeds: shutterCounts.map { StatsReport.ShutterStat(rawValue: $0.key, count: $0.value) }.sorted { $0.rawValue > $1.rawValue },
             totalFilesAnalyzed: totalPhotos,
             rawOutput: "[]",
@@ -1714,7 +1873,10 @@ struct SettingsView: View {
             apertureCount: totalPhotos,
             focalSum: 135 * Double(totalPhotos),
             focalCount: totalPhotos,
-            monthCounts: monthCounts
+            monthCounts: monthCounts,
+            captureTimestampsByDay: mergedCaptureTimestampsByDay,
+            cameraMaxShutterCounts: mergedCameraMaxShutterCounts,
+            cameraLastSeenDates: mergedCameraLastSeenDates
         )
 
         // MARK: - Last import report (hero card)

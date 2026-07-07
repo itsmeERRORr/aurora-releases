@@ -19,15 +19,20 @@ struct AdvancedView: View {
     @State private var showImportConfirmation = false
     @State private var showNoSelectionAlert = false
     @State private var showNoDestinationAlert = false
+    @State private var showLicenseExpiredAlert = false
     @State private var importEngine = ImportEngine()
-    @State private var gridWidth: CGFloat = 0
     @State private var selectedSourceID: String?
+    private let gridPanelWidth: CGFloat = 450
     @State private var loadFilesTask: Task<Void, Never>?
     @State private var thumbnailTasks: [URL: Task<Void, Never>] = [:]
+    @State private var panelImageStates: [URL: ThumbnailState] = [:]
+    @State private var panelImageTasks: [URL: Task<Void, Never>] = [:]
+    @State private var panelRawLoaded: Set<URL> = []
     @State private var previewTask: Task<Void, Never>?
     @State private var modifierEventMonitor: Any?
     @State private var currentModifierFlags: NSEvent.ModifierFlags = []
     @State private var mouseDownModifierFlags: NSEvent.ModifierFlags = []
+    @State private var totalBytes: Int64 = 0
 
     @FocusState private var isGalleryFocused: Bool
     @FocusState private var isPreviewFocused: Bool
@@ -53,12 +58,9 @@ struct AdvancedView: View {
 
     private var displayedFiles: [URL] {
         switch ratingFilter {
-        case .all:
-            return files
-        case .rated:
-            return files.filter { rating(for: $0) != nil }
-        case .unrated:
-            return files.filter { rating(for: $0) == nil }
+        case .all:    return files
+        case .rated:  return files.filter { rating(for: $0) != nil }
+        case .unrated: return files.filter { rating(for: $0) == nil }
         }
     }
 
@@ -68,7 +70,7 @@ struct AdvancedView: View {
 
     private var showImportOverlay: Bool {
         switch appState.importState {
-        case .importing, .paused, .scanning, .verifying, .ejecting, .ejectingDone, .generatingStats, .error:
+        case .importing, .paused, .scanning, .verifying, .ejecting, .ejectingDone, .error:
             return true
         default:
             return false
@@ -78,14 +80,33 @@ struct AdvancedView: View {
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
-                header
+                topBar
 
-                Rectangle()
-                    .fill(Color.auroraStroke)
-                    .frame(height: 1)
+                Rectangle().fill(Color.auroraStroke).frame(height: 1)
 
-                gallery
+                HStack(alignment: .top, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        largePreviewPanel
+                            .aspectRatio(3/2, contentMode: .fit)
+                            .frame(maxWidth: .infinity)
+                        sourceHeaderInfo
+                            .padding(.horizontal, 4)
+                            .padding(.top, 10)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    Rectangle().fill(Color.white.opacity(0.10)).frame(width: 1)
+                    thumbnailGridPanel
+                        .frame(width: 450, height: 524)
+                        .clipped()
+                }
+                .frame(height: 524)
+
+                Rectangle().fill(Color.auroraStroke).frame(height: 1)
+
+                bottomBar
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(AuroraBackground())
 
             if let selectedFile, let previewImage {
@@ -95,8 +116,7 @@ struct AdvancedView: View {
             }
 
             if showImportOverlay {
-                Color.black.opacity(0.38)
-                    .ignoresSafeArea()
+                Color.black.opacity(0.38).ignoresSafeArea()
                 ProgressOverlayView(
                     appState: appState,
                     onPause: pauseImport,
@@ -106,7 +126,8 @@ struct AdvancedView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
         }
-        .frame(minWidth: 980, minHeight: 720)
+        .frame(minWidth: 1100, idealWidth: 1280, maxWidth: .infinity,
+               minHeight: 618, idealHeight: 720, maxHeight: .infinity)
         .onAppear {
             startModifierMonitor()
             loadFiles()
@@ -125,6 +146,12 @@ struct AdvancedView: View {
                 selectionAnchorIndex = displayedFiles.firstIndex { selectedFiles.contains($0) }
             }
         }
+        .onChange(of: selectedFile) { _, file in
+            if let file {
+                loadThumbnailIfNeeded(for: file)
+                loadPanelImageIfNeeded(for: file)
+            }
+        }
         .alert("Import selected photos?", isPresented: $showImportConfirmation) {
             Button("Import") { importSelectedFiles() }
             Button("Cancel", role: .cancel) { }
@@ -141,135 +168,316 @@ struct AdvancedView: View {
         } message: {
             Text("Choose an import destination before importing selected photos.")
         }
+        .alert("License Expired", isPresented: $showLicenseExpiredAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Your Aurora license has expired. Renew your license to continue importing.")
+        }
     }
 
-    private var header: some View {
-        HStack(alignment: .top, spacing: 16) {
-            IconChip(systemName: "rectangle.grid.3x2.fill", color: .auroraCyan, size: 38, iconScale: 0.48)
+    // MARK: - Top Bar
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Advanced Import")
-                    .font(.auroraTopbarH2)
-                    .tracking(-0.4)
-                    .foregroundStyle(Color.auroraTxt)
+    private var topBar: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text("Aurora — Advanced Import")
+                .font(.sora(14, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
 
-                Text(headerSubtitle)
-                    .font(.manrope(12.5, weight: .semibold))
-                    .foregroundStyle(Color.auroraMuted)
+            Spacer(minLength: 12)
 
-                if !files.isEmpty {
-                    HStack(spacing: 8) {
-                        if sourceVolumes.count > 1 {
-                            Menu {
-                                Button {
-                                    selectedSourceID = nil
-                                    loadFiles()
-                                } label: {
-                                    Label("All Cards", systemImage: selectedSourceID == nil ? "checkmark" : "")
-                                }
-                                Divider()
-                                ForEach(sourceVolumes) { volume in
-                                    Button {
-                                        selectedSourceID = volume.id
-                                        loadFiles()
-                                    } label: {
-                                        Label(volume.name, systemImage: selectedSourceID == volume.id ? "checkmark" : "")
-                                    }
-                                }
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Text(sourceSelectionTitle)
-                                        .font(.manrope(11.5, weight: .semibold))
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 9, weight: .bold))
-                                }
-                            }
-                            .menuStyle(.borderlessButton)
-                            .frame(minWidth: 120)
-                        }
-                        filterButton(.all)
-                        filterButton(.rated)
-                        filterButton(.unrated)
-                    }
-                    .padding(.top, 6)
+            if !files.isEmpty {
+                HStack(spacing: 6) {
+                    filterPill(.all)
+                    filterPill(.rated)
+                    filterPill(.unrated)
                 }
             }
 
-            Spacer()
+            Spacer().frame(width: 4)
 
-            VStack(alignment: .trailing, spacing: 10) {
-                HStack(spacing: 10) {
-                    Button("Import Selected") {
-                        beginImportConfirmation()
-                    }
-                    .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                    .disabled(selectedFilesInView.isEmpty || appState.destinationURL == nil)
-                    .opacity(selectedFilesInView.isEmpty || appState.destinationURL == nil ? 0.45 : 1)
-
-                    Button("Close", action: closeAdvanced)
-                        .buttonStyle(AuroraGhostButtonStyle())
-                }
-
-                Text(destinationLabel)
-                    .font(.manrope(11, weight: .semibold))
-                    .foregroundStyle(Color.auroraFaint)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 360, alignment: .trailing)
-            }
+            Button("Close", action: closeAdvanced)
+                .buttonStyle(AuroraGhostButtonStyle())
         }
-        .padding(.horizontal, AuroraSpacing.mainPaddingH)
-        .padding(.vertical, 18)
-    }
-
-    private var headerSubtitle: String {
-        if isLoadingFiles { return "Scanning source files…" }
-        guard !sourceVolumes.isEmpty else { return "No card detected" }
-        let selected = selectedFilesInView.count
-        if selected > 0 {
-            return "\(AuroraFormat.count(selected)) selected from \(AuroraFormat.count(displayedFiles.count)) shown · \(sourceSelectionTitle)"
-        }
-        return "\(AuroraFormat.count(displayedFiles.count)) files shown · \(AuroraFormat.count(files.count)) RAW files · \(sourceSelectionTitle)"
-    }
-
-    private var destinationLabel: String {
-        if let destination = appState.destinationURL {
-            return "Destination: \(destination.path)"
-        }
-        return "Choose a destination before importing"
-    }
-
-    private func filterButton(_ filter: RatingFilter) -> some View {
-        Button {
-            ratingFilter = filter
-        } label: {
-            Text(filterTitle(filter))
-        }
-        .buttonStyle(AuroraGhostButtonStyle(active: ratingFilter == filter))
-    }
-
-    private func filterTitle(_ filter: RatingFilter) -> String {
-        switch filter {
-        case .all:
-            return "All"
-        case .rated:
-            return "Rated (\(files.filter { rating(for: $0) != nil }.count))"
-        case .unrated:
-            return "Unrated"
-        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
     }
 
     @ViewBuilder
-    private var gallery: some View {
+    private var sourceHeaderInfo: some View {
+        HStack(spacing: 11) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.auroraCyan.opacity(0.16))
+                Image(systemName: "sdcard.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.auroraCyan)
+            }
+            .frame(width: 32, height: 32)
+
+            VStack(alignment: .leading, spacing: 2) {
+                if sourceVolumes.count > 1 {
+                    sourceMenu
+                } else {
+                    Text(headerTitle)
+                        .font(.sora(14, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                        .lineLimit(1)
+                }
+                Text(headerSubtitle)
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(Color.auroraFaint)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var sourceMenu: some View {
+        Menu {
+            Button {
+                selectedSourceID = nil
+                loadFiles()
+            } label: {
+                Label("All Cards", systemImage: selectedSourceID == nil ? "checkmark" : "")
+            }
+            Divider()
+            ForEach(sourceVolumes) { volume in
+                Button {
+                    selectedSourceID = volume.id
+                    loadFiles()
+                } label: {
+                    Label(volume.name, systemImage: selectedSourceID == volume.id ? "checkmark" : "")
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(headerTitle)
+                    .font(.sora(14, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+                    .lineLimit(1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private var headerTitle: String {
+        if isLoadingFiles { return "Scanning source files…" }
+        guard !sourceVolumes.isEmpty else { return "No card detected" }
+        if files.isEmpty { return sourceSelectionTitle }
+        return "\(sourceSelectionTitle) — \(AuroraFormat.count(files.count)) \(files.count == 1 ? "RAW" : "RAWs")"
+    }
+
+    private var headerSubtitle: String {
+        guard !files.isEmpty else { return "Insert a card with RAW files to begin" }
+        var parts: [String] = []
+        if totalBytes > 0 {
+            parts.append(ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file))
+        }
+        let thumbsLoading = displayedFiles.prefix(24).contains { (thumbnailStates[$0] ?? .loading) == .loading }
+        if thumbsLoading {
+            parts.append("reading previews")
+        } else {
+            let picks = files.filter { rating(for: $0) != nil }.count
+            parts.append(picks > 0 ? "\(AuroraFormat.count(picks)) picks" : "no picks yet")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func filterPill(_ filter: RatingFilter) -> some View {
+        let isActive = ratingFilter == filter
+        return Button {
+            ratingFilter = filter
+        } label: {
+            HStack(spacing: 5) {
+                if filter == .rated {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 9, weight: .bold))
+                } else if filter == .unrated {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                Text(filterPillTitle(filter))
+                    .font(.manrope(11, weight: .bold))
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 5)
+            .background(
+                Capsule()
+                    .fill(isActive ? Color.auroraCyan.opacity(0.18) : Color.auroraPanel)
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(isActive ? Color.auroraCyan.opacity(0.55) : Color.auroraStroke, lineWidth: 1)
+            )
+            .foregroundStyle(isActive ? Color.auroraCyan : Color.auroraMuted)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func filterPillTitle(_ filter: RatingFilter) -> String {
+        switch filter {
+        case .all:     return "All \(AuroraFormat.count(files.count))"
+        case .rated:   return "Picks \(AuroraFormat.count(files.filter { rating(for: $0) != nil }.count))"
+        case .unrated: return "Unrated \(AuroraFormat.count(files.filter { rating(for: $0) == nil }.count))"
+        }
+    }
+
+    // MARK: - Large Preview Panel
+
+    private var largePreviewPanel: some View {
+        previewImageArea
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var previewImageArea: some View {
+        let file = selectedFile ?? displayedFiles.first
+        return ZStack {
+            Color.clear
+
+            if let file {
+                let panelState = panelImageStates[file] ?? .loading
+
+                // Photo
+                switch panelState {
+                case .loaded(let img):
+                    Image(nsImage: img)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .loading:
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(Color.auroraCyan)
+                case .failed:
+                    Image(systemName: "photo")
+                        .font(.system(size: 44, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+
+                // Gradient overlays for legibility
+                VStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [Color.black.opacity(0.55), Color.clear],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .frame(height: 80)
+                    Spacer()
+                    LinearGradient(
+                        colors: [Color.clear, Color.black.opacity(0.62)],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .frame(height: 100)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+
+                // UI overlay (PICK, counter, stars, filename)
+                VStack(spacing: 0) {
+                    HStack(alignment: .center) {
+                        if rating(for: file) != nil {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(Color.auroraHealthy)
+                                    .frame(width: 7, height: 7)
+                                Text("PICK")
+                                    .font(.manrope(10, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .tracking(0.8)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(Color.auroraHealthy.opacity(0.22)))
+                            .overlay(Capsule().strokeBorder(Color.auroraHealthy.opacity(0.45), lineWidth: 1))
+                        }
+                        Spacer()
+                        Text(fileCounter)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.72))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(Color.black.opacity(0.5)))
+                    }
+                    .padding(16)
+
+                    Spacer()
+
+                    HStack(alignment: .bottom) {
+                        HStack(spacing: 7) {
+                            ForEach(1...5, id: \.self) { value in
+                                Button {
+                                    setRating(value, for: file)
+                                    isGalleryFocused = true
+                                } label: {
+                                    Image(systemName: value <= (rating(for: file) ?? 0) ? "star.fill" : "star")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundStyle(Color.yellow)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            if rating(for: file) != nil {
+                                Button {
+                                    clearRating(for: file)
+                                    isGalleryFocused = true
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.white.opacity(0.42))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(file.lastPathComponent)
+                                .font(.manrope(11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.55))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: 220, alignment: .trailing)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            } else if !isLoadingFiles {
+                VStack(spacing: 12) {
+                    IconChip(systemName: "photo.on.rectangle.angled", color: .auroraViolet, size: 54, iconScale: 0.48)
+                    Text("Select a photo")
+                        .font(.manrope(16, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    Text("Click any thumbnail to preview")
+                        .font(.manrope(12, weight: .semibold))
+                        .foregroundStyle(Color.auroraMuted)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var fileCounter: String {
+        guard let file = selectedFile,
+              let index = displayedFiles.firstIndex(of: file) else {
+            return displayedFiles.isEmpty ? "0 / 0" : "– / \(displayedFiles.count)"
+        }
+        return String(format: "%04d / %04d", index + 1, displayedFiles.count)
+    }
+
+    // MARK: - Thumbnail Grid Panel
+
+    @ViewBuilder
+    private var thumbnailGridPanel: some View {
         if isLoadingFiles {
             VStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.large)
+                ProgressView().controlSize(.large)
                 Text("Loading RAW files…")
                     .font(.manrope(12, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.auroraBg)
         } else if displayedFiles.isEmpty {
             VStack(spacing: 12) {
                 IconChip(systemName: "photo.on.rectangle.angled", color: .auroraViolet, size: 54, iconScale: 0.48)
@@ -281,23 +489,33 @@ struct AdvancedView: View {
                     .foregroundStyle(Color.auroraMuted)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.auroraBg)
         } else {
-            GeometryReader { proxy in
-                let layout = gridLayout(for: proxy.size.width)
+            let gap: CGFloat = 10
+            let pad: CGFloat = 12
+            // Each cell = tileSize + gap (gap split as padding around each tile)
+            let cellSize: CGFloat = max(80, floor((gridPanelWidth - pad * 2) / 3))
+            let tileSize: CGFloat = max(60, cellSize - gap)
+            ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVGrid(columns: layout.columns, spacing: layout.spacing) {
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.fixed(cellSize), spacing: 0), count: 3),
+                        spacing: 0
+                    ) {
                         ForEach(Array(displayedFiles.enumerated()), id: \.element) { index, file in
-                            AdvancedPhotoTile(
+                            AdvancedThumb(
                                 file: file,
+                                size: tileSize,
                                 thumbnailState: thumbnailStates[file] ?? .loading,
                                 isSelected: selectedFiles.contains(file),
+                                isFocused: selectedFile == file,
                                 rating: rating(for: file),
                                 onSelect: { handleSelection(file, index: index) },
                                 onPreview: { openPreview(file) },
                                 onRate: { setRating($0, for: file) }
                             )
-                            .frame(width: layout.tileWidth)
-                            .clipped()
+                            .id(file)
+                            .padding(gap / 2)
                             .onAppear { loadThumbnailIfNeeded(for: file) }
                             .contextMenu {
                                 Button("Import This Photo") {
@@ -306,17 +524,21 @@ struct AdvancedView: View {
                                     beginImportConfirmation()
                                 }
                                 Divider()
-                                Button("Clear Rating") {
-                                    clearRating(for: file)
-                                }
+                                Button("Clear Rating") { clearRating(for: file) }
                             }
                         }
                     }
-                    .padding(layout.padding)
+                    .padding(.top, 5)
+                    .padding([.bottom, .leading, .trailing], pad)
                 }
                 .scrollIndicators(.hidden)
-                .onAppear { gridWidth = proxy.size.width }
-                .onChange(of: proxy.size.width) { _, width in gridWidth = width }
+                .onChange(of: selectedFile) { _, file in
+                    if let file {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            proxy.scrollTo(file, anchor: .center)
+                        }
+                    }
+                }
             }
             .focusable()
             .focused($isGalleryFocused)
@@ -337,27 +559,73 @@ struct AdvancedView: View {
                 if let selectedFile { openPreview(selectedFile) }
                 return .handled
             }
-            .onKeyPress(.leftArrow) { moveSelection(by: -1); return .handled }
-            .onKeyPress(.rightArrow) { moveSelection(by: 1); return .handled }
-            .onKeyPress(.upArrow) { moveSelection(by: -columnCount); return .handled }
-            .onKeyPress(.downArrow) { moveSelection(by: columnCount); return .handled }
+            .onKeyPress(.leftArrow)  { moveSelection(by: -1); return .handled }
+            .onKeyPress(.rightArrow) { moveSelection(by:  1); return .handled }
+            .onKeyPress(.upArrow)    { moveSelection(by: -3); return .handled }
+            .onKeyPress(.downArrow)  { moveSelection(by:  3); return .handled }
         }
     }
 
-    private func gridLayout(for width: CGFloat) -> (columns: [GridItem], tileWidth: CGFloat, spacing: CGFloat, padding: CGFloat) {
-        let spacing: CGFloat = 24
-        let padding: CGFloat = 24
-        let minTileWidth: CGFloat = 210
-        let contentWidth = max(width - padding * 2, minTileWidth)
-        let count = max(Int((contentWidth + spacing) / (minTileWidth + spacing)), 1)
-        let tileWidth = floor((contentWidth - spacing * CGFloat(count - 1)) / CGFloat(count))
-        let columns = Array(repeating: GridItem(.fixed(tileWidth), spacing: spacing), count: count)
-        return (columns, tileWidth, spacing, padding)
+    // MARK: - Bottom Bar
+
+    private var bottomBar: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 14) {
+                shortcutChip("1–5", "Rate")
+                shortcutChip("←→", "Navigate")
+                shortcutChip("Space", "Loupe 100%")
+                shortcutChip("⌘A", "Select all")
+            }
+            .padding(.leading, 20)
+
+            Spacer()
+
+            Text(destinationLabel)
+                .font(.manrope(10.5, weight: .semibold))
+                .foregroundStyle(Color.auroraFaint)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 260, alignment: .trailing)
+
+            Spacer().frame(width: 16)
+
+            Button { beginImportConfirmation() } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "return")
+                        .font(.system(size: 11, weight: .bold))
+                    Text(importButtonLabel)
+                }
+            }
+            .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            .disabled(selectedFilesInView.isEmpty || appState.destinationURL == nil)
+            .opacity(selectedFilesInView.isEmpty || appState.destinationURL == nil ? 0.45 : 1)
+            .padding(.trailing, 20)
+        }
+        .frame(height: 52)
+        .background(Color.auroraPanel2)
     }
 
-    private var columnCount: Int {
-        gridLayout(for: gridWidth).columns.count
+    private var importButtonLabel: String {
+        let count = selectedFilesInView.count
+        return count > 0 ? "Import \(count) selected" : "Import Selected"
     }
+
+    private func shortcutChip(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            Text(key)
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Color.auroraTxt)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: 4).fill(Color.auroraPanel))
+                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.auroraStroke, lineWidth: 0.5))
+            Text(label)
+                .font(.manrope(10, weight: .semibold))
+                .foregroundStyle(Color.auroraFaint)
+        }
+    }
+
+    // MARK: - Preview Overlay (full-res loupe)
 
     private var previewLoadingOverlay: some View {
         Color.black.opacity(0.82)
@@ -376,8 +644,7 @@ struct AdvancedView: View {
 
     private func previewOverlay(file: URL, image: NSImage) -> some View {
         ZStack {
-            Color.black.opacity(0.94)
-                .ignoresSafeArea()
+            Color.black.opacity(0.94).ignoresSafeArea()
 
             VStack(spacing: 14) {
                 HStack {
@@ -425,8 +692,8 @@ struct AdvancedView: View {
         .focusEffectDisabled()
         .onAppear { isPreviewFocused = true }
         .onKeyPress(.escape) { closePreview(); return .handled }
-        .onKeyPress(.leftArrow) { navigatePreview(offset: -1); return .handled }
-        .onKeyPress(.rightArrow) { navigatePreview(offset: 1); return .handled }
+        .onKeyPress(.leftArrow)  { navigatePreview(offset: -1); return .handled }
+        .onKeyPress(.rightArrow) { navigatePreview(offset:  1); return .handled }
         .onKeyPress("1") { setRating(1, for: file); return .handled }
         .onKeyPress("2") { setRating(2, for: file); return .handled }
         .onKeyPress("3") { setRating(3, for: file); return .handled }
@@ -434,6 +701,8 @@ struct AdvancedView: View {
         .onKeyPress("5") { setRating(5, for: file); return .handled }
         .onKeyPress("0") { clearRating(for: file); return .handled }
     }
+
+    // MARK: - File Loading
 
     private func loadFiles() {
         let volumes = selectedSourceVolumes
@@ -451,7 +720,7 @@ struct AdvancedView: View {
                 paths.flatMap { path in
                     VolumeWatcher.listRawFiles(at: path, extensions: extensions)
                 }
-                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
             }.value
             guard !Task.isCancelled else { return }
             await MainActor.run {
@@ -464,6 +733,13 @@ struct AdvancedView: View {
                 }
                 isLoadingFiles = false
                 prefetchInitialThumbnails()
+                computeTotalBytes(for: files)
+                if selectedFile == nil, let first = displayedFiles.first,
+                   let idx = displayedFiles.firstIndex(of: first) {
+                    selectedFile = first
+                    lastSelectedIndex = idx
+                    selectionAnchorIndex = idx
+                }
             }
         }
     }
@@ -474,6 +750,10 @@ struct AdvancedView: View {
         for task in thumbnailTasks.values { task.cancel() }
         thumbnailTasks.removeAll()
         thumbnailStates = [:]
+        totalBytes = 0
+        for task in panelImageTasks.values { task.cancel() }
+        panelImageTasks.removeAll()
+        panelImageStates = [:]
         previewImage = nil
         isLoadingPreview = false
         selectedFile = nil
@@ -490,11 +770,15 @@ struct AdvancedView: View {
 
     private func startModifierMonitor() {
         guard modifierEventMonitor == nil else { return }
-        modifierEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .leftMouseDown]) { event in
+        modifierEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .leftMouseDown, .keyDown]) { [self] event in
             let relevantFlags = relevantModifierFlags(event.modifierFlags)
             currentModifierFlags = relevantFlags
-            if event.type == .leftMouseDown {
-                mouseDownModifierFlags = relevantFlags
+            if event.type == .leftMouseDown { mouseDownModifierFlags = relevantFlags }
+            if event.type == .keyDown && event.keyCode == 49 && previewImage == nil && !isLoadingPreview {
+                if let file = selectedFile {
+                    DispatchQueue.main.async { openPreview(file) }
+                    return nil
+                }
             }
             return event
         }
@@ -514,10 +798,76 @@ struct AdvancedView: View {
         loadFilesTask = nil
         previewTask?.cancel()
         previewTask = nil
-        for task in thumbnailTasks.values {
-            task.cancel()
-        }
+        for task in thumbnailTasks.values { task.cancel() }
         thumbnailTasks.removeAll()
+        for task in panelImageTasks.values { task.cancel() }
+        panelImageTasks.removeAll()
+    }
+
+    // Preloads QL preview for a single file (phase 1 only, no RAW decode).
+    private func preloadPanelQuickPreview(for file: URL) {
+        guard panelImageStates[file] == nil, panelImageTasks[file] == nil else { return }
+        panelImageStates[file] = .loading
+        panelImageTasks[file] = Task {
+            let quick = await quickLookImage(for: file, maxPixel: 600, scale: 1)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                panelImageTasks[file] = nil
+                panelImageStates[file] = quick.map { .loaded($0) } ?? .failed
+            }
+        }
+    }
+
+    // Called for all files on load — fills panelImageStates with QL previews quickly.
+    private func preloadAllPanelQuickPreviews() {
+        for file in displayedFiles {
+            preloadPanelQuickPreview(for: file)
+        }
+    }
+
+    // Called for the selected file — upgrades to full RAW quality if not already done.
+    private func loadPanelImageIfNeeded(for file: URL) {
+        guard !panelRawLoaded.contains(file) else { return }
+        guard panelImageTasks[file] == nil else { return }
+        panelImageTasks[file] = Task {
+            // Phase 1: only if not already loaded by quick preload
+            if panelImageStates[file] == nil {
+                panelImageStates[file] = .loading
+                let quick = await quickLookImage(for: file, maxPixel: 600, scale: 1)
+                if let quick, !Task.isCancelled {
+                    await MainActor.run { panelImageStates[file] = .loaded(quick) }
+                }
+            }
+            guard !Task.isCancelled else { return }
+            // Phase 2: RAW decode for full quality
+            let hq = await Task.detached(priority: .userInitiated) { [self] in
+                rawDecodeImage(for: file, maxPixel: 2048, fullDecode: true)
+            }.value
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                panelImageTasks[file] = nil
+                if let hq {
+                    panelImageStates[file] = .loaded(hq)
+                    panelRawLoaded.insert(file)
+                }
+            }
+        }
+    }
+
+    private func rawDecodeImage(for file: URL, maxPixel: CGFloat, fullDecode: Bool) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(file as CFURL, nil) else { return nil }
+        var options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel)
+        ]
+        if fullDecode {
+            options[kCGImageSourceCreateThumbnailFromImageAlways] = true
+            options[kCGImageSourceShouldAllowFloat] = true
+        } else {
+            options[kCGImageSourceCreateThumbnailFromImageIfAbsent] = true
+        }
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 
     private func loadThumbnailIfNeeded(for file: URL) {
@@ -527,24 +877,49 @@ struct AdvancedView: View {
             return
         }
         thumbnailStates[file] = .loading
-        thumbnailTasks[file] = Task {
+        thumbnailTasks[file] = Task.detached(priority: .userInitiated) { [self] in
             let image = await thumbnailImage(for: file)
+            guard !Task.isCancelled else { return }
+            let square = image.map { squareCrop($0) }
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 thumbnailTasks[file] = nil
-                guard let image else {
-                    thumbnailStates[file] = .failed
-                    return
-                }
-                ThumbnailCache.shared.set(image, for: file)
-                thumbnailStates[file] = .loaded(image)
+                guard let square else { thumbnailStates[file] = .failed; return }
+                ThumbnailCache.shared.set(square, for: file)
+                thumbnailStates[file] = .loaded(square)
             }
         }
+    }
+
+    private nonisolated func squareCrop(_ image: NSImage) -> NSImage {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return image }
+        let w = cg.width
+        let h = cg.height
+        guard w > 0, h > 0, w != h else { return image }
+        let side = min(w, h)
+        let cropRect = CGRect(x: (w - side) / 2, y: (h - side) / 2, width: side, height: side)
+        guard let cropped = cg.cropping(to: cropRect) else { return image }
+        return NSImage(cgImage: cropped, size: NSSize(width: side, height: side))
     }
 
     private func prefetchInitialThumbnails(limit: Int = 18) {
         for file in displayedFiles.prefix(limit) {
             loadThumbnailIfNeeded(for: file)
+        }
+        preloadAllPanelQuickPreviews()
+        if let first = displayedFiles.first {
+            loadPanelImageIfNeeded(for: first)
+        }
+    }
+
+    private func computeTotalBytes(for urls: [URL]) {
+        Task.detached(priority: .utility) {
+            var sum: Int64 = 0
+            for url in urls {
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                sum += Int64(size)
+            }
+            await MainActor.run { totalBytes = sum }
         }
     }
 
@@ -555,14 +930,24 @@ struct AdvancedView: View {
         isLoadingPreview = true
         isGalleryFocused = false
         previewTask = Task {
+            // Phase 1: fast embedded preview
+            let quick = await Task.detached(priority: .userInitiated) { [self] in
+                rawDecodeImage(for: file, maxPixel: 1400, fullDecode: false)
+            }.value
+            if let quick, !Task.isCancelled {
+                await MainActor.run {
+                    guard selectedFile == file else { return }
+                    previewImage = quick
+                    isLoadingPreview = false
+                }
+            }
+            guard !Task.isCancelled else { return }
+            // Phase 2: full quality
             let image = await fullPreviewImage(for: file)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 previewTask = nil
-                guard selectedFile == file, let image else {
-                    isLoadingPreview = false
-                    return
-                }
+                guard selectedFile == file, let image else { isLoadingPreview = false; return }
                 previewImage = image
                 isLoadingPreview = false
                 isPreviewFocused = true
@@ -572,32 +957,23 @@ struct AdvancedView: View {
 
     private func thumbnailImage(for file: URL) async -> NSImage? {
         if Task.isCancelled { return nil }
-        if let image = await quickLookImage(for: file, maxPixel: 320, scale: 1) {
-            return image
-        }
-
+        if let image = await quickLookImage(for: file, maxPixel: 320, scale: 1) { return image }
         for tag in ["PreviewImage", "ThumbnailImage", "JpgFromRaw"] {
             if Task.isCancelled { return nil }
             guard let data = await extractJPEG(from: file, tag: tag) else { continue }
             if Task.isCancelled { return nil }
-            if let image = makeImage(from: data, maxPixel: 320) {
-                return image
-            }
+            if let image = makeImage(from: data, maxPixel: 320) { return image }
         }
         return nil
     }
 
     private func fullPreviewImage(for file: URL) async -> NSImage? {
-        for tag in ["JpgFromRaw", "PreviewImage", "ThumbnailImage"] {
-            if Task.isCancelled { return nil }
-            guard let data = await extractJPEG(from: file, tag: tag) else { continue }
-            if Task.isCancelled { return nil }
-            if let image = makeImage(from: data, maxPixel: 2400) {
-                return image
-            }
-        }
         if Task.isCancelled { return nil }
-        return await quickLookImage(for: file, maxPixel: 1800)
+        if let img = await Task.detached(priority: .userInitiated) { [self] in
+            rawDecodeImage(for: file, maxPixel: 3000, fullDecode: true)
+        }.value { return img }
+        if Task.isCancelled { return nil }
+        return await quickLookImage(for: file, maxPixel: 2400)
     }
 
     private func closePreview() {
@@ -606,7 +982,9 @@ struct AdvancedView: View {
         previewImage = nil
         isLoadingPreview = false
         isPreviewFocused = false
-        isGalleryFocused = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            isGalleryFocused = true
+        }
     }
 
     private func navigatePreview(offset: Int) {
@@ -627,11 +1005,8 @@ struct AdvancedView: View {
             let rangeFiles = Set(bounds.map { displayedFiles[$0] })
             selectedFiles = isCommand ? selectedFiles.union(rangeFiles) : rangeFiles
         } else if isCommand {
-            if selectedFiles.contains(file) {
-                selectedFiles.remove(file)
-            } else {
-                selectedFiles.insert(file)
-            }
+            if selectedFiles.contains(file) { selectedFiles.remove(file) }
+            else { selectedFiles.insert(file) }
             selectionAnchorIndex = index
         } else {
             selectedFiles = [file]
@@ -647,10 +1022,8 @@ struct AdvancedView: View {
     private func selectionModifierFlags() -> NSEvent.ModifierFlags {
         let mouseFlags = relevantModifierFlags(mouseDownModifierFlags)
         if !mouseFlags.isEmpty { return mouseFlags }
-
         let currentFlags = relevantModifierFlags(currentModifierFlags)
         if !currentFlags.isEmpty { return currentFlags }
-
         return relevantModifierFlags(NSApp.currentEvent?.modifierFlags ?? [])
     }
 
@@ -660,6 +1033,8 @@ struct AdvancedView: View {
         let nextIndex = max(0, min(displayedFiles.count - 1, currentIndex + offset))
         handleSelection(displayedFiles[nextIndex], index: nextIndex)
     }
+
+    // MARK: - Ratings
 
     private func rating(for file: URL) -> Int? {
         let value = appState.photoRatings[file] ?? 0
@@ -675,26 +1050,26 @@ struct AdvancedView: View {
     }
 
     private func rateSelection(_ rating: Int) {
-        for file in selectedFilesInView {
-            setRating(rating, for: file)
-        }
+        for file in selectedFilesInView { setRating(rating, for: file) }
     }
 
     private func clearSelectionRatings() {
-        for file in selectedFilesInView {
-            clearRating(for: file)
+        for file in selectedFilesInView { clearRating(for: file) }
+    }
+
+    // MARK: - Import
+
+    private var destinationLabel: String {
+        if let destination = appState.destinationURL {
+            return "Destination: \(destination.path)"
         }
+        return "Choose a destination before importing"
     }
 
     private func beginImportConfirmation() {
-        guard !selectedFilesInView.isEmpty else {
-            showNoSelectionAlert = true
-            return
-        }
-        guard appState.destinationURL != nil else {
-            showNoDestinationAlert = true
-            return
-        }
+        guard appState.canUseTrialAction() else { appState.requestActivationForTrialLimit(); return }
+        guard !selectedFilesInView.isEmpty else { showNoSelectionAlert = true; return }
+        guard appState.destinationURL != nil else { showNoDestinationAlert = true; return }
         showImportConfirmation = true
     }
 
@@ -704,6 +1079,7 @@ struct AdvancedView: View {
         guard !filesToImport.isEmpty else { return }
         let importSources = sources(containing: filesToImport)
         guard !importSources.isEmpty else { return }
+        guard appState.consumeTrialAction("advanced import") else { return }
         let sourceName = importSources.map(\.name).joined(separator: " + ")
         let sourcePath = importSources.map { $0.path.path }.joined(separator: "\n")
 
@@ -748,6 +1124,8 @@ struct AdvancedView: View {
                         appState.importProgress.currentFileName = progress.currentFileName
                         appState.importProgress.bytesPerSecond = progress.bytesPerSecond
                         appState.importProgress.skippedFiles = progress.skippedFiles
+                        appState.importProgress.failedFiles = progress.failedFiles
+                        appState.importProgress.copiedAfterMoveFailureFiles = progress.copiedAfterMoveFailureFiles
                         appState.importProgress.statusMessage = progress.statusMessage
                     }
                 }
@@ -765,20 +1143,19 @@ struct AdvancedView: View {
                         importedFiles: result.importedFiles
                     )
                     appState.log("Advanced import complete: \(result.fileCount) files")
+                    logImportOutcome(result)
                     if result.skippedFiles > 0 {
                         appState.log("Advanced import skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s") already present in destination")
                     }
                     if result.importedFiles.isEmpty {
-                        if result.skippedFiles > 0 {
-                            appState.sourceFileCountForDestinationCheck = result.skippedFiles
-                            appState.allDestinationFilesAlreadyImported = true
-                            appState.sourceFilesImportStatusMessage = "All \(result.skippedFiles) files are already imported"
-                        }
+                        appState.sourceFileCountForDestinationCheck = result.skippedFiles + result.failedFiles
+                        appState.allDestinationFilesAlreadyImported = result.failedFiles == 0 && result.skippedFiles > 0
+                        appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: result.skippedFiles, failedFiles: result.failedFiles, copiedAfterMoveFailureFiles: result.copiedAfterMoveFailureFiles, allSkipped: result.failedFiles == 0)
                         appState.importState = .idle
-                    } else if result.skippedFiles > 0 {
-                        appState.sourceFileCountForDestinationCheck = result.skippedFiles
+                    } else if result.skippedFiles > 0 || result.failedFiles > 0 || result.copiedAfterMoveFailureFiles > 0 {
+                        appState.sourceFileCountForDestinationCheck = result.skippedFiles + result.failedFiles
                         appState.allDestinationFilesAlreadyImported = false
-                        appState.sourceFilesImportStatusMessage = "Skipped \(result.skippedFiles) duplicate file\(result.skippedFiles == 1 ? "" : "s")"
+                        appState.sourceFilesImportStatusMessage = Self.importOutcomeMessage(skippedFiles: result.skippedFiles, failedFiles: result.failedFiles, copiedAfterMoveFailureFiles: result.copiedAfterMoveFailureFiles, allSkipped: false)
                     }
                 }
 
@@ -798,6 +1175,7 @@ struct AdvancedView: View {
                         ))
                         appState.importHistory = ImportHistoryStorage.load()
                         appState.mergeImportedStatsIntoEventCache(lastStats, destinationPath: result.destinationPath)
+                        appState.refreshJPGDayCacheForImportedDestination(result.destinationPath)
                         appState.recordTelegramDailyImport(
                             sourceName: sourceName,
                             destinationPath: result.destinationPath,
@@ -835,6 +1213,41 @@ struct AdvancedView: View {
         }
     }
 
+    @MainActor
+    private func logImportOutcome(_ result: ImportResult) {
+        if result.copiedAfterMoveFailureFiles > 0 {
+            let movedFiles = max(result.fileCount - result.copiedAfterMoveFailureFiles, 0)
+            appState.log("Advanced import moved \(movedFiles) file\(movedFiles == 1 ? "" : "s"); copied \(result.copiedAfterMoveFailureFiles) because source delete failed", level: .warning)
+            let diagnosticsToLog = result.moveFallbackDiagnostics.prefix(20)
+            for diagnostic in diagnosticsToLog {
+                appState.log("Advanced import move fallback diagnostic: \(diagnostic)", level: .warning)
+            }
+            if result.moveFallbackDiagnostics.count > diagnosticsToLog.count {
+                appState.log("Advanced import move fallback diagnostic: \(result.moveFallbackDiagnostics.count - diagnosticsToLog.count) additional file\(result.moveFallbackDiagnostics.count - diagnosticsToLog.count == 1 ? "" : "s") omitted", level: .warning)
+            }
+        } else if appState.importMode == .move {
+            appState.log("Advanced import moved \(result.fileCount) file\(result.fileCount == 1 ? "" : "s")")
+        }
+        if result.failedFiles > 0 {
+            appState.log("Advanced import failed \(result.failedFiles) locked or unreadable file\(result.failedFiles == 1 ? "" : "s")", level: .warning)
+        }
+    }
+
+    private static func importOutcomeMessage(skippedFiles: Int, failedFiles: Int, copiedAfterMoveFailureFiles: Int, allSkipped: Bool) -> String? {
+        var messages: [String] = []
+        if skippedFiles > 0 {
+            let prefix = allSkipped ? "All" : "Skipped"
+            messages.append("\(prefix) \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s")\(allSkipped ? " already imported" : "")")
+        }
+        if copiedAfterMoveFailureFiles > 0 {
+            messages.append("Copied \(copiedAfterMoveFailureFiles) because source delete failed")
+        }
+        if failedFiles > 0 {
+            messages.append("Failed \(failedFiles) locked or unreadable file\(failedFiles == 1 ? "" : "s")")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: ". ")
+    }
+
     private func resumeImport() {
         Task {
             await importEngine.resume()
@@ -843,10 +1256,10 @@ struct AdvancedView: View {
     }
 
     private func cancelImport() {
-        Task {
-            await importEngine.cancel()
-        }
+        Task { await importEngine.cancel() }
     }
+
+    // MARK: - Volume Helpers
 
     private var sourceVolumes: [VolumeInfo] {
         let volumes = appState.mountedVolumes.filter { $0.rawFileCount > 0 && !isDestinationVolume($0.path) }
@@ -893,6 +1306,8 @@ struct AdvancedView: View {
         path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
+    // MARK: - Image Helpers
+
     private func extractJPEG(from file: URL, tag: String) async -> Data? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -906,7 +1321,6 @@ struct AdvancedView: View {
                 let pipe = Pipe()
                 process.standardOutput = pipe
                 process.standardError = Pipe()
-
                 do {
                     try process.run()
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -926,7 +1340,6 @@ struct AdvancedView: View {
             scale: scale,
             representationTypes: .thumbnail
         )
-
         do {
             let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
             return makeImage(from: representation.nsImage, maxPixel: maxPixel)
@@ -940,10 +1353,10 @@ struct AdvancedView: View {
         let height = max(image.size.height, 1)
         let scale = min(1, maxPixel / max(width, height))
         guard scale < 1 else { return image }
-
         let size = NSSize(width: width * scale, height: height * scale)
         let resized = NSImage(size: size)
         resized.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
         image.draw(in: NSRect(origin: .zero, size: size), from: NSRect(origin: .zero, size: image.size), operation: .copy, fraction: 1)
         resized.unlockFocus()
         return resized
@@ -955,113 +1368,91 @@ struct AdvancedView: View {
     }
 }
 
+// MARK: - Helpers
+
 private func relevantModifierFlags(_ flags: NSEvent.ModifierFlags) -> NSEvent.ModifierFlags {
     flags.intersection([.shift, .command, .option, .control])
 }
 
 private func exiftoolPath() -> String? {
-    ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
-        .first { FileManager.default.fileExists(atPath: $0) }
+    var paths: [String] = []
+    if let bundled = Bundle.main.path(forResource: "exiftool", ofType: nil) {
+        paths.append(bundled)
+    }
+    paths += ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
+    return paths.first { FileManager.default.fileExists(atPath: $0) }
 }
 
-private struct AdvancedPhotoTile: View {
+// MARK: - Thumbnail Cell
+
+private struct AdvancedThumb: View {
     let file: URL
+    let size: CGFloat
     let thumbnailState: AdvancedView.ThumbnailState
     let isSelected: Bool
+    let isFocused: Bool
     let rating: Int?
     let onSelect: () -> Void
     let onPreview: () -> Void
     let onRate: (Int) -> Void
 
-    @State private var hovering = false
+    private var thumbSize: CGFloat { size }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.auroraPanel2)
+        ZStack(alignment: .topTrailing) {
+            Color.auroraPanel2
 
-                switch thumbnailState {
-                case .loading:
-                    ProgressView()
-                        .scaleEffect(0.8)
-                case .failed:
-                    VStack(spacing: 8) {
-                        Image(systemName: "photo")
-                            .font(.system(size: 24, weight: .semibold))
-                        Text("No preview")
-                            .font(.manrope(11, weight: .semibold))
-                    }
+            switch thumbnailState {
+            case .loading:
+                ProgressView().scaleEffect(0.65)
+            case .failed:
+                Image(systemName: "photo")
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
-                case .loaded(let image):
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .clipped()
-                }
+            case .loaded(let img):
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: thumbSize, height: thumbSize)
+                    .clipped()
+            }
 
-                if let rating {
-                    HStack(spacing: 3) {
-                        Image(systemName: "star.fill")
-                        Text("\(rating)")
+            if rating != nil {
+                Circle()
+                    .fill(Color.auroraHealthy)
+                    .frame(width: 7, height: 7)
+                    .padding(6)
+            }
+
+            if let rating {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 2) {
+                        ForEach(1...5, id: \.self) { v in
+                            Image(systemName: v <= rating ? "star.fill" : "star")
+                                .font(.system(size: 6, weight: .bold))
+                                .foregroundStyle(Color.yellow)
+                        }
                     }
-                    .font(.manrope(10, weight: .bold))
-                    .foregroundStyle(Color.yellow)
-                    .padding(.horizontal, 7)
                     .padding(.vertical, 4)
-                    .background(Capsule().fill(Color.black.opacity(0.58)))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .padding(8)
-                }
-            }
-            .frame(height: 118)
-            .padding(.horizontal, 10)
-            .padding(.top, 2)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(file.lastPathComponent)
-                    .font(.manrope(12, weight: .bold))
-                    .foregroundStyle(Color.auroraTxt)
-                    .lineLimit(1)
-                Text(fileSizeLabel)
-                    .font(.manrope(10.5, weight: .semibold))
-                    .foregroundStyle(Color.auroraFaint)
-            }
-
-            HStack(spacing: 5) {
-                ForEach(1...5, id: \.self) { value in
-                    Button {
-                        onRate(value)
-                    } label: {
-                        Image(systemName: value <= (rating ?? 0) ? "star.fill" : "star")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(Color.yellow)
-                    }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 6)
+                    .background(Color.black.opacity(0.55))
                 }
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(hovering ? Color.auroraPanel2 : Color.auroraPanel)
-        )
+        .frame(width: thumbSize, height: thumbSize)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(isSelected ? Color.auroraCyan : Color.auroraStroke, lineWidth: isSelected ? 2 : 1)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(
+                    isFocused ? Color.auroraCyan
+                              : (isSelected ? Color.auroraCyan.opacity(0.5) : Color.clear),
+                    lineWidth: isFocused ? 2.5 : 1.5
+                )
         )
-        .shadow(color: isSelected ? Color.auroraCyan.opacity(0.18) : .clear, radius: 16, x: 0, y: 8)
+        .shadow(color: isFocused ? Color.auroraCyan.opacity(0.3) : .clear, radius: 6)
         .contentShape(Rectangle())
         .onTapGesture(count: 2, perform: onPreview)
-        .onTapGesture(count: 1, perform: onSelect)
-        .onHover { hovering = $0 }
-    }
-
-    private var fileSizeLabel: String {
-        guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 else { return file.pathExtension.uppercased() }
-        let parts = AuroraFormat.bytesParts(Int64(size))
-        return "\(file.pathExtension.uppercased()) · \(parts.value) \(parts.unit)"
+        .simultaneousGesture(TapGesture().onEnded { onSelect() })
     }
 }

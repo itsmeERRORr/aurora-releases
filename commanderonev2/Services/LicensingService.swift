@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import CryptoKit
 
 /// Online licensing via Supabase.
 ///
@@ -7,9 +8,13 @@ import IOKit
 ///   - Verifies the key exists in the DB and is active/not-expired
 ///   - Binds the Mac UUID on first use (rejects on a different Mac)
 ///   - Updates `last_seen_at` on subsequent validations
+///   - Signs the response with an ECDSA (P-256) private key held only on the server
 ///
-/// The result is cached in Keychain so the app works offline after the first activation.
-/// A silent background revalidation runs at launch to catch revoked/expired keys.
+/// The result is cached locally so the app works offline after the first activation,
+/// but the cache is only trusted if its ECDSA signature verifies against the public
+/// key embedded below — a hand-edited or fabricated cache entry fails verification
+/// and is treated as not activated. A silent background revalidation runs at launch
+/// to catch revoked/expired keys and to refresh the signature/last-validated stamp.
 enum LicensingService {
 
     // MARK: - Supabase config
@@ -21,7 +26,48 @@ enum LicensingService {
 
     private static let keychainService = "errormedia.aurora.license"
     private static let keychainAccount = "activatedKey"
-    static let adminTokenKeychainAccount = "adminToken"
+    private static let adminEmailKeychainAccount = "adminEmail"
+    private static let adminPasswordKeychainAccount = "adminPassword"
+
+    // MARK: - Signature verification
+
+    /// Public half of the ECDSA (P-256) key pair used by the `validate-license` Edge
+    /// Function to sign activation payloads. Safe to embed — only the private key
+    /// (held server-side as a Supabase secret) can produce valid signatures.
+    private static let signingPublicKeyDER = Data(
+        base64Encoded: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAET2tVgzW1g8AGdY3nNIgenp1PsQLEObR9CGxAE00vfa5h0pVOE4hS/S7L3iTlgPeqEyWY8ZynNimMCpuwGx+fhg=="
+    )!
+    private static let signingPublicKey = try? P256.Signing.PublicKey(derRepresentation: signingPublicKeyDER)
+
+    /// Offline grace period: an activation cached locally must be re-confirmed with
+    /// the server at least this often, or it stops being trusted. Prevents an
+    /// indefinitely-offline (or network-blocked) Mac from trusting a forged or
+    /// long-revoked cache forever.
+    private static let maxOfflineValidationAge: TimeInterval = 30 * 24 * 60 * 60 // 30 days
+
+    static func normalizeLicenseKey(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+    }
+
+    /// Must exactly match the message the server signs in validate-license/index.ts.
+    private static func activationMessage(key: String, uuid: String, plan: String, expiresAtRaw: String?, issuedAtRaw: String) -> String {
+        "\(key)|\(uuid)|\(plan)|\(expiresAtRaw ?? "")|\(issuedAtRaw)"
+    }
+
+    private static func verifySignature(_ signatureB64: String?, for activation: StoredActivation) -> Bool {
+        guard let signatureB64,
+              let issuedAtRaw = activation.issuedAtRaw,
+              let signingPublicKey,
+              let sigData = Data(base64Encoded: signatureB64),
+              let signature = try? P256.Signing.ECDSASignature(rawRepresentation: sigData) else { return false }
+        let message = activationMessage(
+            key: activation.key, uuid: activation.uuid, plan: activation.plan,
+            expiresAtRaw: activation.expiresAtRaw, issuedAtRaw: issuedAtRaw
+        )
+        return signingPublicKey.isValidSignature(signature, for: Data(message.utf8))
+    }
 
     // MARK: - Hardware UUID
 
@@ -37,25 +83,81 @@ enum LicensingService {
         return IORegistryEntryCreateCFProperty(service, "IOPlatformUUID" as CFString, nil, 0)?.takeRetainedValue() as? String
     }
 
-    // MARK: - Stored activation (Keychain cache)
+    // MARK: - Stored activation (local cache)
 
     struct StoredActivation: Codable {
         let key: String
         let uuid: String
         let plan: String
         var expiresAt: Date?
+        /// Exact `expires_at` string as returned (and signed) by the server. Needed
+        /// verbatim for signature verification — re-formatting the Date wouldn't match.
+        var expiresAtRaw: String?
         var customerEmail: String?
         let activatedAt: Date
+        /// Server-issued timestamp (ISO8601) that is part of the signed message, so it
+        /// can't be forged. Used for the offline-grace window instead of a client-side
+        /// clock the user could edit. `nil` only on pre-signing legacy records.
+        var issuedAtRaw: String?
+        /// Base64 ECDSA signature from the server over `activationMessage(...)`.
+        /// `nil` only for activations cached by an app version predating this check.
+        var signature: String?
+
+        init(
+            key: String, uuid: String, plan: String, expiresAt: Date?, expiresAtRaw: String?,
+            customerEmail: String?, activatedAt: Date, issuedAtRaw: String?, signature: String?
+        ) {
+            self.key = key
+            self.uuid = uuid
+            self.plan = plan
+            self.expiresAt = expiresAt
+            self.expiresAtRaw = expiresAtRaw
+            self.customerEmail = customerEmail
+            self.activatedAt = activatedAt
+            self.issuedAtRaw = issuedAtRaw
+            self.signature = signature
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            key = try container.decode(String.self, forKey: .key)
+            uuid = try container.decode(String.self, forKey: .uuid)
+            plan = try container.decode(String.self, forKey: .plan)
+            expiresAt = try container.decodeIfPresent(Date.self, forKey: .expiresAt)
+            expiresAtRaw = try container.decodeIfPresent(String.self, forKey: .expiresAtRaw)
+            customerEmail = try container.decodeIfPresent(String.self, forKey: .customerEmail)
+            activatedAt = try container.decode(Date.self, forKey: .activatedAt)
+            issuedAtRaw = try container.decodeIfPresent(String.self, forKey: .issuedAtRaw)
+            signature = try container.decodeIfPresent(String.self, forKey: .signature)
+        }
     }
 
     static func hasStoredKey() -> Bool {
         KeychainStore.string(service: keychainService, account: keychainAccount) != nil
     }
 
-    /// Synchronous check — reads from Keychain cache. Safe to call on main thread.
+    /// Synchronous check — reads from the local cache. Safe to call on main thread.
+    /// Trusts the cache ONLY if every condition holds: a valid ECDSA signature
+    /// (proving the server issued it — an unsigned or edited record fails here), the
+    /// Mac's hardware UUID matches the bound one, not past its expiry, and the
+    /// server-signed issue time is within the offline-grace window.
+    ///
+    /// There is deliberately no "trust unsigned cache" fallback: the entire record
+    /// lives in user-writable storage, so an unsigned record is indistinguishable
+    /// from a forged one. Legacy (pre-signing) caches simply read as not-activated
+    /// here; `revalidateInBackground()` re-confirms them with the server on launch
+    /// (which re-signs the record) and flips the live state back to activated.
     static func isActivated() -> Bool {
         guard let a = storedActivation() else { return false }
+        guard let signature = a.signature else { return false }
+        // `a.uuid` stores the hashed device id (see DeviceIdentity) — never the raw
+        // hardware UUID. Compare against a freshly-computed hash for this Mac.
+        guard let currentUUID = DeviceIdentity.deviceHash(), currentUUID == a.uuid else { return false }
+        guard verifySignature(signature, for: a) else { return false }
         if let exp = a.expiresAt, exp < Date() { return false }
+        guard let issuedAtRaw = a.issuedAtRaw,
+              let issuedAt = parseDate(issuedAtRaw),
+              Date().timeIntervalSince(issuedAt) <= maxOfflineValidationAge else { return false }
         return true
     }
 
@@ -73,6 +175,15 @@ enum LicensingService {
         guard let data = try? encoder.encode(activation),
               let json = String(data: data, encoding: .utf8) else { return }
         KeychainStore.setString(json, service: keychainService, account: keychainAccount)
+    }
+
+    private static func parseDate(_ string: String) -> Date? {
+        let full = ISO8601DateFormatter()
+        full.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = full.date(from: string) { return d }
+        let basic = ISO8601DateFormatter()
+        basic.formatOptions = [.withInternetDateTime]
+        return basic.date(from: string)
     }
 
     static func deactivate() {
@@ -93,7 +204,9 @@ enum LicensingService {
 
     @discardableResult
     static func activate(with key: String) async -> ActivationResult {
-        guard let uuid = hardwareUUID() else {
+        // Send the hashed device id, not the raw UUID — the server binds and signs
+        // whatever it receives here as an opaque per-device identifier.
+        guard let uuid = DeviceIdentity.deviceHash() else {
             return .networkError("Could not read hardware UUID.")
         }
         guard let url = URL(string: "\(supabaseURL)/functions/v1/validate-license") else {
@@ -116,9 +229,22 @@ enum LicensingService {
             if http.statusCode == 200, json["valid"] as? Bool == true {
                 let plan = json["plan"] as? String ?? "pro"
                 let email = json["customer_email"] as? String
-                let expiresAt = (json["expires_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+                let expiresAtRaw = json["expires_at"] as? String
+                let expiresAt = expiresAtRaw.flatMap { Self.parseDate($0) }
+                let issuedAtRaw = json["issued_at"] as? String
+                let signature = json["signature"] as? String
+                let normalizedKey = normalizeLicenseKey(key)
 
-                save(StoredActivation(key: key, uuid: uuid, plan: plan, expiresAt: expiresAt, customerEmail: email, activatedAt: Date()))
+                let activation = StoredActivation(
+                    key: normalizedKey, uuid: uuid, plan: plan,
+                    expiresAt: expiresAt, expiresAtRaw: expiresAtRaw,
+                    customerEmail: email, activatedAt: Date(),
+                    issuedAtRaw: issuedAtRaw, signature: signature
+                )
+                guard verifySignature(signature, for: activation) else {
+                    return .networkError("Could not verify the server's response. Please try again.")
+                }
+                save(activation)
                 return .success(plan: plan, expiresAt: expiresAt, email: email)
             }
 
@@ -158,7 +284,7 @@ enum LicensingService {
 
     static func cancelSubscription() async -> CancelResult {
         guard let activation = storedActivation(),
-              let uuid = hardwareUUID() else {
+              let uuid = DeviceIdentity.deviceHash() else {
             return .networkError("Could not read activation or hardware UUID.")
         }
         guard let url = URL(string: "\(supabaseURL)/functions/v1/cancel-subscription") else {
@@ -182,7 +308,7 @@ enum LicensingService {
             }
             switch http.statusCode {
             case 200:
-                let expiresAt = (json["expires_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+                let expiresAt = (json["expires_at"] as? String).flatMap { Self.parseDate($0) }
                 return .success(expiresAt: expiresAt)
             case 400 where (json["error"] as? String) == "Already cancelled":
                 return .alreadyCancelled
@@ -199,8 +325,12 @@ enum LicensingService {
     }
 
     // MARK: - Admin: create manual license (Beta only)
-    // Calls the admin-create-license Edge Function.
-    // Requires ADMIN_SECRET to be configured in Supabase and stored in Keychain.
+    // Calls the admin-create-license / admin-revoke-license Edge Functions.
+    // Auth is a Supabase Auth (email/password) sign-in rather than a static shared
+    // secret — easier to remember than a token, and the Edge Function validates a
+    // real per-user JWT instead of comparing to a fixed string. The Supabase Auth
+    // user itself (email/password) must be created once from the Supabase dashboard
+    // (Authentication → Users → Add user) — this app never creates that account.
 
     enum AdminCreateResult {
         case success(licenseKey: String)
@@ -208,9 +338,45 @@ enum LicensingService {
         case networkError(String)
     }
 
+    static func saveAdminCredentials(email: String, password: String) {
+        KeychainStore.setString(email, service: keychainService, account: adminEmailKeychainAccount)
+        KeychainStore.setString(password, service: keychainService, account: adminPasswordKeychainAccount)
+    }
+
+    static func hasAdminCredentials() -> Bool {
+        guard let email = KeychainStore.string(service: keychainService, account: adminEmailKeychainAccount) else { return false }
+        return !email.isEmpty
+    }
+
+    static func clearAdminCredentials() {
+        KeychainStore.remove(service: keychainService, account: adminEmailKeychainAccount)
+        KeychainStore.remove(service: keychainService, account: adminPasswordKeychainAccount)
+    }
+
+    /// Signs in via Supabase Auth and returns a short-lived JWT to send as the admin
+    /// Bearer token. Re-signs in fresh for each admin action rather than juggling
+    /// refresh-token expiry — this tool is used a handful of times a week, so the
+    /// extra round-trip is irrelevant and the code stays simple.
+    private static func fetchAdminAccessToken() async -> String? {
+        guard let email = KeychainStore.string(service: keychainService, account: adminEmailKeychainAccount), !email.isEmpty,
+              let password = KeychainStore.string(service: keychainService, account: adminPasswordKeychainAccount), !password.isEmpty,
+              let url = URL(string: "\(supabaseURL)/auth/v1/token?grant_type=password") else { return nil }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(anonKey, forHTTPHeaderField: "apikey")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["email": email, "password": password])
+
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = json["access_token"] as? String else { return nil }
+        return token
+    }
+
     static func adminCreateLicense(name: String, plan: String, email: String?) async -> AdminCreateResult {
-        guard let secret = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount),
-              !secret.isEmpty else {
+        guard let token = await fetchAdminAccessToken() else {
             return .unauthorized
         }
         guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-create-license") else {
@@ -223,7 +389,7 @@ enum LicensingService {
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue("Bearer \(secret)", forHTTPHeaderField: "authorization")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
@@ -243,8 +409,7 @@ enum LicensingService {
     }
 
     static func adminRevokeLicense(key: String) async -> AdminCreateResult {
-        guard let secret = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount),
-              !secret.isEmpty else {
+        guard let token = await fetchAdminAccessToken() else {
             return .unauthorized
         }
         guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-revoke-license") else {
@@ -254,7 +419,7 @@ enum LicensingService {
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue("Bearer \(secret)", forHTTPHeaderField: "authorization")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["license_key": key])
 
         do {
@@ -271,16 +436,4 @@ enum LicensingService {
         }
     }
 
-    static func saveAdminToken(_ token: String) {
-        KeychainStore.setString(token, service: keychainService, account: adminTokenKeychainAccount)
-    }
-
-    static func hasAdminToken() -> Bool {
-        guard let t = KeychainStore.string(service: keychainService, account: adminTokenKeychainAccount) else { return false }
-        return !t.isEmpty
-    }
-
-    static func clearAdminToken() {
-        KeychainStore.remove(service: keychainService, account: adminTokenKeychainAccount)
-    }
 }

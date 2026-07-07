@@ -22,9 +22,10 @@ struct KeysManagementView: View {
     @State private var revokingKeyID: UUID?
     @State private var keyToRevoke: CreatedLicenseKey?
 
-    // Admin token setup
-    @State private var adminToken = ""
-    @State private var hasToken = LicensingService.hasAdminToken()
+    // Admin sign-in
+    @State private var adminEmail = ""
+    @State private var adminPassword = ""
+    @State private var hasToken = LicensingService.hasAdminCredentials()
     @State private var showTokenSetup = false
 
     private static let udKey = "aurora.adminCreatedKeys"
@@ -78,9 +79,12 @@ struct KeysManagementView: View {
                 .foregroundStyle(Color.auroraTxt)
             Spacer()
             if hasToken {
-                Button("Change Token") { showTokenSetup = true }
-                    .buttonStyle(AuroraGhostButtonStyle())
-                    .font(.manrope(11, weight: .semibold))
+                Button("Sign Out") {
+                    LicensingService.clearAdminCredentials()
+                    hasToken = false
+                }
+                .buttonStyle(AuroraGhostButtonStyle())
+                .font(.manrope(11, weight: .semibold))
             }
         }
         .padding(.bottom, 4)
@@ -94,15 +98,15 @@ struct KeysManagementView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Admin token not configured")
+                Text("Not signed in")
                     .font(.manrope(12, weight: .bold))
                     .foregroundStyle(Color.auroraTxt)
-                Text("Set the ADMIN_SECRET from your Supabase dashboard to create keys.")
+                Text("Sign in with your Supabase admin account to create keys.")
                     .font(.manrope(11, weight: .medium))
                     .foregroundStyle(Color.auroraFaint)
             }
             Spacer()
-            Button("Configure") { showTokenSetup = true }
+            Button("Sign In") { showTokenSetup = true }
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
         }
         .padding(12)
@@ -110,20 +114,28 @@ struct KeysManagementView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: - Token setup sheet
+    // MARK: - Sign-in sheet
 
     private var tokenSetupSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Admin Token")
+            Text("Admin Sign In")
                 .font(.manrope(16, weight: .black))
                 .foregroundStyle(Color.auroraTxt)
 
-            Text("Paste the value of ADMIN_SECRET from your Supabase project:\nDashboard → Edge Functions → Secrets → ADMIN_SECRET")
+            Text("Use the Supabase Auth account created for admin access:\nDashboard → Authentication → Users")
                 .font(.manrope(12, weight: .medium))
                 .foregroundStyle(Color.auroraFaint)
                 .fixedSize(horizontal: false, vertical: true)
 
-            SecureField("Paste your ADMIN_SECRET here", text: $adminToken)
+            TextField("Email", text: $adminEmail)
+                .textFieldStyle(.plain)
+                .font(.manrope(13, weight: .medium))
+                .foregroundStyle(Color.auroraTxt)
+                .padding(10)
+                .background(Color.auroraPanel2)
+                .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.small))
+
+            SecureField("Password", text: $adminPassword)
                 .textFieldStyle(.plain)
                 .font(.manrope(13, weight: .medium))
                 .foregroundStyle(Color.auroraTxt)
@@ -135,16 +147,16 @@ struct KeysManagementView: View {
                 Spacer()
                 Button("Cancel") { showTokenSetup = false }
                     .buttonStyle(AuroraGhostButtonStyle())
-                Button("Save") {
-                    let trimmed = adminToken.trimmingCharacters(in: .whitespaces)
-                    guard !trimmed.isEmpty else { return }
-                    LicensingService.saveAdminToken(trimmed)
+                Button("Sign In") {
+                    let trimmedEmail = adminEmail.trimmingCharacters(in: .whitespaces)
+                    guard !trimmedEmail.isEmpty, !adminPassword.isEmpty else { return }
+                    LicensingService.saveAdminCredentials(email: trimmedEmail, password: adminPassword)
                     hasToken = true
                     showTokenSetup = false
-                    adminToken = ""
+                    adminPassword = ""
                 }
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
-                .disabled(adminToken.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(adminEmail.trimmingCharacters(in: .whitespaces).isEmpty || adminPassword.isEmpty)
             }
         }
         .padding(20)
@@ -216,7 +228,7 @@ struct KeysManagementView: View {
         case .unauthorized:
             HStack(spacing: 6) {
                 Image(systemName: "lock.fill").foregroundStyle(.orange)
-                Text("Admin token rejeitado. Verifica o ADMIN_SECRET no Supabase.")
+                Text("Sign-in rejeitado. Verifica o email/password.")
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(.orange)
             }

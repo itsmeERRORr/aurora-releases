@@ -1,6 +1,24 @@
 import Foundation
 
 enum AuroraFormat {
+    private static let mediumDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, yyyy"
+        return f
+    }()
+
+    private static let shortDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d"
+        return f
+    }()
+
+    private static let compactDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d yyyy"
+        return f
+    }()
+
     /// Formats a byte count as a two-part tuple: ("3.62", "TB").
     /// Threshold rules tuned to match the handoff sample data.
     static func bytesParts(_ bytes: Int64) -> (value: String, unit: String) {
@@ -46,10 +64,17 @@ enum AuroraFormat {
 
     /// Photo count with thin space thousands separator (e.g. "151 495").
     static func count(_ n: Int) -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        f.groupingSeparator = "\u{2009}" // thin space
-        return f.string(from: NSNumber(value: n)) ?? "\(n)"
+        let sign = n < 0 ? "-" : ""
+        let digits = String(abs(n)).reversed()
+        var grouped: [Character] = []
+        grouped.reserveCapacity(digits.count + digits.count / 3)
+        for (index, char) in digits.enumerated() {
+            if index > 0, index % 3 == 0 {
+                grouped.append("\u{2009}")
+            }
+            grouped.append(char)
+        }
+        return sign + String(grouped.reversed())
     }
 
     static func aperture(_ v: Double) -> String {
@@ -77,23 +102,17 @@ enum AuroraFormat {
 
     /// "May 11, 2026"
     static func dateMedium(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d, yyyy"
-        return f.string(from: date)
+        mediumDateFormatter.string(from: date)
     }
 
     /// "May 11"
     static func dateShort(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d"
-        return f.string(from: date)
+        shortDateFormatter.string(from: date)
     }
 
     /// "May 11 2026"
     static func dateCompact(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d yyyy"
-        return f.string(from: date)
+        compactDateFormatter.string(from: date)
     }
 
     /// "May 9 — May 11, 2026"
@@ -102,9 +121,7 @@ enum AuroraFormat {
         if Calendar.current.isDate(start, inSameDayAs: end) {
             return endStr
         }
-        let f = DateFormatter()
-        f.dateFormat = "MMM d"
-        return "\(f.string(from: start)) — \(endStr)"
+        return "\(shortDateFormatter.string(from: start)) — \(endStr)"
     }
 
     private static func format(_ d: Double) -> String {

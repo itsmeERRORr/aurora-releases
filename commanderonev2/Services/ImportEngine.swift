@@ -28,6 +28,8 @@ actor ImportEngine {
         let currentFileName: String
         let bytesPerSecond: Double
         let skippedFiles: Int
+        let failedFiles: Int
+        let copiedAfterMoveFailureFiles: Int
         let statusMessage: String?
     }
 
@@ -48,13 +50,17 @@ actor ImportEngine {
         isCancelled = false
         isPaused = false
 
-        // Create date-stamped subfolder
+        // Create Year/YYYY-MM-DD subfolders (Lightroom-style)
         let destFolder: URL
         if createSubfolder {
-            let df = DateFormatter()
-            df.dateFormat = "yyyy-MM-dd_HH-mm"
-            let folderName = df.string(from: Date())
-            destFolder = destinationBase.appendingPathComponent(folderName)
+            let now = Date()
+            let yearDF = DateFormatter()
+            yearDF.dateFormat = "yyyy"
+            let dayDF = DateFormatter()
+            dayDF.dateFormat = "yyyy-MM-dd"
+            destFolder = destinationBase
+                .appendingPathComponent(yearDF.string(from: now))
+                .appendingPathComponent(dayDF.string(from: now))
         } else {
             destFolder = destinationBase
         }
@@ -109,6 +115,8 @@ actor ImportEngine {
                 currentFileName: "No new files",
                 bytesPerSecond: 0,
                 skippedFiles: skippedFiles,
+                failedFiles: 0,
+                copiedAfterMoveFailureFiles: 0,
                 statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
             ))
             return ImportResult(
@@ -118,14 +126,20 @@ actor ImportEngine {
                 averageSpeed: 0,
                 destinationPath: destFolder.path,
                 importedFiles: [],
-                skippedFiles: skippedFiles
+                skippedFiles: skippedFiles,
+                failedFiles: 0,
+                copiedAfterMoveFailureFiles: 0,
+                moveFallbackDiagnostics: []
             )
         }
 
         let startTime = Date()
         let transferredBytes = TransferCounter()
         let completedCount = TransferCounter()
+        let failedImports = FailedImportsList()
         let importedFiles = ImportedFilesList()
+        let copiedAfterMoveFailureCount = TransferCounter()
+        let moveFallbackDiagnostics = MoveFallbackDiagnosticsList()
         let lastFileName = LastFileName()
 
         // Process files concurrently in batches
@@ -158,29 +172,30 @@ actor ImportEngine {
                 let fileSize = job.size
 
                 group.addTask { [fileManager] in
-                    do {
-                        switch mode {
-                        case .move:
-                            try fileManager.moveItem(at: sourceFile, to: destFile)
-                        case .copy:
-                            try fileManager.copyItem(at: sourceFile, to: destFile)
-                        }
-                    } catch {
-                        if mode == .move {
-                            do {
-                                try fileManager.copyItem(at: sourceFile, to: destFile)
-                            } catch {
-                                throw ImportError.fileFailed(sourceFile.lastPathComponent, error.localizedDescription)
-                            }
-                        } else {
-                            throw ImportError.fileFailed(sourceFile.lastPathComponent, error.localizedDescription)
-                        }
-                    }
+                    let result = Self.transferFile(
+                        fileManager: fileManager,
+                        sourceFile: sourceFile,
+                        destFile: destFile,
+                        fileSize: fileSize,
+                        mode: mode
+                    )
 
-                    await transferredBytes.add(fileSize)
                     await completedCount.add(1)
-                    await importedFiles.append(destFile.path)
                     await lastFileName.set(destFile.lastPathComponent)
+
+                    switch result {
+                    case .success(let outcome):
+                        await transferredBytes.add(fileSize)
+                        await importedFiles.append(destFile.path)
+                        if outcome.copiedAfterMoveFailure {
+                            await copiedAfterMoveFailureCount.add(1)
+                        }
+                        if let diagnostic = outcome.moveFallbackDiagnostic {
+                            await moveFallbackDiagnostics.append(diagnostic)
+                        }
+                    case .failure(let reason):
+                        await failedImports.append(fileName: sourceFile.lastPathComponent, reason: reason)
+                    }
                 }
 
                 index += 1
@@ -189,6 +204,8 @@ actor ImportEngine {
                 if index % 4 == 0 || index == jobs.count {
                     let completed = await completedCount.value
                     let transferred = await transferredBytes.value
+                    let failed = await failedImports.count
+                    let copiedAfterMoveFailure = await copiedAfterMoveFailureCount.value
                     let currentName = await lastFileName.value
                     let elapsed = Date().timeIntervalSince(startTime)
                     let speed = elapsed > 0 ? Double(transferred) / elapsed : 0
@@ -201,7 +218,13 @@ actor ImportEngine {
                         currentFileName: currentName,
                         bytesPerSecond: speed,
                         skippedFiles: skippedFiles,
-                        statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
+                        failedFiles: Int(failed),
+                        copiedAfterMoveFailureFiles: Int(copiedAfterMoveFailure),
+                        statusMessage: Self.importStatusMessage(
+                            skippedFiles: skippedFiles,
+                            failedFiles: failed,
+                            copiedAfterMoveFailureFiles: Int(copiedAfterMoveFailure)
+                        )
                     ))
                 }
             }
@@ -213,6 +236,9 @@ actor ImportEngine {
         // Final progress update
         let finalTransferred = await transferredBytes.value
         let finalCompleted = await completedCount.value
+        let finalFailed = await failedImports.count
+        let finalCopiedAfterMoveFailure = await copiedAfterMoveFailureCount.value
+        let finalMoveFallbackDiagnostics = await moveFallbackDiagnostics.values
         let elapsed = Date().timeIntervalSince(startTime)
         let speed = elapsed > 0 ? Double(finalTransferred) / elapsed : 0
 
@@ -224,7 +250,13 @@ actor ImportEngine {
             currentFileName: "Done",
             bytesPerSecond: speed,
             skippedFiles: skippedFiles,
-            statusMessage: skippedFiles > 0 ? "Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination." : nil
+            failedFiles: Int(finalFailed),
+            copiedAfterMoveFailureFiles: Int(finalCopiedAfterMoveFailure),
+            statusMessage: Self.importStatusMessage(
+                skippedFiles: skippedFiles,
+                failedFiles: finalFailed,
+                copiedAfterMoveFailureFiles: Int(finalCopiedAfterMoveFailure)
+            )
         ))
 
         let duration = Date().timeIntervalSince(startTime)
@@ -238,7 +270,10 @@ actor ImportEngine {
             averageSpeed: avgSpeed,
             destinationPath: destFolder.path,
             importedFiles: files,
-            skippedFiles: skippedFiles
+            skippedFiles: skippedFiles,
+            failedFiles: Int(finalFailed),
+            copiedAfterMoveFailureFiles: Int(finalCopiedAfterMoveFailure),
+            moveFallbackDiagnostics: finalMoveFallbackDiagnostics
         )
     }
 
@@ -252,6 +287,158 @@ actor ImportEngine {
         let url: URL
         let destination: URL
         let size: Int64
+    }
+
+    private enum FileTransferResult {
+        case success(TransferOutcome)
+        case failure(String)
+    }
+
+    private struct TransferOutcome {
+        let copiedAfterMoveFailure: Bool
+        let moveFallbackDiagnostic: String?
+    }
+
+    private nonisolated static func transferFile(
+        fileManager: FileManager,
+        sourceFile: URL,
+        destFile: URL,
+        fileSize: Int64,
+        mode: Mode
+    ) -> FileTransferResult {
+        do {
+            switch mode {
+            case .move:
+                try fileManager.moveItem(at: sourceFile, to: destFile)
+            case .copy:
+                try fileManager.copyItem(at: sourceFile, to: destFile)
+            }
+            return .success(TransferOutcome(copiedAfterMoveFailure: false, moveFallbackDiagnostic: nil))
+        } catch {
+            if mode == .move {
+                let moveError = error
+                // On locked cards, cross-volume move can copy successfully then fail deleting
+                // the protected source. Keep the imported file and continue the session.
+                if existingFileMatchesSource(at: destFile, sourceSize: fileSize, fileManager: fileManager) {
+                    return .success(TransferOutcome(
+                        copiedAfterMoveFailure: true,
+                        moveFallbackDiagnostic: moveFallbackDiagnostic(
+                            sourceFile: sourceFile,
+                            destFile: destFile,
+                            moveError: moveError,
+                            fallbackCopyUsed: false,
+                            fallbackCopyError: nil,
+                            sourceStillExists: fileManager.fileExists(atPath: sourceFile.path),
+                            destinationExists: true,
+                            fileManager: fileManager
+                        )
+                    ))
+                }
+
+                do {
+                    try fileManager.copyItem(at: sourceFile, to: destFile)
+                    return .success(TransferOutcome(
+                        copiedAfterMoveFailure: true,
+                        moveFallbackDiagnostic: moveFallbackDiagnostic(
+                            sourceFile: sourceFile,
+                            destFile: destFile,
+                            moveError: moveError,
+                            fallbackCopyUsed: true,
+                            fallbackCopyError: nil,
+                            sourceStillExists: fileManager.fileExists(atPath: sourceFile.path),
+                            destinationExists: fileManager.fileExists(atPath: destFile.path),
+                            fileManager: fileManager
+                        )
+                    ))
+                } catch {
+                    let copyError = error
+                    removePartialFile(at: destFile, fileManager: fileManager)
+                    return .failure(moveFallbackDiagnostic(
+                        sourceFile: sourceFile,
+                        destFile: destFile,
+                        moveError: moveError,
+                        fallbackCopyUsed: true,
+                        fallbackCopyError: copyError,
+                        sourceStillExists: fileManager.fileExists(atPath: sourceFile.path),
+                        destinationExists: fileManager.fileExists(atPath: destFile.path),
+                        fileManager: fileManager
+                    ))
+                }
+            }
+
+            removePartialFile(at: destFile, fileManager: fileManager)
+            return .failure(error.localizedDescription)
+        }
+    }
+
+    private nonisolated static func removePartialFile(at url: URL, fileManager: FileManager) {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        try? fileManager.removeItem(at: url)
+    }
+
+    private nonisolated static func moveFallbackDiagnostic(
+        sourceFile: URL,
+        destFile: URL,
+        moveError: Error,
+        fallbackCopyUsed: Bool,
+        fallbackCopyError: Error?,
+        sourceStillExists: Bool,
+        destinationExists: Bool,
+        fileManager: FileManager
+    ) -> String {
+        let volumeInfo = volumeDiagnosticInfo(for: sourceFile, fileManager: fileManager)
+        var parts = [
+            "Move failed for \(sourceFile.lastPathComponent)",
+            "source=\(sourceFile.path)",
+            "destination=\(destFile.path)",
+            "moveError=\(errorDescription(moveError))",
+            "fallbackCopyUsed=\(fallbackCopyUsed)",
+            "sourceStillExists=\(sourceStillExists)",
+            "destinationExists=\(destinationExists)",
+            "volume={\(volumeInfo)}"
+        ]
+        if let fallbackCopyError {
+            parts.append("fallbackCopyError=\(errorDescription(fallbackCopyError))")
+        }
+        return parts.joined(separator: " | ")
+    }
+
+    private nonisolated static func volumeDiagnosticInfo(for sourceFile: URL, fileManager: FileManager) -> String {
+        let sourceVolumeURL = (try? sourceFile.resourceValues(forKeys: [.volumeURLKey]).volume)
+        let volumeURL = sourceVolumeURL ?? URL(fileURLWithPath: "/Volumes").appendingPathComponent(sourceFile.pathComponents.dropFirst(2).first ?? "")
+        let values = try? volumeURL.resourceValues(forKeys: [
+            .volumeNameKey,
+            .volumeLocalizedFormatDescriptionKey,
+            .volumeIsReadOnlyKey,
+            .volumeIsRemovableKey,
+            .volumeAvailableCapacityKey
+        ])
+        let name = values?.volumeName ?? volumeURL.lastPathComponent
+        let format = values?.volumeLocalizedFormatDescription ?? "unknown"
+        let readOnly = values?.volumeIsReadOnly.map(String.init) ?? "unknown"
+        let removable = values?.volumeIsRemovable.map(String.init) ?? "unknown"
+        let writableByFileManager = fileManager.isWritableFile(atPath: volumeURL.path)
+        let free = values?.volumeAvailableCapacity.map { "\($0) bytes" } ?? "unknown"
+        return "name=\(name), path=\(volumeURL.path), format=\(format), readOnly=\(readOnly), writable=\(writableByFileManager), removable=\(removable), free=\(free)"
+    }
+
+    private nonisolated static func errorDescription(_ error: Error) -> String {
+        let nsError = error as NSError
+        return "\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)"
+    }
+
+    private static func importStatusMessage(skippedFiles: Int, failedFiles: Int, copiedAfterMoveFailureFiles: Int) -> String? {
+        var messages: [String] = []
+        if skippedFiles > 0 {
+            messages.append("Skipped \(skippedFiles) duplicate file\(skippedFiles == 1 ? "" : "s") already present in destination.")
+        }
+        if copiedAfterMoveFailureFiles > 0 {
+            messages.append("Copied \(copiedAfterMoveFailureFiles) file\(copiedAfterMoveFailureFiles == 1 ? "" : "s") because source delete failed.")
+        }
+        if failedFiles > 0 {
+            messages.append("Failed \(failedFiles) locked or unreadable file\(failedFiles == 1 ? "" : "s").")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: " ")
     }
 
     private static func importJobs(
@@ -316,7 +503,7 @@ actor ImportEngine {
         return jobs
     }
 
-    private static func existingFileMatchesSource(at destination: URL, sourceSize: Int64, fileManager: FileManager) -> Bool {
+    private nonisolated static func existingFileMatchesSource(at destination: URL, sourceSize: Int64, fileManager: FileManager) -> Bool {
         guard fileManager.fileExists(atPath: destination.path),
               let attrs = try? fileManager.attributesOfItem(atPath: destination.path),
               let size = attrs[.size] as? Int64 else { return false }
@@ -452,6 +639,20 @@ private actor ImportedFilesList {
     func append(_ path: String) { values.append(path) }
 }
 
+private actor FailedImportsList {
+    private var failures: [(fileName: String, reason: String)] = []
+    var count: Int { failures.count }
+
+    func append(fileName: String, reason: String) {
+        failures.append((fileName: fileName, reason: reason))
+    }
+}
+
+private actor MoveFallbackDiagnosticsList {
+    var values: [String] = []
+    func append(_ value: String) { values.append(value) }
+}
+
 private actor LastFileName {
     var value: String = ""
     func set(_ name: String) { value = name }
@@ -465,6 +666,9 @@ struct ImportResult: Sendable {
     let destinationPath: String
     let importedFiles: [String]
     let skippedFiles: Int
+    let failedFiles: Int
+    let copiedAfterMoveFailureFiles: Int
+    let moveFallbackDiagnostics: [String]
 
     static let empty = ImportResult(
         fileCount: 0,
@@ -473,7 +677,10 @@ struct ImportResult: Sendable {
         averageSpeed: 0,
         destinationPath: "",
         importedFiles: [],
-        skippedFiles: 0
+        skippedFiles: 0,
+        failedFiles: 0,
+        copiedAfterMoveFailureFiles: 0,
+        moveFallbackDiagnostics: []
     )
 }
 

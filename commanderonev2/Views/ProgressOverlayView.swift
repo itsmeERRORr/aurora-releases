@@ -74,7 +74,7 @@ struct ProgressOverlayView: View {
 
     private var grid: some View {
         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-            row(icon: "doc", label: "Current file", value: appState.importProgress.currentFileName, mono: true)
+            row(icon: "doc", label: "Current file", value: currentFileDisplayName, mono: true)
             row(icon: "gauge.with.dots.needle.67percent", label: appState.importJobs.count > 1 ? "Total speed" : "Speed", value: appState.importProgress.speedFormatted, mono: true)
             row(icon: "clock", label: "Elapsed", value: appState.importProgress.elapsedFormatted, mono: true)
             row(icon: "arrow.down.circle", label: "Transferred", value: bytesFormatted, mono: true)
@@ -227,10 +227,25 @@ struct ProgressOverlayView: View {
             return "Stats will refresh in a moment."
         case .error:
             return appState.importProgress.failureMessage ?? "Check the import details below."
+        case .ejecting:
+            return "Almost there…"
+        case .ejectingDone:
+            return "Card ejected safely."
         default:
             return appState.importProgress.currentFileName.isEmpty
                 ? "Working…"
                 : appState.importProgress.currentFileName
+        }
+    }
+
+    private var currentFileDisplayName: String {
+        switch appState.importState {
+        case .ejecting:
+            return "Almost there…"
+        case .ejectingDone:
+            return "Card ejected"
+        default:
+            return appState.importProgress.currentFileName
         }
     }
 

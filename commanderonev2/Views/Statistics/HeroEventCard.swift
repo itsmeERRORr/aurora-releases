@@ -6,33 +6,49 @@ struct HeroEventCard: View {
     @Bindable var appState: AppState
     var onViewEvent: (Int) -> Void
     @State private var isEmptyStateExpanded = false
+    @State private var isBannerCompact = false
+    @State private var isHoveringCard = false
+    // `body` must never call `resolveLatestEvent()` directly — it does a
+    // synchronous `EventStatsCache.load` (see the matching comment in
+    // TopEventsPanel.swift for why that's a problem even for a single event).
+    // Starts as a neutral placeholder and pops in once `.task` below resolves it.
+    @State private var cachedInfo: LatestEventInfo?
+
+    private static let placeholderInfo = LatestEventInfo(
+        name: "", folderPath: nil, bookmarkIndex: nil, bannerImagePath: nil,
+        meta: nil, description: nil, badge: "",
+        strip: HeroStrip(rawFiles: "—", data: "—", avgISO: "—", topLens: "—", date: "—"),
+        hasData: false, isFinalized: false
+    )
 
     var body: some View {
-        let info = resolveLatestEvent()
+        let info = cachedInfo ?? Self.placeholderInfo
         let isCollapsedEmptyState = !info.hasData && !isEmptyStateExpanded
+        let isCollapsedBanner = info.hasData && effectiveBannerIsCompact(info)
+        let isCollapsed = isCollapsedEmptyState || isCollapsedBanner
 
         ZStack {
             cardBannerBackground(info: info)
 
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
-                    leftPanel(info: info)
+                    leftPanel(info: info, isCompact: isCollapsedBanner)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    if !isCollapsedEmptyState {
+                    if !isCollapsed {
                         rightPanel(info: info)
                             .frame(maxWidth: .infinity)
                             .padding(8)
                     }
                 }
-                .frame(height: isCollapsedEmptyState ? 88 : 198)
-                if !isCollapsedEmptyState {
+                .frame(height: isCollapsed ? 88 : 198)
+                if !isCollapsed {
                     bottomStrip(info: info)
                         .frame(height: 52)
                 }
             }
 
         }
-        .frame(height: isCollapsedEmptyState ? 88 : 250)
+        .frame(height: isCollapsed ? 88 : 250)
         .background(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
                 .fill(Color.auroraPanel)
@@ -42,21 +58,49 @@ struct HeroEventCard: View {
                 .strokeBorder(Color.auroraStroke, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
+        .overlay(alignment: .topLeading) {
+            if info.hasData && isHoveringCard {
+                bannerExpandButton(info: info)
+                    .padding(.top, 12)
+                    .padding(.leading, 16)
+                    .zIndex(10)
+            }
+        }
         .overlay(alignment: .topTrailing) {
-            if !info.hasData {
+            if info.hasData {
+                bannerMenu(info: info)
+                    .padding(.top, 12)
+                    .padding(.trailing, 16)
+                    .zIndex(10)
+            } else {
                 emptyStateToggleButton
                     .padding(.top, 12)
                     .padding(.trailing, 16)
                     .zIndex(10)
             }
         }
-        .animation(.easeInOut(duration: 0.18), value: isCollapsedEmptyState)
+        .onAppear {
+            loadBannerDisplayMode(for: info)
+        }
+        .onChange(of: info.bookmarkIndex) { _, _ in
+            loadBannerDisplayMode(for: info)
+        }
+        .onHover { isHoveringCard = $0 }
+        .animation(.easeInOut(duration: 0.18), value: isCollapsed)
+        .animation(.easeOut(duration: 0.14), value: isHoveringCard)
+        // Populates `cachedInfo` off the initial synchronous render path — see the
+        // `@State private var cachedInfo` comment above.
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            cachedInfo = resolveLatestEvent()
+        }
     }
 
     // MARK: - Left
 
-    private func leftPanel(info: LatestEventInfo) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private func leftPanel(info: LatestEventInfo, isCompact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: isCompact ? 5 : 8) {
             Text("LATEST EVENT")
                 .font(.manrope(9.5, weight: .bold))
                 .tracking(1.9)
@@ -68,6 +112,7 @@ struct HeroEventCard: View {
                     .tracking(-0.5)
                     .foregroundStyle(Color.auroraTxt)
                     .lineLimit(2)
+                    .minimumScaleFactor(isCompact ? 0.7 : 1)
 
                 if info.isFinalized {
                     Text("Finalizado")
@@ -80,17 +125,17 @@ struct HeroEventCard: View {
                 }
             }
 
-            if let meta = info.meta {
+            if !isCompact, let meta = info.meta {
                 Text(meta)
                     .font(.manrope(11.5, weight: .semibold))
                     .foregroundStyle(Color.auroraMuted)
             }
 
-            if info.hasData || isEmptyStateExpanded {
+            if (info.hasData && !isCompact) || isEmptyStateExpanded {
                 Spacer(minLength: 4)
             }
 
-            if info.hasData {
+            if info.hasData && !isCompact {
                 Button {
                     if let bookmarkIndex = info.bookmarkIndex {
                         onViewEvent(bookmarkIndex)
@@ -145,21 +190,31 @@ struct HeroEventCard: View {
         .auroraTooltip(isEmptyStateExpanded ? "Minimize" : "Expand")
     }
 
+    @ViewBuilder
+    private func bannerExpandButton(info: LatestEventInfo) -> some View {
+        if info.bookmarkIndex != nil {
+            Button {
+                setBannerCompact(!effectiveBannerIsCompact(info), for: info)
+            } label: {
+                Image(systemName: effectiveBannerIsCompact(info) ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Color.auroraCyan)
+                    .frame(width: 22, height: 22)
+                    .background(Circle().fill(Color.auroraPanel.opacity(0.72)))
+                    .overlay(Circle().strokeBorder(Color.auroraCyan.opacity(0.28), lineWidth: 1))
+                    .shadow(color: Color.black.opacity(0.28), radius: 6, x: 0, y: 3)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
     // MARK: - Right
 
     private func rightPanel(info: LatestEventInfo) -> some View {
         ZStack {
             if info.hasData {
                 EmptyView()
-            }
-
-            VStack {
-                HStack {
-                    Spacer()
-                    bannerMenu(info: info)
-                        .padding(12)
-                }
-                Spacer()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -168,10 +223,13 @@ struct HeroEventCard: View {
 
     @ViewBuilder
     private func cardBannerBackground(info: LatestEventInfo) -> some View {
-        if let path = info.bannerImagePath, let image = NSImage(contentsOfFile: path) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
+        if let path = info.bannerImagePath {
+            EventThumbnail(
+                eventName: info.name,
+                folderPath: info.folderPath,
+                cornerRadius: 0,
+                bannerImagePath: path
+            )
                 .saturation(0.95)
                 .contrast(1.08)
                 .opacity(0.5)
@@ -199,6 +257,9 @@ struct HeroEventCard: View {
                 Button("Choose Banner Photo…") {
                     chooseBannerPhoto(for: bookmarkIndex)
                 }
+                Button(effectiveBannerIsCompact(info) ? "Expand Banner" : "Collapse Banner") {
+                    setBannerCompact(!effectiveBannerIsCompact(info), for: info)
+                }
                 if info.bannerImagePath != nil {
                     Button("Remove Banner Photo") {
                         appState.clearEventFolderBanner(at: bookmarkIndex)
@@ -220,6 +281,31 @@ struct HeroEventCard: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
         }
+    }
+
+    private func effectiveBannerIsCompact(_ info: LatestEventInfo) -> Bool {
+        info.bookmarkIndex != nil && isBannerCompact
+    }
+
+    private func bannerDisplayModeKey(for info: LatestEventInfo) -> String? {
+        guard let bookmarkIndex = info.bookmarkIndex else { return nil }
+        return "eventBannerCompact-\(bookmarkIndex)"
+    }
+
+    private func loadBannerDisplayMode(for info: LatestEventInfo) {
+        guard let key = bannerDisplayModeKey(for: info) else {
+            isBannerCompact = false
+            return
+        }
+        isBannerCompact = UserDefaults.standard.bool(forKey: key)
+    }
+
+    private func setBannerCompact(_ compact: Bool, for info: LatestEventInfo) {
+        guard let key = bannerDisplayModeKey(for: info) else { return }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+            isBannerCompact = compact
+        }
+        UserDefaults.standard.set(compact, forKey: key)
     }
 
     private func chooseBannerPhoto(for bookmarkIndex: Int) {

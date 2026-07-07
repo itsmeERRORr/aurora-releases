@@ -3,7 +3,7 @@ import SwiftUI
 @main
 struct commanderonev2App: App {
     @State private var appState = AppState()
-    @State private var showLicenseOverlay = !LicensingService.isActivated()
+    @State private var showLicenseOverlay = false
 
     #if canImport(Sparkle)
     @StateObject private var updater = SparkleUpdater()

@@ -4,46 +4,198 @@ import AppKit
 struct StatisticsView: View {
     @Bindable var appState: AppState
     let statsRunner: StatsRunner?
+    var onStartImport: () -> Void = {}
     var onSelectEvent: (Int) -> Void = { _ in }
 
     @State private var mode: StatsMode = .total
     @State private var viewAllSheet: StatsViewAllSheet?
+    @State private var topEventsMetric: TopEventsMetric = .raw
+    @State private var isComparing = false
+    @State private var compareTagA: EventTag?
+    @State private var compareTagB: EventTag?
+    // `hasNoFilteredData`/`selectedReport`/`shootingTimeRow` below must never call
+    // `appState.dashboardStatsReport`/`dashboardShootingTimeSourceNamesByDay`
+    // directly — see the matching comment in TopEventsPanel.swift.
+    @State private var cachedTotalReport: StatsReport?
+    @State private var cachedShootingTimeSourceNames: [String: String] = [:]
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                StatisticsTopbar(mode: $mode)
+        Group {
+            if shouldRequestLibraryFirst {
+                dashboardAccessEmptyState
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        StatisticsTopbar(mode: $mode, appState: appState, isComparing: $isComparing)
 
-                GeneralStatsGrid(appState: appState, mode: mode)
+                        if isComparing && mode == .total {
+                            CompareSectionView(appState: appState, tagA: $compareTagA, tagB: $compareTagB)
+                                .onDisappear {
+                                    compareTagA = nil
+                                    compareTagB = nil
+                                }
+                        } else if hasNoFilteredData {
+                            noFilteredDataState
+                        } else {
+                            if hasDashboardEvents {
+                                GeneralStatsGrid(appState: appState, mode: mode)
 
-                HeroEventCard(appState: appState, onViewEvent: onSelectEvent)
+                                HeroEventCard(appState: appState, onViewEvent: onSelectEvent)
+                            }
 
-                PhotoStatsGrid(appState: appState, mode: mode)
+                            PhotoStatsGrid(appState: appState, mode: mode)
 
-                camerasAndLensesRow
+                            camerasAndLensesRow
 
-                eventsRow
+                            if mode == .total {
+                                eventsRow
 
-                chartsRow
+                                chartsRow
 
-                photosPerMonthRow
+                                photosPerMonthRow
 
-                rawImportsTimelineRow
+                                if hasImportedEvents {
+                                    rawImportsTimelineRow
+                                }
+                            }
+
+                            shootingTimeRow
+
+                            if mode == .total && hasActiveDaysData {
+                                activeImportDaysRow
+                            }
+                        }
+                    }
+                    .padding(.horizontal, AuroraSpacing.mainPaddingH)
+                    .padding(.vertical, AuroraSpacing.mainPaddingV)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .scrollIndicators(.hidden)
             }
-            .padding(.horizontal, AuroraSpacing.mainPaddingH)
-            .padding(.vertical, AuroraSpacing.mainPaddingV)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .scrollIndicators(.hidden)
         .sheet(item: $viewAllSheet) { sheet in
             StatsViewAllSheetView(kind: sheet, appState: appState, onSelectEvent: onSelectEvent)
         }
+        // Populates `cachedTotalReport`/`cachedShootingTimeSourceNames` off the main
+        // thread — GeneralStatsGrid/PhotoStatsGrid have their own copies of this same
+        // fix. `body` (via `hasNoFilteredData`/`selectedReport`/`shootingTimeRow`)
+        // never calls the `appState` properties directly, so the first render (and
+        // every render right after a stats change) is always cheap.
+        // Debounced — see the matching comment in TopEventsPanel.swift.
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await refreshTotalReportAndShootingTimeNames()
+        }
+        .task(id: "\(appState.dashboardTagFilter?.rawValue ?? "-")|\(appState.dashboardYearFilter.map(String.init) ?? "-")") {
+            await refreshTotalReportAndShootingTimeNames()
+        }
+    }
+
+    private func refreshTotalReportAndShootingTimeNames() async {
+        await appState.prewarmStatsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
+        cachedTotalReport = appState.statsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
+        await appState.prewarmDashboardShootingTimeSourceNamesByDay()
+        cachedShootingTimeSourceNames = appState.dashboardShootingTimeSourceNamesByDay
+    }
+
+    private var shouldRequestLibraryFirst: Bool {
+        appState.uniqueImportDestinations.isEmpty
+    }
+
+    private var hasImportedEvents: Bool {
+        appState.uniqueImportDestinations.contains { destination in
+            !appState.isLibraryFolder(at: destination.bookmarkIndex)
+                && appState.importStatsForEventFolder(at: destination.bookmarkIndex) != nil
+        }
+    }
+
+    private var hasDashboardEvents: Bool {
+        appState.uniqueImportDestinations.contains { destination in
+            !appState.isLibraryFolder(at: destination.bookmarkIndex)
+        }
+    }
+
+    private var hasActiveDashboardFilter: Bool {
+        appState.dashboardTagFilter != nil || appState.dashboardYearFilter != nil
+    }
+
+    private var hasNoFilteredData: Bool {
+        mode == .total && hasActiveDashboardFilter && cachedTotalReport == nil
+    }
+
+    private var noFilteredDataState: some View {
+        VStack(spacing: 8) {
+            Text("No stats for this filter")
+                .font(.sora(18, weight: .bold))
+                .foregroundStyle(Color.auroraTxt)
+            Text(noFilteredDataSubtitle)
+                .font(.manrope(12.5, weight: .medium))
+                .foregroundStyle(Color.auroraMuted)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 64)
+        .auroraStaticCard(radius: AuroraRadius.large, paddingH: 0, paddingV: 0)
+    }
+
+    private var noFilteredDataSubtitle: String {
+        var parts: [String] = []
+        if let tag = appState.dashboardTagFilter { parts.append(tag.rawValue) }
+        if let year = appState.dashboardYearFilter { parts.append(String(year)) }
+        return "No events match \(parts.joined(separator: " · ")). Try another tag or year."
+    }
+
+    private var hasActiveDaysData: Bool {
+        if selectedReport?.captureTimestampsByDay.isEmpty == false { return true }
+        return !appState.filteredImportHistory.isEmpty
+    }
+
+    private var dashboardAccessEmptyState: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 14) {
+                IconChip(systemName: "chart.bar.fill", color: .auroraCyan, size: 36, iconScale: 0.52)
+                Text("Dashboard")
+                    .font(.auroraTopbarH2)
+                    .foregroundStyle(Color.auroraTxt)
+                Spacer()
+            }
+
+            Spacer()
+
+            VStack(alignment: .center, spacing: 18) {
+                IconChip(systemName: "folder.badge.plus", color: .auroraMagenta, size: 46, iconScale: 0.5)
+
+                VStack(alignment: .center, spacing: 8) {
+                    Text("Add a folder or make an import first")
+                        .font(.sora(26, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                        .lineLimit(1)
+                    Text("Your Dashboard will appear once Aurora has an event or folder to analyze.")
+                        .font(.manrope(13.5, weight: .medium))
+                        .foregroundStyle(Color.auroraMuted)
+                        .lineLimit(1)
+                }
+
+                Button(action: onStartImport) {
+                    Label("Add Folder or Make Import", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(AuroraGradientButtonStyle(compact: true))
+            }
+            .padding(28)
+            .frame(width: 620, alignment: .center)
+            .auroraStaticCard(radius: AuroraRadius.large, paddingH: 0, paddingV: 0)
+
+            Spacer()
+        }
+        .padding(.horizontal, AuroraSpacing.mainPaddingH)
+        .padding(.vertical, AuroraSpacing.mainPaddingV)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     // 1 : 1 — Top Events + Latest Events
     private var eventsRow: some View {
         HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
-            TopEventsPanel(appState: appState, onSelect: onSelectEvent, onViewAll: { viewAllSheet = .topEvents })
+            TopEventsPanel(appState: appState, onSelect: onSelectEvent, onViewAll: { viewAllSheet = .topEvents(topEventsMetric) }, selectedMetric: $topEventsMetric)
                 .frame(maxWidth: .infinity)
             LatestEventsPanel(appState: appState, onSelect: onSelectEvent, onViewAll: { viewAllSheet = .latestEvents })
                 .frame(maxWidth: .infinity)
@@ -53,26 +205,21 @@ struct StatisticsView: View {
     // 1 : 1 — Top Cameras + Top Lenses
     private var camerasAndLensesRow: some View {
         HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
-            TopCamerasPanel(appState: appState, onViewAll: { viewAllSheet = .topCameras })
+            TopCamerasPanel(appState: appState, report: selectedReport, onViewAll: { viewAllSheet = .topCameras(mode) })
                 .frame(maxWidth: .infinity)
-            TopLensesPanel(appState: appState, onViewAll: { viewAllSheet = .topLenses })
+            TopLensesPanel(appState: appState, report: selectedReport, onViewAll: { viewAllSheet = .topLenses(mode) })
                 .frame(maxWidth: .infinity)
         }
     }
 
     // 1 : 1 — Most RAW Photos + Most Deliverable Photos
     private var chartsRow: some View {
-        GeometryReader { geo in
-            let gap = AuroraSpacing.gridGap
-            let unit = (geo.size.width - gap) / 2
-            HStack(alignment: .top, spacing: gap) {
-                PhotosPerEventChart(appState: appState, onViewAll: { viewAllSheet = .photosPerEvent })
-                    .frame(width: unit)
-                DeliverablesPerEventChart(appState: appState, onViewAll: { viewAllSheet = .deliverablesPerEvent })
-                    .frame(width: unit)
-            }
+        HStack(alignment: .top, spacing: AuroraSpacing.gridGap) {
+            PhotosPerEventChart(appState: appState, onViewAll: { viewAllSheet = .photosPerEvent })
+                .frame(maxWidth: .infinity)
+            DeliverablesPerEventChart(appState: appState, onViewAll: { viewAllSheet = .deliverablesPerEvent })
+                .frame(maxWidth: .infinity)
         }
-        .frame(minHeight: 360)
     }
 
     // Full width — RAW imports by day/week/month
@@ -80,30 +227,61 @@ struct StatisticsView: View {
         RAWImportsTimelineChart(appState: appState)
     }
 
+    private var shootingTimeRow: some View {
+        ShootingTimePanel(
+            report: selectedReport,
+            title: mode == .lastImport ? "Import Shooting Time" : "Shooting Time",
+            subtitle: mode == .lastImport
+                ? "Working hours and active shooting time from this import"
+                : "Working hours and active shooting time from RAW capture timestamps",
+            sourceNamesByDay: mode == .total ? cachedShootingTimeSourceNames : [:]
+        )
+    }
+
+    private var activeImportDaysRow: some View {
+        ActiveImportDaysPanel(report: selectedReport, importHistory: appState.filteredImportHistory, appState: appState)
+    }
+
+    private var selectedReport: StatsReport? {
+        mode == .lastImport ? appState.statsReport : cachedTotalReport
+    }
+
     // Full width — Photos per Month
     private var photosPerMonthRow: some View {
-        PhotosPerMonthChart(appState: appState)
+        PhotosPerMonthChart(appState: appState, onViewAll: { viewAllSheet = .photosPerMonth })
     }
 }
 
-enum StatsViewAllSheet: String, Identifiable {
-    case topEvents
+enum StatsViewAllSheet: Identifiable {
+    case topEvents(TopEventsMetric)
     case latestEvents
-    case topCameras
-    case topLenses
+    case topCameras(StatsMode)
+    case topLenses(StatsMode)
     case photosPerEvent
     case deliverablesPerEvent
+    case photosPerMonth
 
-    var id: String { rawValue }
+    var id: String {
+        switch self {
+        case .topEvents(let metric): return "topEvents-\(metric.rawValue)"
+        case .latestEvents: return "latestEvents"
+        case .topCameras(let mode): return "topCameras-\(mode.id)"
+        case .topLenses(let mode): return "topLenses-\(mode.id)"
+        case .photosPerEvent: return "photosPerEvent"
+        case .deliverablesPerEvent: return "deliverablesPerEvent"
+        case .photosPerMonth: return "photosPerMonth"
+        }
+    }
 
     var title: String {
         switch self {
-        case .topEvents: return "Top Events"
+        case .topEvents(let metric): return "Top Events per \(metric.rawValue)"
         case .latestEvents: return "Latest Events"
         case .topCameras: return "Top Cameras"
         case .topLenses: return "Top Lenses"
         case .photosPerEvent: return "Most Photos per Event"
         case .deliverablesPerEvent: return "Most Deliverable Photos per Event"
+        case .photosPerMonth: return "Most Photos per Month"
         }
     }
 }
@@ -114,6 +292,9 @@ struct StatsViewAllSheetView: View {
     var onSelectEvent: (Int) -> Void = { _ in }
     @Environment(\.dismiss) private var dismiss
     @State private var dateEditor: ManualEventDateEditorState?
+    // See the matching comment in TopEventsPanel.swift — `content` below must
+    // never call `EventAggregator.build` directly.
+    @State private var cachedEvents: [EventAggregate] = []
 
     var body: some View {
         ZStack {
@@ -150,6 +331,23 @@ struct StatsViewAllSheetView: View {
             }
         }
         .animation(.easeOut(duration: 0.16), value: dateEditor?.id)
+        // Populates `cachedEvents` off the main thread for the `.topEvents`/
+        // `.photosPerEvent` sheet kinds — `content` never calls
+        // `EventAggregator.build` itself (see the matching comment in
+        // TopEventsPanel.swift).
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await refreshEvents()
+        }
+        .task(id: "\(appState.dashboardTagFilter?.rawValue ?? "-")|\(appState.dashboardYearFilter.map(String.init) ?? "-")") {
+            await refreshEvents()
+        }
+    }
+
+    private func refreshEvents() async {
+        await EventAggregator.prewarm(appState: appState, tagFilter: appState.dashboardTagFilter, yearFilter: appState.dashboardYearFilter)
+        cachedEvents = EventAggregator.build(appState: appState, tagFilter: appState.dashboardTagFilter, yearFilter: appState.dashboardYearFilter)
     }
 
     private var manualDateEditor: some View {
@@ -245,18 +443,18 @@ struct StatsViewAllSheetView: View {
     @ViewBuilder
     private var content: some View {
         switch kind {
-        case .topEvents:
-            let events = EventAggregator.build(appState: appState)
-                .sorted(by: EventAggregator.sortByPhotoCount)
+        case .topEvents(let metric):
+            let events = cachedEvents
+                .sorted { EventAggregator.sort($0, $1, by: metric) }
                 .map { aggregate in
                     LatestEventDisplay(
                         aggregate: aggregate,
                         bookmarkIndex: bookmarkIndex(for: aggregate.id),
                         bannerImagePath: appState.bannerImagePath(forEventPath: aggregate.id)
                     )
-                }
+            }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
-                TopEventRow(rank: idx + 1, event: event) {
+                TopEventRow(rank: idx + 1, event: event, metric: metric) {
                     if let bookmarkIndex = event.bookmarkIndex {
                         selectEvent(bookmarkIndex)
                     }
@@ -271,21 +469,30 @@ struct StatsViewAllSheetView: View {
                     selectEvent(event.bookmarkIndex)
                 }
             }
-        case .topCameras:
-            let cameras = appState.totalStatsReport?.allCameras ?? []
+        case .topCameras(let mode):
+            let cameras = report(for: mode)?.allCameras ?? []
             ForEach(Array(cameras.enumerated()), id: \.offset) { idx, camera in
                 TopCameraRow(rank: idx + 1, camera: camera)
             }
-        case .topLenses:
-            let lenses = appState.totalStatsReport?.allLenses ?? []
+        case .topLenses(let mode):
+            let lenses = report(for: mode)?.allLenses ?? []
             ForEach(Array(lenses), id: \.id) { lens in
                 TopLensRow(lens: lens)
             }
         case .photosPerEvent:
-            let events = EventAggregator.build(appState: appState)
+            let events = cachedEvents
                 .sorted { $0.totalFiles > $1.totalFiles }
             ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
                 PhotosPerEventListRow(rank: idx + 1, event: event, appState: appState)
+            }
+        case .photosPerMonth:
+            // Chronological oldest-first (reversed from `photosByMonth`'s newest-first
+            // order), unlike the card's top-5-by-volume — this is where a recent,
+            // still-low-volume month like the current one (which the top-5-by-count
+            // list can drop) always shows up, in reading order from the start.
+            let months = appState.photosByMonth.reversed()
+            ForEach(Array(months.enumerated()), id: \.element.month) { idx, entry in
+                MonthPhotosListRow(rank: idx + 1, month: entry.month, count: entry.count)
             }
         case .deliverablesPerEvent:
             let entries = DeliverablesPerEventChart.deliverableEntries(appState: appState)
@@ -293,6 +500,19 @@ struct StatsViewAllSheetView: View {
             ForEach(Array(entries.enumerated()), id: \.element.id) { idx, entry in
                 DeliverableEventListRow(rank: idx + 1, entry: entry, appState: appState)
             }
+        }
+    }
+
+    private func report(for mode: StatsMode) -> StatsReport? {
+        mode == .lastImport ? appState.statsReport : appState.dashboardTotalStatsReport
+    }
+}
+
+private extension StatsMode {
+    var id: String {
+        switch self {
+        case .lastImport: return "lastImport"
+        case .total: return "total"
         }
     }
 }
@@ -328,7 +548,7 @@ private struct LatestSidebarOrderRow: View {
         }()
         HStack(spacing: 12) {
             RankBadge(rank: rank)
-            EventThumbnail(eventName: event.name, folderPath: event.path, bannerImagePath: bannerPath)
+            EventThumbnail(eventName: event.name, bannerImagePath: bannerPath)
                 .frame(width: 44, height: 34)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onSelect)
@@ -343,7 +563,7 @@ private struct LatestSidebarOrderRow: View {
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraFaint)
                     .contentShape(Rectangle())
-                    .help("Click to set a manual event date")
+                    .auroraTooltip("Click to set a manual event date")
                     .onTapGesture {
                         onEditDate(event.bookmarkIndex, editableDate())
                     }
@@ -377,7 +597,6 @@ private struct PhotosPerEventListRow: View {
             RankBadge(rank: rank)
             EventThumbnail(
                 eventName: event.name,
-                folderPath: event.id,
                 bannerImagePath: appState.bannerImagePath(forEventPath: event.id)
             )
             .frame(width: 44, height: 34)
@@ -398,6 +617,25 @@ private struct PhotosPerEventListRow: View {
     }
 }
 
+private struct MonthPhotosListRow: View {
+    let rank: Int
+    let month: String
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RankBadge(rank: rank)
+            Text(month)
+                .font(.auroraEventName)
+                .foregroundStyle(Color.auroraTxt)
+            Spacer(minLength: 4)
+            SpeedPill(text: AuroraFormat.count(count), tint: .auroraCyan)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+}
+
 private struct DeliverableEventListRow: View {
     let rank: Int
     let entry: DeliverablesPerEventChart.DeliverableEntry
@@ -408,7 +646,6 @@ private struct DeliverableEventListRow: View {
             RankBadge(rank: rank)
             EventThumbnail(
                 eventName: entry.name,
-                folderPath: entry.id,
                 bannerImagePath: appState.bannerImagePath(forEventPath: entry.id)
             )
             .frame(width: 44, height: 34)

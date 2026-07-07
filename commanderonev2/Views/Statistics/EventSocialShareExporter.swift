@@ -34,6 +34,9 @@ struct EventSocialShareSnapshot {
     let avgShutter: String
     let avgAperture: String
     let avgFocal: String
+    let mostRawPhotosInDay: String
+    let totalWorkingHours: String
+    let longestActiveDay: String
     let topLenses: [EventSocialRankItem]
     let topCameras: [EventSocialRankItem]
 }
@@ -119,6 +122,19 @@ private struct EventSocialShareCard: View {
         }
         .frame(width: size.width, height: size.height)
         .clipped()
+        .overlay(alignment: .bottomTrailing) {
+            brandMark
+                .padding(.horizontal, isStory ? 72 : 58)
+                .padding(.bottom, isStory ? 92 : 54)
+        }
+    }
+
+    private var brandMark: some View {
+        Text("Stats by @TheAuroraApp")
+            .font(.manrope(isStory ? 18 : 15, weight: .heavy))
+            .tracking(1.2)
+            .foregroundStyle(Color.auroraCyan)
+            .shadow(color: .black.opacity(0.45), radius: 10, x: 0, y: 4)
     }
 
     private var background: some View {
@@ -171,10 +187,7 @@ private struct EventSocialShareCard: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: isStory ? 22 : 14) {
             HStack(spacing: 12) {
-                Text("JOAO PHOTOS")
-                    .font(.manrope(isStory ? 18 : 15, weight: .heavy))
-                    .tracking(4)
-                    .foregroundStyle(Color.auroraCyan)
+                brandMark
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -201,9 +214,12 @@ private struct EventSocialShareCard: View {
         VStack(alignment: .leading, spacing: isStory ? 22 : 12) {
             rawFilesHero
 
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: isStory ? 16 : 8) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: isStory ? 16 : 8) {
                 shareStat("Delivered", snapshot.deliveredPhotos, "checkmark.rectangle.stack.fill", .auroraHealthy)
                 shareStat("Data", snapshot.dataImported, "externaldrive.fill", .auroraBlue)
+                shareStat("Most RAW Photos in a Day", snapshot.mostRawPhotosInDay, "photo.stack.fill", .auroraCyan)
+                shareStat("Total Working Hours", snapshot.totalWorkingHours, "clock.fill", .auroraBlue)
+                shareStat("Longest Active Day", snapshot.longestActiveDay, "sun.max.fill", .auroraViolet)
                 shareStat("Avg ISO", snapshot.avgISO, "camera.aperture", .auroraViolet)
                 shareStat("Avg Shutter", snapshot.avgShutter, "timer", .auroraPurple)
                 shareStat("Avg Aperture", snapshot.avgAperture, "circle.dotted", .auroraMagenta)
@@ -261,7 +277,8 @@ private struct EventSocialShareCard: View {
                     .font(.manrope(isStory ? 16 : 14, weight: .heavy))
                     .tracking(1.7)
                     .foregroundStyle(.white.opacity(0.56))
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.62)
             }
 
             Text(value)
@@ -271,7 +288,7 @@ private struct EventSocialShareCard: View {
                 .lineLimit(2)
                 .minimumScaleFactor(0.58)
         }
-        .frame(maxWidth: .infinity, minHeight: isStory ? 136 : 84, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: isStory ? 136 : 90, alignment: .leading)
         .padding(isStory ? 22 : 13)
         .background(
             RoundedRectangle(cornerRadius: 28, style: .continuous)

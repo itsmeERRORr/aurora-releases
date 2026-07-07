@@ -4,15 +4,21 @@ struct PhotoStatsGrid: View {
     @Bindable var appState: AppState
     let mode: StatsMode
 
+    // See the matching comment in GeneralStatsGrid.swift/TopEventsPanel.swift —
+    // `report` below must never call `appState.dashboardStatsReport` directly.
+    @State private var cachedTotalReport: StatsReport?
+
     var body: some View {
         LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 7),
+            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: mode == .lastImport ? 6 : 7),
             spacing: AuroraSpacing.gridGap
         ) {
             PhotoStatCard(icon: "photo.stack.fill", accent: .auroraCyan,
                           pages: photosAddedPages)
-            PhotoStatCard(icon: "checkmark.rectangle.stack.fill", accent: .auroraHealthy,
-                          pages: photosDeliveredPages)
+            if mode == .total {
+                PhotoStatCard(icon: "checkmark.rectangle.stack.fill", accent: .auroraHealthy,
+                              pages: photosDeliveredPages)
+            }
             PhotoStatCard(icon: "camera.aperture", accent: .auroraBlue,
                           pages: isoPages)
             PhotoStatCard(icon: "circle.dotted", accent: .auroraViolet,
@@ -24,10 +30,24 @@ struct PhotoStatsGrid: View {
             PhotoStatCard(icon: "rectangle.portrait.fill", accent: .auroraLive,
                           pages: orientationPages)
         }
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await refreshTotalReport()
+        }
+        .task(id: "\(appState.dashboardTagFilter?.rawValue ?? "-")|\(appState.dashboardYearFilter.map(String.init) ?? "-")") {
+            await refreshTotalReport()
+        }
+    }
+
+    private func refreshTotalReport() async {
+        guard mode == .total else { return }
+        await appState.prewarmStatsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
+        cachedTotalReport = appState.statsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
     }
 
     private var report: StatsReport? {
-        mode == .lastImport ? appState.statsReport : appState.totalStatsReport
+        mode == .lastImport ? appState.statsReport : cachedTotalReport
     }
 
     // MARK: - Pages
@@ -48,7 +68,7 @@ struct PhotoStatsGrid: View {
                 ("Avg / Day", AuroraFormat.count(r.totalFilesAnalyzed))
             ]
         case .total:
-            let history = appState.importHistory
+            let history = appState.filteredImportHistory
             guard !history.isEmpty else { return [("Photos Added", AuroraFormat.count(r.totalFilesAnalyzed))] }
             let avgImport = r.totalFilesAnalyzed / max(history.count, 1)
             let days = Set(history.map { Calendar.current.startOfDay(for: $0.date) })
@@ -150,7 +170,7 @@ struct PhotoStatCard: View {
     let pages: [(label: String, value: String)]
 
     @State private var index = 0
-    @State private var hovering = false
+    @State private var updatePulse = false
 
     var body: some View {
         let safeIndex = pages.indices.contains(index) ? index : 0
@@ -183,19 +203,32 @@ struct PhotoStatCard: View {
                 .minimumScaleFactor(0.65)
                 .contentTransition(.numericText())
         }
+        .scaleEffect(updatePulse ? 1.012 : 1.0)
         .frame(maxWidth: .infinity, alignment: .leading)
         .auroraCard()
         .overlay(
             RoundedRectangle(cornerRadius: AuroraRadius.medium, style: .continuous)
-                .strokeBorder(accent.opacity(0.22), lineWidth: 1)
+                .strokeBorder(updatePulse ? accent.opacity(0.72) : accent.opacity(0.22), lineWidth: updatePulse ? 1.4 : 1)
         )
-        .onHover { hovering = $0 }
+        .shadow(color: updatePulse ? accent.opacity(0.28) : .clear, radius: updatePulse ? 16 : 0, x: 0, y: 0)
+        .animation(.spring(response: 0.34, dampingFraction: 0.78), value: updatePulse)
+        .animation(.easeInOut(duration: 0.22), value: page.value)
+        .onChange(of: page.value) { _, _ in
+            pulseUpdate()
+        }
         .onTapGesture {
             guard pages.count > 1 else { return }
             withAnimation(.easeInOut(duration: 0.2)) {
                 index = (safeIndex + 1) % pages.count
             }
         }
-        .help(pages.count > 1 ? "Click to cycle through avg / highest / lowest" : "")
+    }
+
+    private func pulseUpdate() {
+        updatePulse = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(520))
+            updatePulse = false
+        }
     }
 }

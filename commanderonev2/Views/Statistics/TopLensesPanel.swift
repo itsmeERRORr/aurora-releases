@@ -12,12 +12,22 @@ enum LensDisplayFormatter {
             return "10mm F2.8"
         }
 
-        return model
+        var result = model
             .replacingOccurrences(of: "Sony ", with: "")
             .replacingOccurrences(of: "SONY ", with: "")
             .replacingOccurrences(of: "FE ", with: "")
             .replacingOccurrences(of: "DT ", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip any remaining brand prefix (e.g. "SAMYANG AF 85mm" → "AF 85mm")
+        let upperResult = result.uppercased()
+        let upperMake = make.uppercased().trimmingCharacters(in: .whitespaces)
+        if !upperMake.isEmpty, upperResult.hasPrefix(upperMake + " ") {
+            result = String(result.dropFirst(upperMake.count + 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return result
     }
 
     static func brandName(make: String, model: String) -> String {
@@ -37,13 +47,15 @@ enum LensDisplayFormatter {
 
 struct TopLensesPanel: View {
     @Bindable var appState: AppState
+    var report: StatsReport?
     var onViewAll: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Top Lenses", actionLabel: "View all →", action: onViewAll)
+            let allLenses = report?.allLenses ?? []
+            AuroraPanelHeader(title: "Top Lenses", actionLabel: allLenses.count > 5 ? "View all →" : nil, action: onViewAll)
 
-            let lenses = (appState.totalStatsReport?.allLenses ?? []).prefix(5)
+            let lenses = allLenses.prefix(5)
 
             if lenses.isEmpty {
                 emptyState
@@ -53,9 +65,10 @@ struct TopLensesPanel: View {
                         TopLensRow(lens: lens)
                     }
                 }
+                .frame(minHeight: 266, alignment: .top)
             }
         }
-        .auroraStaticCard()
+        .auroraCollapsibleStaticCard(storageKey: "dashboard.topLenses")
     }
 
     private var emptyState: some View {

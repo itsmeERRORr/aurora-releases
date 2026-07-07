@@ -184,6 +184,131 @@ struct AuroraStaticCardStyle: ViewModifier {
     }
 }
 
+struct AuroraCollapsibleStaticCardStyle: ViewModifier {
+    var storageKey: String
+    var radius: CGFloat = AuroraRadius.medium
+    var paddingH: CGFloat = AuroraSpacing.cardPaddingH
+    var paddingV: CGFloat = AuroraSpacing.cardPaddingV
+    var collapsedHeight: CGFloat = 56
+    var collapsedVisibleHeight: CGFloat
+
+    @State private var hovering = false
+    @AppStorage private var isCollapsed: Bool
+
+    init(
+        storageKey: String,
+        radius: CGFloat = AuroraRadius.medium,
+        paddingH: CGFloat = AuroraSpacing.cardPaddingH,
+        paddingV: CGFloat = AuroraSpacing.cardPaddingV,
+        collapsedHeight: CGFloat = 56,
+        collapsedVisibleHeight: CGFloat? = nil
+    ) {
+        self.storageKey = storageKey
+        self.radius = radius
+        self.paddingH = paddingH
+        self.paddingV = paddingV
+        self.collapsedHeight = collapsedHeight
+        self.collapsedVisibleHeight = collapsedVisibleHeight ?? (collapsedHeight - 14)
+        _isCollapsed = AppStorage(wrappedValue: false, "aurora.collapsedPanel.\(storageKey)")
+    }
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        let collapseAnimation = Animation.easeInOut(duration: 0.22)
+        let toggleCollapse = {
+            withAnimation(collapseAnimation) {
+                isCollapsed.toggle()
+            }
+        }
+
+        ZStack(alignment: .topLeading) {
+            content
+                .environment(\.auroraToggleCardCollapse, toggleCollapse)
+                .environment(\.auroraCardIsCollapsed, isCollapsed)
+                .padding(.leading, paddingH)
+                .padding(.trailing, paddingH)
+                .padding(.vertical, paddingV)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: isCollapsed ? collapsedVisibleHeight : nil, alignment: .top)
+                .clipped()
+                .compositingGroup()
+        }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: isCollapsed ? collapsedHeight : nil, alignment: .top)
+            .contentShape(shape)
+            .clipShape(shape)
+            .background(
+                shape.fill(Color.auroraPanel)
+            )
+            .overlay(
+                shape.strokeBorder(Color.auroraStroke, lineWidth: 1)
+            )
+            .overlay(alignment: .topLeading) {
+                if hovering {
+                    Button {
+                        toggleCollapse()
+                    } label: {
+                        Image(systemName: isCollapsed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundStyle(Color.auroraCyan)
+                            .frame(width: 22, height: 22)
+                            .background(
+                                Circle()
+                                    .fill(Color.auroraPanel2.opacity(0.94))
+                            )
+                            .overlay(
+                                Circle()
+                                    .strokeBorder(Color.auroraStroke2, lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .padding(6)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .help(isCollapsed ? "Expand card" : "Collapse card")
+                }
+            }
+            .animation(collapseAnimation, value: isCollapsed)
+            .animation(.easeOut(duration: 0.14), value: hovering)
+            .onHover { hovering = $0 }
+    }
+}
+
+private struct AuroraToggleCardCollapseKey: EnvironmentKey {
+    static let defaultValue: (() -> Void)? = nil
+}
+
+private struct AuroraCardIsCollapsedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var auroraToggleCardCollapse: (() -> Void)? {
+        get { self[AuroraToggleCardCollapseKey.self] }
+        set { self[AuroraToggleCardCollapseKey.self] = newValue }
+    }
+
+    var auroraCardIsCollapsed: Bool {
+        get { self[AuroraCardIsCollapsedKey.self] }
+        set { self[AuroraCardIsCollapsedKey.self] = newValue }
+    }
+}
+
+struct AuroraCollapsibleHeaderTitle: View {
+    let title: String
+    @Environment(\.auroraToggleCardCollapse) private var toggleCardCollapse
+
+    var body: some View {
+        Text(title.uppercased())
+            .font(.auroraSectionLabel)
+            .tracking(1.6)
+            .foregroundStyle(Color.auroraFaint)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                toggleCardCollapse?()
+            }
+    }
+}
+
 extension View {
     func auroraCard(radius: CGFloat = AuroraRadius.medium,
                     paddingH: CGFloat = AuroraSpacing.cardPaddingH,
@@ -194,6 +319,21 @@ extension View {
                           paddingH: CGFloat = AuroraSpacing.cardPaddingH,
                           paddingV: CGFloat = AuroraSpacing.cardPaddingV) -> some View {
         modifier(AuroraStaticCardStyle(radius: radius, paddingH: paddingH, paddingV: paddingV))
+    }
+    func auroraCollapsibleStaticCard(storageKey: String,
+                                     radius: CGFloat = AuroraRadius.medium,
+                                     paddingH: CGFloat = AuroraSpacing.cardPaddingH,
+                                     paddingV: CGFloat = AuroraSpacing.cardPaddingV,
+                                     collapsedHeight: CGFloat = 56,
+                                     collapsedVisibleHeight: CGFloat? = nil) -> some View {
+        modifier(AuroraCollapsibleStaticCardStyle(
+            storageKey: storageKey,
+            radius: radius,
+            paddingH: paddingH,
+            paddingV: paddingV,
+            collapsedHeight: collapsedHeight,
+            collapsedVisibleHeight: collapsedVisibleHeight
+        ))
     }
     func auroraGlow(_ color: Color = .auroraAccent, opacity: Double = 0.7) -> some View {
         shadow(color: color.opacity(opacity), radius: 14, x: 0, y: 8)

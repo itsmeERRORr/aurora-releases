@@ -205,18 +205,71 @@ APP_PATH="$EXPORT_DIR/${PRODUCT_NAME}.app"
 echo "Adhoc signing…"
 codesign --force --deep --sign - "$APP_PATH"
 
-# -------- 4. Build the DMG ---------------------------------------------------
+# -------- 4. Build the DMG (drag-to-Applications, no external tools) ---------
 DMG_NAME="${PRODUCT_NAME}-${NEW_VERSION}.dmg"
 DMG_PATH="$RELEASES_DIR/$DMG_NAME"
-rm -f "$DMG_PATH"
+DMG_STAGING="$RELEASES_DIR/.dmg-staging-$$"
+TMP_DMG="$RELEASES_DIR/.dmg-tmp-$$.dmg"
+rm -f "$DMG_PATH" "$TMP_DMG"
+rm -rf "$DMG_STAGING"
 
 echo "Building DMG → $DMG_NAME"
+
+# Stage: app + Applications symlink
+mkdir -p "$DMG_STAGING"
+cp -R "$APP_PATH" "$DMG_STAGING/"
+ln -s /Applications "$DMG_STAGING/Applications"
+
+# Create a read-write DMG from the staging folder
 hdiutil create \
+    -srcfolder "$DMG_STAGING" \
     -volname "${PRODUCT_NAME} ${NEW_VERSION}" \
-    -srcfolder "$APP_PATH" \
-    -ov -format UDZO \
+    -fs HFS+ \
+    -fsargs "-c c=64,a=16,b=16" \
+    -format UDRW \
     -quiet \
-    "$DMG_PATH"
+    "$TMP_DMG"
+
+# Mount the RW DMG
+MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen "$TMP_DMG" \
+    | grep "/Volumes" | awk -F'\t' '{print $NF}' | head -1)
+
+# Use Finder via AppleScript to set icon positions and window layout
+VOLNAME="${PRODUCT_NAME} ${NEW_VERSION}"
+APP_BUNDLE="${PRODUCT_NAME}.app"
+osascript <<APPLESCRIPT
+tell application "Finder"
+    tell disk "$VOLNAME"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set bounds of container window to {200, 120, 860, 520}
+        set theViewOptions to the icon view options of container window
+        set arrangement of theViewOptions to not arranged
+        set icon size of theViewOptions to 128
+        set position of item "$APP_BUNDLE" of container window to {170, 185}
+        set position of item "Applications" of container window to {490, 185}
+        update without registering applications
+        delay 1
+        close
+    end tell
+end tell
+APPLESCRIPT
+
+# Flush and detach
+sync
+hdiutil detach "$MOUNT_DIR" -quiet
+
+# Convert to compressed read-only DMG
+hdiutil convert "$TMP_DMG" \
+    -format UDZO \
+    -imagekey zlib-level=9 \
+    -quiet \
+    -o "$DMG_PATH"
+
+rm -f "$TMP_DMG"
+rm -rf "$DMG_STAGING"
 
 DMG_SIZE_BYTES=$(stat -f%z "$DMG_PATH")
 

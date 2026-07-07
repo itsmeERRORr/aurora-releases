@@ -16,38 +16,21 @@ enum StatsStorage {
     }
 
     static func save(_ stats: StatsReport) {
-        print("StatsStorage.save: Saving stats with \(stats.totalFilesAnalyzed) files to file")
-        print("StatsStorage.save: File path: \(storageURL.path)")
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .prettyPrinted
-            let data = try encoder.encode(stats)
+            let data = try JSONEncoder().encode(stats)
             try data.write(to: storageURL, options: .atomic)
-            print("StatsStorage.save: ✅ Successfully saved \(data.count) bytes to file")
         } catch {
             print("StatsStorage.save: ❌ Failed to save - \(error)")
         }
     }
 
     static func load() -> StatsReport? {
-        print("StatsStorage.load: Loading from file: \(storageURL.path)")
-
-        guard FileManager.default.fileExists(atPath: storageURL.path) else {
-            print("StatsStorage.load: ❌ File does not exist")
-            return nil
-        }
-
+        guard FileManager.default.fileExists(atPath: storageURL.path) else { return nil }
         do {
             let data = try Data(contentsOf: storageURL)
-            print("StatsStorage.load: ✅ Found data of \(data.count) bytes")
-
-            let decoder = JSONDecoder()
-            let stats = try decoder.decode(StatsReport.self, from: data).recalculatingISOFromRawOutput()
-            print("StatsStorage.load: ✅ Successfully loaded stats with \(stats.totalFilesAnalyzed) files")
-            return stats
+            return try JSONDecoder().decode(StatsReport.self, from: data).recalculatingISOFromRawOutput()
         } catch {
             print("StatsStorage.load: ❌ Failed to load - \(error)")
-            // Clear corrupted file
             try? FileManager.default.removeItem(at: storageURL)
             return nil
         }
@@ -61,11 +44,8 @@ enum StatsStorage {
     // Last import stats
     static func saveLastImport(_ stats: StatsReport) {
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .prettyPrinted
-            let data = try encoder.encode(stats)
+            let data = try JSONEncoder().encode(stats)
             try data.write(to: lastImportURL, options: .atomic)
-            print("StatsStorage.saveLastImport: Saved \(data.count) bytes")
         } catch {
             print("StatsStorage.saveLastImport: Failed - \(error)")
         }

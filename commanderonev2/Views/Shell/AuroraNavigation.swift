@@ -7,7 +7,7 @@ enum NavigationItem: Equatable, Identifiable, Hashable {
     case storage
     case settings
     case logs
-    case event(index: Int)
+    case event(bookmarkIndex: Int)
 
     var id: String {
         switch self {
@@ -17,7 +17,7 @@ enum NavigationItem: Equatable, Identifiable, Hashable {
         case .storage: return "storage"
         case .settings: return "settings"
         case .logs: return "logs"
-        case .event(let idx): return "event-\(idx)"
+        case .event(let bookmarkIndex): return "event-\(bookmarkIndex)"
         }
     }
 

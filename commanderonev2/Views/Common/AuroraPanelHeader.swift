@@ -6,17 +6,15 @@ struct AuroraPanelHeader: View {
     let title: String
     var actionLabel: String? = nil
     var action: (() -> Void)? = nil
+    @Environment(\.auroraCardIsCollapsed) private var cardIsCollapsed
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(title.uppercased())
-                .font(.auroraSectionLabel)
-                .tracking(1.6)
-                .foregroundStyle(Color.auroraFaint)
+            AuroraCollapsibleHeaderTitle(title: title)
 
             Spacer(minLength: 8)
 
-            if let label = actionLabel {
+            if let label = actionLabel, !cardIsCollapsed {
                 Button(action: { action?() }) {
                     Text(label)
                         .font(.manrope(11.5, weight: .semibold))

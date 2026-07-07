@@ -5,13 +5,9 @@ struct RAWImportsTimelineChart: View {
 
     @State private var period: ImportTimelinePeriod = .day
     @State private var animateBars = false
+    @State private var entries: [ImportTimelineEntry] = []
 
     var body: some View {
-        let entries = ImportTimelineAggregator.entries(
-            from: appState.importHistory,
-            monthlyStats: appState.photosByMonth,
-            period: period
-        )
         let peak = entries.max { $0.rawCount < $1.rawCount }
         let totalRAWs = entries.reduce(0) { $0 + $1.rawCount }
         let totalImports = entries.reduce(0) { $0 + $1.importCount }
@@ -35,19 +31,17 @@ struct RAWImportsTimelineChart: View {
                     .padding(.top, 2)
             }
         }
-        .auroraStaticCard()
-        .onAppear { restartAnimation() }
-        .onChange(of: period) { _, _ in restartAnimation() }
-        .onChange(of: appState.importHistory.count) { _, _ in restartAnimation() }
+        .auroraCollapsibleStaticCard(storageKey: "dashboard.rawImportsTimeline", collapsedVisibleHeight: 31)
+        .onAppear { reloadEntries(restartBars: false) }
+        .onChange(of: period) { _, _ in reloadEntries(restartBars: true) }
+        .onChange(of: appState.importHistory.count) { _, _ in reloadEntries(restartBars: true) }
+        .onChange(of: appState.photosByMonth.count) { _, _ in reloadEntries(restartBars: true) }
     }
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("RAW Imports Timeline")
-                    .font(.auroraSectionLabel)
-                    .tracking(1.6)
-                    .foregroundStyle(Color.auroraFaint)
+                AuroraCollapsibleHeaderTitle(title: "RAW Imports Timeline")
                 Text("Imported RAW files by day, week and month")
                     .font(.manrope(11, weight: .semibold))
                     .foregroundStyle(Color.auroraMuted)
@@ -92,14 +86,10 @@ struct RAWImportsTimelineChart: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.auroraPanel2.opacity(0.66))
-        )
+        .auroraCard(paddingH: 13, paddingV: 13)
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: AuroraRadius.medium, style: .continuous)
                 .strokeBorder(tint.opacity(0.2), lineWidth: 1)
         )
     }
@@ -107,6 +97,19 @@ struct RAWImportsTimelineChart: View {
     private func restartAnimation() {
         animateBars = false
         withAnimation(.timingCurve(0.18, 0.86, 0.22, 1, duration: 0.95)) {
+            animateBars = true
+        }
+    }
+
+    private func reloadEntries(restartBars: Bool) {
+        entries = ImportTimelineAggregator.entries(
+            from: appState.importHistory,
+            monthlyStats: appState.photosByMonth,
+            period: period
+        )
+        if restartBars {
+            restartAnimation()
+        } else {
             animateBars = true
         }
     }
@@ -207,15 +210,12 @@ enum ImportTimelineAggregator {
     }
 
     private static func monthlyEntries(from monthlyStats: [(month: String, count: Int)], importHistory: [ImportHistoryEntry]) -> [ImportTimelineEntry] {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM yyyy"
-
         let importCountsByMonth = Dictionary(grouping: importHistory) { entry in
-            formatter.string(from: entry.date)
+            Self.monthFormatter.string(from: entry.date)
         }.mapValues { $0.count }
 
         return monthlyStats.compactMap { item in
-            guard let date = formatter.date(from: item.month) else { return nil }
+            guard let date = Self.monthFormatter.date(from: item.month) else { return nil }
             return ImportTimelineEntry(
                 id: date,
                 startDate: date,
@@ -242,48 +242,69 @@ enum ImportTimelineAggregator {
     }
 
     private static func label(for date: Date, period: ImportTimelinePeriod, calendar: Calendar) -> String {
-        let formatter = DateFormatter()
         switch period {
         case .day:
-            formatter.dateFormat = "MMM d, yyyy"
-            return formatter.string(from: date)
+            return Self.dayFormatter.string(from: date)
         case .week:
             let end = calendar.date(byAdding: .day, value: 6, to: date) ?? date
             return "\(AuroraFormat.dateShort(date)) — \(AuroraFormat.dateShort(end))"
         case .month:
-            formatter.dateFormat = "MMM yyyy"
-            return formatter.string(from: date)
+            return Self.monthFormatter.string(from: date)
         }
     }
 
     private static func shortLabel(for date: Date, period: ImportTimelinePeriod, calendar: Calendar) -> String {
-        let formatter = DateFormatter()
         switch period {
         case .day:
-            formatter.dateFormat = "MMM d"
+            return Self.shortDayFormatter.string(from: date)
         case .week:
             return shortWeekLabel(for: date, calendar: calendar)
         case .month:
-            formatter.dateFormat = "MMM"
+            return Self.shortMonthFormatter.string(from: date)
         }
-        return formatter.string(from: date)
     }
 
     private static func shortWeekLabel(for date: Date, calendar: Calendar) -> String {
         let end = calendar.date(byAdding: .day, value: 6, to: date) ?? date
-        let monthFormatter = DateFormatter()
-        monthFormatter.dateFormat = "MMM"
-        let dayFormatter = DateFormatter()
-        dayFormatter.dateFormat = "d"
-        let startMonth = monthFormatter.string(from: date)
-        let endMonth = monthFormatter.string(from: end)
-        let startDay = dayFormatter.string(from: date)
-        let endDay = dayFormatter.string(from: end)
+        let startMonth = Self.shortMonthFormatter.string(from: date)
+        let endMonth = Self.shortMonthFormatter.string(from: end)
+        let startDay = Self.dayNumberFormatter.string(from: date)
+        let endDay = Self.dayNumberFormatter.string(from: end)
         if startMonth == endMonth {
             return "\(startMonth) \(startDay)-\(endDay)"
         }
         return "\(startMonth) \(startDay)-\(endMonth) \(endDay)"
     }
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, yyyy"
+        return formatter
+    }()
+
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM yyyy"
+        return formatter
+    }()
+
+    private static let shortDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter
+    }()
+
+    private static let shortMonthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM"
+        return formatter
+    }()
+
+    private static let dayNumberFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "d"
+        return formatter
+    }()
 }
 
 private struct TimelineBars: View {
@@ -318,9 +339,7 @@ private struct TimelineBars: View {
                             .contentShape(Rectangle())
                             .onHover { hovering in
                                 guard hovering else { return }
-                                withAnimation(.easeOut(duration: 0.12)) {
-                                    hoveredID = entry.id
-                                }
+                                hoveredID = entry.id
                             }
                         }
                     }
@@ -330,10 +349,8 @@ private struct TimelineBars: View {
                 .frame(width: contentWidth, height: geo.size.height)
                 .contentShape(Rectangle())
                 .onHover { hovering in
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        isHoveringChart = hovering
-                        if !hovering { hoveredID = nil }
-                    }
+                    isHoveringChart = hovering
+                    if !hovering { hoveredID = nil }
                 }
             }
             .scrollIndicators(.hidden)
@@ -386,7 +403,7 @@ private struct TimelineBar: View {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(barGradient)
                     .frame(height: max(6, chartHeight * min(max(fraction, 0), 1)))
-                    .shadow(color: barTint.opacity(isHighlighted ? 0.55 : 0.24), radius: isHighlighted ? 12 : 5, x: 0, y: 0)
+                    .shadow(color: barTint.opacity(isHighlighted ? 0.45 : 0), radius: isHighlighted ? 10 : 0, x: 0, y: 0)
             }
             .frame(maxWidth: .infinity)
             .frame(height: chartHeight)

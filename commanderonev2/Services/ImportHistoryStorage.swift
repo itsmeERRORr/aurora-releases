@@ -10,10 +10,26 @@ enum ImportHistoryStorage {
 
         if let data = try? JSONEncoder().encode(trimmedHistory) {
             UserDefaults.standard.set(data, forKey: storageKey)
+            try? FileManager.default.createDirectory(at: AppPaths.applicationSupportRoot, withIntermediateDirectories: true)
+            try? data.write(to: fileURL, options: [.atomic])
         }
     }
 
     static func load() -> [ImportHistoryEntry] {
+        let legacyHistory = loadLegacyDefaults()
+        if let data = try? Data(contentsOf: fileURL),
+           let history = try? JSONDecoder().decode([ImportHistoryEntry].self, from: data) {
+            if history.count >= legacyHistory.count {
+                return history
+            }
+            save(legacyHistory)
+            return legacyHistory
+        }
+        save(legacyHistory)
+        return legacyHistory
+    }
+
+    private static func loadLegacyDefaults() -> [ImportHistoryEntry] {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let history = try? JSONDecoder().decode([ImportHistoryEntry].self, from: data) else {
             return []
@@ -48,6 +64,11 @@ enum ImportHistoryStorage {
 
     static func clear() {
         UserDefaults.standard.removeObject(forKey: storageKey)
+        try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    private static var fileURL: URL {
+        AppPaths.applicationSupportRoot.appendingPathComponent("import_history.json")
     }
 
     private static func normalizePath(_ path: String) -> String {

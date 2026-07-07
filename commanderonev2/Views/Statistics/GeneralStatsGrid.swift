@@ -4,6 +4,14 @@ struct GeneralStatsGrid: View {
     @Bindable var appState: AppState
     let mode: StatsMode
 
+    // `body`/the computed properties below never call `appState.dashboardStatsReport`
+    // directly — SwiftUI evaluates `body` synchronously on mount, before any `.task`
+    // has a chance to run, so reading the (potentially expensive, on a cache miss)
+    // property straight from a computed property re-created the exact hang a shared
+    // cache + prewarm was supposed to fix (see the comment in TopEventsPanel.swift
+    // for the full explanation). This starts `nil` and pops in once populated.
+    @State private var cachedTotalReport: StatsReport?
+
     var body: some View {
         LazyVGrid(
             columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
@@ -18,6 +26,7 @@ struct GeneralStatsGrid: View {
                 secondaryStats: dataSecondaryStats,
                 sparkValues: dataSpark
             )
+
             GeneralStatCard(
                 icon: "bolt.fill",
                 accent: .auroraViolet,
@@ -26,6 +35,7 @@ struct GeneralStatsGrid: View {
                 value: speed.value, unit: speed.unit,
                 sparkValues: speedSpark
             )
+
             GeneralStatCard(
                 icon: "clock",
                 accent: .auroraMagenta,
@@ -35,6 +45,7 @@ struct GeneralStatsGrid: View {
                 secondaryStats: timeSecondaryStats,
                 sparkValues: timeSpark
             )
+
             GeneralStatCard(
                 icon: "arrow.up.circle.fill",
                 accent: .auroraBlue,
@@ -45,6 +56,20 @@ struct GeneralStatsGrid: View {
                 sparkValues: importsSpark
             )
         }
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await refreshTotalReport()
+        }
+        .task(id: "\(appState.dashboardTagFilter?.rawValue ?? "-")|\(appState.dashboardYearFilter.map(String.init) ?? "-")") {
+            await refreshTotalReport()
+        }
+    }
+
+    private func refreshTotalReport() async {
+        guard mode == .total else { return }
+        await appState.prewarmStatsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
+        cachedTotalReport = appState.statsReport(forTag: appState.dashboardTagFilter, year: appState.dashboardYearFilter)
     }
 
     // MARK: - Data
@@ -55,8 +80,8 @@ struct GeneralStatsGrid: View {
             guard let r = appState.lastImportReport else { return ("—", "") }
             return AuroraFormat.bytesParts(r.totalBytes)
         case .total:
-            let bytes = appState.totalStatsReport?.totalBytes
-                ?? appState.importHistory.reduce(0) { $0 + $1.totalBytes }
+            let bytes = cachedTotalReport?.totalBytes
+                ?? appState.filteredImportHistory.reduce(0) { $0 + $1.totalBytes }
             if bytes == 0 { return ("—", "") }
             return AuroraFormat.bytesParts(bytes)
         }
@@ -72,10 +97,10 @@ struct GeneralStatsGrid: View {
                 (label: "Avg / Day", value: "\(parts.value) \(parts.unit)")
             ]
         case .total:
-            let history = appState.importHistory
+            let history = appState.filteredImportHistory
             guard !history.isEmpty else { return [] }
 
-            let totalBytes = appState.totalStatsReport?.totalBytes
+            let totalBytes = cachedTotalReport?.totalBytes
                 ?? history.reduce(Int64(0)) { $0 + $1.totalBytes }
             guard totalBytes > 0 else { return [] }
 
@@ -96,7 +121,7 @@ struct GeneralStatsGrid: View {
             guard let r = appState.lastImportReport else { return ("—", "") }
             return AuroraFormat.speedParts(r.averageSpeed)
         case .total:
-            guard let r = appState.totalStatsReport, r.averageSpeed > 0 else { return ("—", "") }
+            guard let r = cachedTotalReport, r.averageSpeed > 0 else { return ("—", "") }
             return AuroraFormat.speedParts(r.averageSpeed)
         }
     }
@@ -107,7 +132,7 @@ struct GeneralStatsGrid: View {
             guard let r = appState.lastImportReport else { return ("—", "") }
             return AuroraFormat.durationParts(Int(r.duration))
         case .total:
-            guard let r = appState.totalStatsReport, r.totalDuration > 0 else { return ("—", "") }
+            guard let r = cachedTotalReport, r.totalDuration > 0 else { return ("—", "") }
             return AuroraFormat.durationParts(r.totalDuration)
         }
     }
@@ -119,10 +144,10 @@ struct GeneralStatsGrid: View {
             let parts = AuroraFormat.durationParts(Int(report.duration))
             return [(label: "Avg / Import", value: "\(parts.value) \(parts.unit)")]
         case .total:
-            guard let report = appState.totalStatsReport,
+            guard let report = cachedTotalReport,
                   report.totalDuration > 0,
-                  !appState.importHistory.isEmpty else { return [] }
-            let parts = AuroraFormat.durationParts(report.totalDuration / max(appState.importHistory.count, 1))
+                  !appState.filteredImportHistory.isEmpty else { return [] }
+            let parts = AuroraFormat.durationParts(report.totalDuration / max(appState.filteredImportHistory.count, 1))
             return [(label: "Avg / Import", value: "\(parts.value) \(parts.unit)")]
         }
     }
@@ -132,7 +157,7 @@ struct GeneralStatsGrid: View {
         case .lastImport:
             return (appState.lastImportReport == nil ? "—" : "1", "")
         case .total:
-            let n = appState.importHistory.count
+            let n = appState.filteredImportHistory.count
             if n == 0 { return ("—", "") }
             return ("\(n)", "")
         }
@@ -143,7 +168,7 @@ struct GeneralStatsGrid: View {
         case .lastImport:
             return appState.lastImportReport == nil ? [] : [(label: "Avg / Day", value: "1")]
         case .total:
-            let history = appState.importHistory
+            let history = appState.filteredImportHistory
             guard !history.isEmpty else { return [] }
             let days = Set(history.map { Calendar.current.startOfDay(for: $0.date) })
             let avg = Double(history.count) / Double(max(days.count, 1))
@@ -156,31 +181,35 @@ struct GeneralStatsGrid: View {
 
     /// History sorted newest → oldest, capped at 10 entries.
     private var historyWindow: [ImportHistoryEntry] {
-        Array(appState.importHistory.suffix(10))
+        Array(appState.filteredImportHistory.suffix(10))
     }
 
     private var dataSpark: [Double] {
-        historyWindow.map { Double($0.totalBytes) }
+        guard mode == .total else { return [] }
+        return historyWindow.map { Double($0.totalBytes) }
     }
 
     private var speedSpark: [Double] {
+        guard mode == .total else { return [] }
         // No bytes/s in history → approximate with bytes / fileCount as proxy
-        historyWindow.map { e in
+        return historyWindow.map { e in
             let count = max(e.fileCount, 1)
             return Double(e.totalBytes) / Double(count)
         }
     }
 
     private var timeSpark: [Double] {
-        historyWindow.map { Double($0.fileCount) }
+        guard mode == .total else { return [] }
+        return historyWindow.map { Double($0.fileCount) }
     }
 
     private var importsSpark: [Double] {
+        guard mode == .total else { return [] }
         // Imports per day in the last 10 days
         let calendar = Calendar.current
         let now = Date()
         var counts: [Date: Int] = [:]
-        for entry in appState.importHistory {
+        for entry in appState.filteredImportHistory {
             let day = calendar.startOfDay(for: entry.date)
             counts[day, default: 0] += 1
         }
@@ -203,7 +232,11 @@ struct GeneralStatCard: View {
     var secondaryStats: [(label: String, value: String)] = []
     let sparkValues: [Double]
 
+    @State private var updatePulse = false
+
     var body: some View {
+        let updateKey = ([value, unit] + secondaryStats.flatMap { [$0.label, $0.value] }).joined(separator: "|")
+
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 IconChip(systemName: icon, color: accent)
@@ -223,6 +256,7 @@ struct GeneralStatCard: View {
                         .foregroundStyle(Color.auroraMuted)
                 }
             }
+            .contentTransition(.numericText())
             HStack(spacing: 10) {
                 ForEach(secondaryStats, id: \.label) { stat in
                     VStack(alignment: .leading, spacing: 1) {
@@ -248,12 +282,27 @@ struct GeneralStatCard: View {
                 Spacer().frame(height: 30 + 4)
             }
         }
+        .scaleEffect(updatePulse ? 1.01 : 1.0)
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: 200, alignment: .topLeading)
         .auroraCard()
         .overlay(
             RoundedRectangle(cornerRadius: AuroraRadius.medium, style: .continuous)
-                .strokeBorder(accent.opacity(0.22), lineWidth: 1)
+                .strokeBorder(updatePulse ? accent.opacity(0.7) : accent.opacity(0.22), lineWidth: updatePulse ? 1.4 : 1)
         )
+        .shadow(color: updatePulse ? accent.opacity(0.24) : .clear, radius: updatePulse ? 16 : 0, x: 0, y: 0)
+        .animation(.spring(response: 0.34, dampingFraction: 0.78), value: updatePulse)
+        .animation(.easeInOut(duration: 0.22), value: updateKey)
+        .onChange(of: updateKey) { _, _ in
+            pulseUpdate()
+        }
+    }
+
+    private func pulseUpdate() {
+        updatePulse = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(520))
+            updatePulse = false
+        }
     }
 }

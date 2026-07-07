@@ -4,12 +4,24 @@ struct PhotosPerEventChart: View {
     @Bindable var appState: AppState
     var onViewAll: () -> Void = {}
 
+    // See the matching comment in TopEventsPanel.swift — `body` must never call
+    // `EventAggregator.build` directly, since SwiftUI evaluates it synchronously
+    // on mount, before any `.task` below has a chance to run.
+    @State private var cachedEvents: [EventAggregate] = []
+    // Distinguishes "still loading" from "genuinely empty" — see the matching
+    // comment in TopEventsPanel.swift.
+    @State private var hasLoadedOnce = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Most RAW Photos per Event", actionLabel: "View all →", action: onViewAll)
+            let allEvents = cachedEvents
+                .sorted { $0.totalFiles > $1.totalFiles }
+            AuroraPanelHeader(title: "Most RAW Photos per Event", actionLabel: allEvents.count > 5 ? "View all →" : nil, action: onViewAll)
 
-            let top = topEvents()
-            if top.count < 3 {
+            let top = topEvents(from: allEvents)
+            if !hasLoadedOnce {
+                AuroraSkeletonChart()
+            } else if top.count < 3 {
                 empty
             } else {
                 ChartCanvas(events: top)
@@ -17,7 +29,23 @@ struct PhotosPerEventChart: View {
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .auroraStaticCard()
+        .auroraCollapsibleStaticCard(storageKey: "dashboard.photosPerEvent")
+        // Populates `cachedEvents` off the main thread (see TopEventsPanel.swift).
+        // Debounced — see the matching comment in TopEventsPanel.swift.
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await refreshEvents()
+        }
+        .task(id: "\(appState.dashboardTagFilter?.rawValue ?? "-")|\(appState.dashboardYearFilter.map(String.init) ?? "-")") {
+            await refreshEvents()
+        }
+    }
+
+    private func refreshEvents() async {
+        await EventAggregator.prewarm(appState: appState, tagFilter: appState.dashboardTagFilter, yearFilter: appState.dashboardYearFilter)
+        cachedEvents = EventAggregator.build(appState: appState, tagFilter: appState.dashboardTagFilter, yearFilter: appState.dashboardYearFilter)
+        hasLoadedOnce = true
     }
 
     private var empty: some View {
@@ -35,10 +63,8 @@ struct PhotosPerEventChart: View {
 
     /// Picks 3 events to plot: highest at the centre, then the 2nd and 3rd
     /// distributed left/right by lastDate (oldest left, newest right).
-    private func topEvents() -> [EventAggregate] {
-        let all = EventAggregator.build(appState: appState)
-            .sorted { $0.totalFiles > $1.totalFiles }
-            .prefix(3)
+    private func topEvents(from events: [EventAggregate]) -> [EventAggregate] {
+        let all = events.prefix(3)
         guard all.count == 3 else { return Array(all) }
         let peak = all[0]
         let others = [all[1], all[2]].sorted { $0.lastDate < $1.lastDate }
@@ -54,12 +80,14 @@ private struct ChartCanvas: View {
             let w = geo.size.width
             let h = geo.size.height
             let topInset: CGFloat = 50    // room for value text + badge
-            let bottomInset: CGFloat = 36 // room for event names
+            let bottomInset: CGFloat = 56 // room for wrapped event names
+            let horizontalInset: CGFloat = 40
+            let labelWidth: CGFloat = min(190, max(130, (w - 40) / 3.1))
             let drawingHeight = h - topInset - bottomInset
 
             let xs: [CGFloat] = events.indices.map { i in
                 let frac: CGFloat = events.count == 1 ? 0.5 : CGFloat(i) / CGFloat(events.count - 1)
-                return frac * (w - 80) + 40
+                return frac * (w - horizontalInset * 2) + horizontalInset
             }
             let maxV = max(CGFloat(events.map(\.totalFiles).max() ?? 1), 1)
             let ys: [CGFloat] = events.map { e in
@@ -96,8 +124,8 @@ private struct ChartCanvas: View {
                 // Badges + labels
                 ForEach(Array(events.enumerated()), id: \.element.id) { idx, event in
                     nodeLabel(event: event,
-                              rank: rankFor(idx: idx),
-                              x: xs[idx], y: ys[idx], h: h, bottomInset: bottomInset)
+                               rank: rankFor(idx: idx),
+                               x: xs[idx], y: ys[idx], h: h, bottomInset: bottomInset, labelWidth: labelWidth, chartWidth: w)
                 }
             }
         }
@@ -113,8 +141,9 @@ private struct ChartCanvas: View {
         }
     }
 
-    private func nodeLabel(event: EventAggregate, rank: Int, x: CGFloat, y: CGFloat, h: CGFloat, bottomInset: CGFloat) -> some View {
-        VStack(spacing: 4) {
+    private func nodeLabel(event: EventAggregate, rank: Int, x: CGFloat, y: CGFloat, h: CGFloat, bottomInset: CGFloat, labelWidth: CGFloat, chartWidth: CGFloat) -> some View {
+        let labelX = min(max(x, labelWidth / 2), max(labelWidth / 2, chartWidth - labelWidth / 2))
+        return VStack(spacing: 4) {
             Text(AuroraFormat.count(event.totalFiles))
                 .font(.sora(15, weight: .bold))
                 .foregroundStyle(Color.auroraTxt)
@@ -125,9 +154,11 @@ private struct ChartCanvas: View {
             Text(event.name)
                 .font(.manrope(12, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
-                .lineLimit(1)
-                .frame(maxWidth: 200)
-                .position(x: x, y: h - bottomInset + 14)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(width: labelWidth)
+                .multilineTextAlignment(.center)
+                .position(x: labelX, y: h - bottomInset + 24)
         )
     }
 
@@ -166,9 +197,9 @@ struct DeliverablesPerEventChart: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Most Deliverable Photos per Event", actionLabel: "View all →", action: onViewAll)
-
             let entries = Self.deliverableEntries(appState: appState)
+            AuroraPanelHeader(title: "Most Deliverable Photos per Event", actionLabel: entries.count > 5 ? "View all →" : nil, action: onViewAll)
+
             if appState.isRefreshingEventFolders && entries.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().scaleEffect(0.75)
@@ -189,8 +220,7 @@ struct DeliverablesPerEventChart: View {
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .auroraStaticCard()
-        .task { appState.refreshEventFolderMediaCounts() }
+        .auroraCollapsibleStaticCard(storageKey: "dashboard.deliverablesPerEvent")
     }
 
     private var emptyView: some View {

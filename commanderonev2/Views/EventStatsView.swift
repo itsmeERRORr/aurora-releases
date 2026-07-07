@@ -17,6 +17,7 @@ struct EventStatsView: View {
     @State private var showAllCameras = false
     @State private var scanDate: Date? = nil      // when the last successful scan happened
     @State private var isCachedData = false       // true = currently showing cached (not fresh) data
+    @State private var scanQuality: EventStatsScanQuality? = nil
     @State private var isEditingEventName = false
     @State private var eventNameDraft = ""
     @State private var isRepositioningBanner = false
@@ -24,16 +25,46 @@ struct EventStatsView: View {
     @State private var bannerDragStartOffset: EventBannerOffset?
     @State private var shareErrorMessage: String?
     @State private var scanProgress: Double = 0
+    // Latched, not recomputed fresh each render — once a scan is flagged as slow it
+    // stays flagged for the rest of that scan, even if the live ETA estimate later
+    // dips back under the threshold (e.g. pace briefly speeds up near the end).
+    // Reset only when a new scan starts (see `.task(id: isBackgroundScanning)`).
+    @State private var showSlowScanInfo = false
     @State private var showLockInfo = false
+    @State private var showLockedInfo = false
+    @State private var showLockConfirmPrompt = false
+    @State private var showUnlockConfirmPrompt = false
+    @State private var showPostLockSharePrompt = false
+    @State private var jpgCountsByDay: [String: Int] = [:]
+    @State private var isLoadingJPGCounts = false
+    @State private var isBannerCompact = false
+    @State private var isHoveringBanner = false
+    @State private var bannerImage: NSImage?
+    @State private var loadedBannerImagePath: String?
+    @State private var isEditingTags = false
+    @State private var galleryPhotos: [GalleryPhotoRecord] = []
+    @State private var isBuildingGallery = false
+    @State private var galleryBuildTotal: Int?
+    // `destinationPath` is a plain `let` (a constructor parameter), not `@State` —
+    // reading it from inside an async closure that captured `self` earlier reads a
+    // *frozen* value from whenever that closure was created, not the live current
+    // path. `@State`'s storage is a shared box, so this mirror of it (kept in sync
+    // via onAppear/onChange below) is what async gallery work should actually check
+    // against to detect "the user has since switched events" — comparing against
+    // `destinationPath` directly always trivially matched, letting an old event's
+    // still-in-progress gallery build write its photos into whatever event the user
+    // had since navigated to.
+    @State private var currentEventPath: String = ""
     @FocusState private var eventNameFieldFocused: Bool
 
     // Import history summary — available instantly, no scan needed
     // Falls back to cached report data if folder has been moved and history can't be matched
     private var importSummary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
+        guard !isAddedLibraryFolder else { return nil }
         if let bookmarkIndex, let summary = appState.importStatsForEventFolder(at: bookmarkIndex) {
             return summary
         }
-        if let summary = appState.importStats(forEventPath: destinationPath) {
+        if let summary = appState.importStats(forEventPath: destinationPath, eventName: eventName) {
             return summary
         }
         // Fallback: use cached report data when folder path has changed
@@ -49,13 +80,46 @@ struct EventStatsView: View {
         return nil
     }
 
+    private var isAddedLibraryFolder: Bool {
+        guard let bookmarkIndex else { return false }
+        return appState.isLibraryFolder(at: bookmarkIndex)
+    }
+
+    private var eventImportHistoryEntries: [ImportHistoryEntry] {
+        let paths = eventImportCandidatePaths
+        guard !paths.isEmpty else { return [] }
+        return appState.importHistory.filter { entry in
+            let destination = normalizeEventPath(entry.destinationPath)
+            return paths.contains { path in
+                destination == path || destination.hasPrefix(path + "/")
+            }
+        }
+    }
+
+    private var eventImportCandidatePaths: [String] {
+        var paths = [destinationPath]
+        if let bookmarkIndex {
+            if bookmarkIndex < appState.eventFolderCachedPaths.count {
+                paths.append(appState.eventFolderCachedPaths[bookmarkIndex])
+            }
+            if bookmarkIndex < appState.eventFolderPreviousCachedPaths.count {
+                paths.append(appState.eventFolderPreviousCachedPaths[bookmarkIndex])
+            }
+        }
+        return Array(Set(paths.map(normalizeEventPath).filter { !$0.isEmpty }))
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
                 eventBannerCard
 
-                // Import history card — always visible, no scan needed
-                if let summary = importSummary {
+                if bookmarkIndex != nil {
+                    eventTagsRow
+                }
+
+                // Import history card — visible for imported events only.
+                if !isAddedLibraryFolder, let summary = importSummary {
                     importHistoryCard(summary: summary)
                 }
 
@@ -63,30 +127,67 @@ struct EventStatsView: View {
                 // Only show the full-page spinner when there is no cached data yet.
                 // If a background re-scan is running while we already have data, the
                 // small header spinner is enough — we keep showing the (cached) content.
-                if isLoading && report == nil {
+                if isBackgroundScanning && report == nil {
+                    backgroundScanningState
+                } else if isLoading && report == nil {
                     loadingState
                 } else if let err = errorMessage {
                     errorState(message: err)
                 } else if let report = report, report.totalFilesAnalyzed > 0 {
                     statsContent(for: report)
                 } else if hasLoaded {
-                    if isBackgroundScanning {
+                    if isQueuedForBackgroundScan {
+                        queuedScanState
+                    } else if isBackgroundScanning {
                         backgroundScanningState
                     } else {
                         emptyState
                     }
                 }
+
+                // JPGs are detected/built independently of the RAW scan (see
+                // checkForNewJPGsAndRebuildIfNeeded), so this stays outside the
+                // report-gated branches above — otherwise it'd stay hidden behind the
+                // "scanning RAWs" skeleton for however long that scan takes. Kept at
+                // the bottom, after the RAW stats, to match where it always was.
+                if !galleryPhotos.isEmpty || isBuildingGallery {
+                    EventGalleryCard(photos: galleryPhotos, isBuilding: isBuildingGallery, buildTotal: galleryBuildTotal, knownJPGCount: deliveredPhotoCount, appState: appState)
+                }
             }
             .padding(.top, 48)
-            .padding(.horizontal, 20)
+            .padding(.horizontal, AuroraSpacing.mainPaddingH)
             .padding(.bottom, 20)
         }
         .onAppear {
+            currentEventPath = destinationPath
+            loadBannerDisplayMode()
+            loadBannerImageIfNeeded()
             if !hasLoaded { loadFromCache() }
+            loadJPGCountsByDay()
+            loadGalleryFromCache()
+        }
+        .task(id: destinationPath) {
+            // JPGs (e.g. edited exports dropped in after a shoot) are added
+            // independently of RAW imports, so the gallery — and the "Photos
+            // Delivered" / "Keep Rate" cards, which read the same JPG count — can't
+            // just piggyback on RAW rescans. Poll lightly while parked on this event
+            // to pick new JPGs up without the user having to hit Refresh. One combined
+            // full-tree walk per tick (see refreshJPGCountsAndGalleryPeriodically),
+            // not two, and a longer interval — this doesn't need sub-15s precision.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled else { break }
+                refreshJPGCountsAndGalleryPeriodically()
+            }
         }
         .onChange(of: isBackgroundScanning) { _, stillScanning in
-            if !stillScanning && report == nil {
+            if !stillScanning {
                 scanProgress = 1.0
+                loadFromCache()
+            }
+        }
+        .onChange(of: currentBackgroundScanQuality) { _, quality in
+            if quality == .full, report == nil {
                 loadFromCache()
             }
         }
@@ -97,26 +198,53 @@ struct EventStatsView: View {
             let fileCount = backgroundScanFileCount
             let estimatedSecs = fileCount > 0 ? max(3.0, Double(fileCount) * 0.030) : 30.0
             let startTime = (bookmarkIndex.flatMap { appState.backgroundScanStartTimes[$0] }) ?? Date()
+            var lastLoadedProcessedCount = -1
+            showSlowScanInfo = false
             while !Task.isCancelled {
-                let ratio = Date().timeIntervalSince(startTime) / estimatedSecs
-                scanProgress = 1.0 - 1.0 / (1.0 + ratio * 2.0)
+                let processed = backgroundScanProcessedFileCount
+                let total = backgroundScanFileCount
+                if processed > 0, total > 0 {
+                    scanProgress = min(1.0, Double(processed) / Double(total))
+                    if processed != lastLoadedProcessedCount {
+                        lastLoadedProcessedCount = processed
+                        loadFromCache()
+                    }
+                } else {
+                    let ratio = Date().timeIntervalSince(startTime) / estimatedSecs
+                    scanProgress = 1.0 - 1.0 / (1.0 + ratio * 2.0)
+                }
+                if !showSlowScanInfo, shouldShowSlowScanInfo(fileCount: total) {
+                    showSlowScanInfo = true
+                }
                 try? await Task.sleep(for: .milliseconds(400))
             }
         }
-        .onChange(of: destinationPath) { _, _ in
+        .onChange(of: destinationPath) { _, newPath in
+            currentEventPath = newPath
             hasLoaded = false
             report = nil
             errorMessage = nil
             shareErrorMessage = nil
             scanDate = nil
+            scanQuality = nil
             isCachedData = false
             isEditingEventName = false
             eventNameDraft = ""
             isRepositioningBanner = false
             bannerOffsetDraft = EventBannerOffset()
             bannerDragStartOffset = nil
+            bannerImage = nil
+            loadedBannerImagePath = nil
+            loadBannerDisplayMode()
+            jpgCountsByDay = [:]
             loadFromCache()
+            loadJPGCountsByDay()
+            loadBannerImageIfNeeded()
+            galleryPhotos = []
+            galleryBuildTotal = nil
+            loadGalleryFromCache()
         }
+        .onChange(of: eventBannerImagePath) { _, _ in loadBannerImageIfNeeded() }
         .alert("Could not export share image", isPresented: shareErrorBinding) {
             Button("OK", role: .cancel) { shareErrorMessage = nil }
         } message: {
@@ -124,11 +252,59 @@ struct EventStatsView: View {
         }
     }
 
+    // MARK: - Tags
+
+    private var eventTagsBinding: Binding<Set<EventTag>> {
+        Binding(
+            get: { bookmarkIndex.map(appState.tags(at:)) ?? [] },
+            set: { newValue in
+                guard let bookmarkIndex else { return }
+                appState.setTags(newValue, at: bookmarkIndex)
+            }
+        )
+    }
+
+    private var eventTagsRow: some View {
+        HStack(alignment: .top, spacing: 10) {
+            EventTagChipsRow(tags: eventTagsBinding.wrappedValue)
+            Spacer(minLength: 8)
+            Button {
+                isEditingTags = true
+            } label: {
+                Label("Edit tags", systemImage: "tag")
+                    .font(.manrope(11.5, weight: .bold))
+            }
+            .buttonStyle(AuroraGhostButtonStyle())
+            .popover(isPresented: $isEditingTags, arrowEdge: .bottom) {
+                EventTagPickerView(selectedTags: eventTagsBinding)
+            }
+        }
+    }
+
     // MARK: - Header
 
     private var isBackgroundScanning: Bool {
         guard let bookmarkIndex else { return false }
-        return appState.backgroundScanningBookmarkIndices.contains(bookmarkIndex)
+        if appState.backgroundScanningBookmarkIndices.contains(bookmarkIndex) { return true }
+        // Library folder scan via drainScanQueue
+        if appState.currentlyScanningIndex == bookmarkIndex { return true }
+        return false
+    }
+
+    private var currentBackgroundScanQuality: EventStatsScanQuality? {
+        guard let bookmarkIndex else { return nil }
+        return appState.backgroundScanQualities[bookmarkIndex]
+    }
+
+    private var isQueuedForBackgroundScan: Bool {
+        guard let bookmarkIndex else { return false }
+        return appState.scanQueue.contains(bookmarkIndex) && !isBackgroundScanning
+    }
+
+    private var queuedScanPosition: Int? {
+        guard let bookmarkIndex,
+              let index = appState.scanQueue.firstIndex(of: bookmarkIndex) else { return nil }
+        return index + 1
     }
 
     private var backgroundScanFileCount: Int {
@@ -136,9 +312,262 @@ struct EventStatsView: View {
         return appState.backgroundScanFileCount[bookmarkIndex] ?? 0
     }
 
+    private var backgroundScanProcessedFileCount: Int {
+        guard let bookmarkIndex else { return 0 }
+        return appState.backgroundScanProcessedFileCount[bookmarkIndex] ?? 0
+    }
+
     private var diskIsReachable: Bool {
         guard !destinationPath.isEmpty else { return false }
         return (try? URL(fileURLWithPath: destinationPath).checkResourceIsReachable()) == true
+    }
+
+    private func loadJPGCountsByDay() {
+        if let cachedCounts = cachedJPGCountsByDayForCurrentEvent(), !cachedCounts.isEmpty {
+            jpgCountsByDay = cachedCounts
+        }
+
+        guard diskIsReachable else {
+            isLoadingJPGCounts = false
+            return
+        }
+
+        // A locked event is a frozen snapshot — show whatever counts were cached
+        // before locking, but don't re-walk the folder to refresh them. Unlocking
+        // (reopenLockedEvent) explicitly kicks this off again.
+        guard !isEventLocked else {
+            isLoadingJPGCounts = false
+            return
+        }
+
+        let path = destinationPath
+        isLoadingJPGCounts = true
+        Task.detached(priority: .utility) {
+            let counts = Self.countJPGFilesByDay(at: path)
+            await MainActor.run {
+                guard currentEventPath == path else { return }
+                jpgCountsByDay = counts
+                if let bookmarkIndex, bookmarkIndex < appState.eventFolderCachedJPGCounts.count {
+                    let count = counts.reduce(0) { $0 + $1.value }
+                    if count > 0 { appState.eventFolderCachedJPGCounts[bookmarkIndex] = count }
+                    if !counts.isEmpty {
+                        appState.updateEventFolderJPGDayCache(at: bookmarkIndex, countsByDay: counts)
+                    }
+                }
+                if !counts.isEmpty {
+                    EventStatsCache.saveJPGCountsByDay(counts, forPath: path)
+                }
+                isLoadingJPGCounts = false
+            }
+        }
+    }
+
+    /// Periodic tick while parked on an event (see `.task(id: destinationPath)`
+    /// below): does **one** full folder walk that both refreshes the JPGs-per-day
+    /// chart and checks whether the gallery needs rebuilding, reusing the same
+    /// enumeration for both instead of `loadJPGCountsByDay()` and
+    /// `checkForNewJPGsAndRebuildIfNeeded()` each doing their own independent
+    /// recursive `FileManager` walk of the same tree every tick. On a large
+    /// "production" event folder — especially over a NAS, where each file's
+    /// resourceValues fetch has real per-file latency — running two full walks
+    /// every 12s was a continuous, self-inflicted I/O/CPU cost and the actual cause
+    /// of the reported sluggishness while inside an event.
+    private func refreshJPGCountsAndGalleryPeriodically() {
+        // Locked events are frozen — see checkForNewJPGsAndRebuildIfNeeded. This is
+        // also what stops the periodic tick below from doing any real work (and
+        // thus any real I/O) for the — typically large majority of — events that
+        // are locked/archived, which was the whole point of gating on lock state.
+        guard !isEventLocked else { return }
+        guard diskIsReachable, !isBuildingGallery else { return }
+        let path = destinationPath
+        Task.detached(priority: .utility) {
+            let counts = Self.countJPGFilesByDay(at: path)
+            let total = counts.reduce(0) { $0 + $1.value }
+            await MainActor.run {
+                guard currentEventPath == path else { return }
+                jpgCountsByDay = counts
+                if let bookmarkIndex, bookmarkIndex < appState.eventFolderCachedJPGCounts.count {
+                    if total > 0 { appState.eventFolderCachedJPGCounts[bookmarkIndex] = total }
+                    if !counts.isEmpty {
+                        appState.updateEventFolderJPGDayCache(at: bookmarkIndex, countsByDay: counts)
+                    }
+                }
+                if !counts.isEmpty {
+                    EventStatsCache.saveJPGCountsByDay(counts, forPath: path)
+                }
+                if total != galleryPhotos.count, !isBuildingGallery {
+                    rebuildGalleryInBackground()
+                }
+            }
+        }
+    }
+
+    // MARK: - Gallery
+
+    /// Loads whatever was already built (survives even if the source folder later
+    /// moves — thumbnails/metadata live in Application Support, not the event folder).
+    /// Reads + JSON-decodes the manifest off the main thread — for a large gallery
+    /// (hundreds+ photos) doing that synchronously on `.onAppear`/`.onChange` was
+    /// blocking the UI for a noticeable moment every time this event was opened.
+    private func loadGalleryFromCache() {
+        let path = destinationPath
+        Task.detached(priority: .userInitiated) {
+            let cached = EventGalleryStore.load(forPath: path)
+            await MainActor.run {
+                guard currentEventPath == path else { return }
+                if let cached { galleryPhotos = cached }
+                // Chained here (instead of called separately right after
+                // loadGalleryFromCache(), like before this became async) and passed
+                // the just-loaded count directly — otherwise this would race the
+                // cache load and almost always see a stale/empty `galleryPhotos`,
+                // triggering a spurious full rebuild on every single event open.
+                checkForNewJPGsAndRebuildIfNeeded(knownCount: cached?.count ?? 0)
+            }
+        }
+    }
+
+    /// Rebuilds the gallery for the current event. Called after a RAW scan finishes
+    /// successfully — JPGs are far cheaper for exiftool to read than RAWs, so this
+    /// piggybacks on the scan the user already triggered instead of running on its own.
+    /// Also called directly by `checkForNewJPGsAndRebuildIfNeeded()` when the JPG
+    /// count itself changes, independent of any RAW scan.
+    private func rebuildGalleryInBackground() {
+        guard diskIsReachable else { return }
+        let path = destinationPath
+        isBuildingGallery = true
+        galleryBuildTotal = nil
+        Task.detached(priority: .utility) {
+            let built = EventGalleryStore.buildGallery(forEventPath: path) { partial, total in
+                Task { @MainActor in
+                    guard currentEventPath == path else { return }
+                    galleryPhotos = partial
+                    galleryBuildTotal = total
+                }
+            }
+            await MainActor.run {
+                // Always clear the "building" flag regardless of whether the user
+                // has since navigated away — it's a single shared flag, not one kept
+                // per event, so leaving it stuck at `true` for an abandoned build
+                // would block the *new* current event's own gallery check from ever
+                // running (see the guard in checkForNewJPGsAndRebuildIfNeeded).
+                isBuildingGallery = false
+                guard currentEventPath == path, let built else { return }
+                galleryPhotos = built
+                galleryBuildTotal = nil
+            }
+        }
+    }
+
+    /// Cheap (count-only, no exiftool/thumbnails) check for whether JPGs were added
+    /// or removed in the event folder since the gallery was last built. JPGs get
+    /// dropped in on their own — e.g. exports from an editor, after the RAW import is
+    /// long done — so this is the only thing that notices without a manual Refresh.
+    private func checkForNewJPGsAndRebuildIfNeeded(knownCount: Int? = nil) {
+        // A locked event is a frozen snapshot — the gallery it had at lock time
+        // stands until the user explicitly unlocks (reopenLockedEvent), which
+        // re-triggers this. No point walking the folder to notice changes we're
+        // going to ignore anyway.
+        guard !isEventLocked else { return }
+        guard diskIsReachable, !isBuildingGallery else { return }
+        let path = destinationPath
+        let knownCount = knownCount ?? galleryPhotos.count
+        Task.detached(priority: .utility) {
+            let currentCount = EventGalleryStore.countJPGs(atPath: path)
+            guard currentCount != knownCount else { return }
+            await MainActor.run {
+                guard currentEventPath == path, !isBuildingGallery else { return }
+                rebuildGalleryInBackground()
+            }
+        }
+    }
+
+    private func cachedJPGCountsByDayForCurrentEvent() -> [String: Int]? {
+        if let bookmarkIndex,
+           bookmarkIndex < appState.eventFolderCachedJPGCountsByDay.count {
+            let cached = appState.eventFolderCachedJPGCountsByDay[bookmarkIndex]
+            if !cached.isEmpty { return cached }
+        }
+        if let counts = EventStatsCache.loadJPGCountsByDay(forPath: destinationPath) {
+            return counts
+        }
+        guard let bookmarkIndex,
+              bookmarkIndex < appState.eventFolderPreviousCachedPaths.count else { return nil }
+        let previousPath = appState.eventFolderPreviousCachedPaths[bookmarkIndex]
+        guard !previousPath.isEmpty else { return nil }
+        return EventStatsCache.loadJPGCountsByDay(forPath: previousPath)
+    }
+
+    nonisolated private static func countJPGFilesByDay(at path: String) -> [String: Int] {
+        let root = URL(fileURLWithPath: path)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [:] }
+
+        var counts: [String: Int] = [:]
+        for case let file as URL in enumerator {
+            let ext = file.pathExtension.lowercased()
+            guard ext == "jpg" || ext == "jpeg" else { continue }
+            if let values = try? file.resourceValues(forKeys: [.isRegularFileKey]), values.isRegularFile == false {
+                continue
+            }
+            guard let day = dayKeyForJPGFile(file) else { continue }
+            counts[day, default: 0] += 1
+        }
+        return counts
+    }
+
+    nonisolated private static func dayKeyForJPGFile(_ url: URL) -> String? {
+        // Avoid opening every JPG with ImageIO during normal chart loading. On
+        // NAS/external disks hundreds of tiny image opens are slower than a plain
+        // directory walk, and delivered JPGs are usually already grouped by day.
+        if let pathDay = dayKeyFromPath(url.path) { return pathDay }
+
+        let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        guard let date = values?.creationDate ?? values?.contentModificationDate else { return nil }
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    nonisolated private static func dayKeyFromPath(_ path: String) -> String? {
+        let tokens = path
+            .split { char in
+                char == "/" || char == "_" || char == " "
+            }
+            .map(String.init)
+
+        for token in tokens.reversed() {
+            let normalized = token.replacingOccurrences(of: ".", with: "-")
+            let parts = normalized.split(separator: "-").map(String.init)
+            guard parts.count == 3 else { continue }
+
+            if parts[0].count == 4,
+               let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]),
+               isValidDay(year: year, month: month, day: day) {
+                return String(format: "%04d-%02d-%02d", year, month, day)
+            }
+
+            if parts[2].count == 4,
+               let day = Int(parts[0]), let month = Int(parts[1]), let year = Int(parts[2]),
+               isValidDay(year: year, month: month, day: day) {
+                return String(format: "%04d-%02d-%02d", year, month, day)
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func isValidDay(year: Int, month: Int, day: Int) -> Bool {
+        guard (1900...2200).contains(year), (1...12).contains(month), (1...31).contains(day) else { return false }
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.year = year
+        components.month = month
+        components.day = day
+        return components.date != nil
     }
 
     private var eventBannerCard: some View {
@@ -164,7 +593,7 @@ struct EventStatsView: View {
                 Spacer()
             }
 
-            if importSummary != nil || bookmarkIndex != nil {
+            if !effectiveBannerIsCompact && (importSummary != nil || bookmarkIndex != nil) {
                 VStack(spacing: 0) {
                     Spacer()
                     HStack(alignment: .center, spacing: 0) {
@@ -194,7 +623,8 @@ struct EventStatsView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 400)
+        .frame(height: effectiveBannerIsCompact ? 86 : 400)
+        .animation(.spring(response: 0.34, dampingFraction: 0.88), value: effectiveBannerIsCompact)
         .clipShape(RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
@@ -205,11 +635,37 @@ struct EventStatsView: View {
                 bannerRepositionOverlay
             }
         }
+        .overlay(alignment: .topLeading) {
+            if bookmarkIndex != nil && isHoveringBanner && !isRepositioningBanner {
+                Button {
+                    setBannerCompact(!effectiveBannerIsCompact)
+                } label: {
+                    Image(systemName: effectiveBannerIsCompact ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundStyle(Color.auroraCyan)
+                        .frame(width: 22, height: 22)
+                        .background(
+                            Circle()
+                                .fill(Color.auroraPanel2.opacity(0.94))
+                        )
+                        .overlay(
+                            Circle()
+                                .strokeBorder(Color.auroraStroke2, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .padding(6)
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                .help(effectiveBannerIsCompact ? "Expand banner" : "Collapse banner")
+            }
+        }
+        .animation(.easeOut(duration: 0.14), value: isHoveringBanner)
+        .onHover { isHoveringBanner = $0 }
     }
 
     @ViewBuilder
     private var bannerCardBackground: some View {
-        if let path = eventBannerImagePath, let img = NSImage(contentsOfFile: path) {
+        if let img = bannerImage {
             GeometryReader { geo in
                 let imageSize = scaledBannerImageSize(imageSize: img.size, containerSize: geo.size)
                 let offset = clampedBannerOffset(activeBannerOffset, imageSize: img.size, containerSize: geo.size)
@@ -233,6 +689,27 @@ struct EventStatsView: View {
         }
     }
 
+    private func loadBannerImageIfNeeded() {
+        guard let path = eventBannerImagePath else {
+            bannerImage = nil
+            loadedBannerImagePath = nil
+            return
+        }
+        guard loadedBannerImagePath != path else { return }
+        loadedBannerImagePath = path
+        if let cached = BannerImageCache.image(forPath: path) {
+            bannerImage = cached
+            return
+        }
+        Task.detached(priority: .utility) {
+            let image = BannerImageCache.load(path: path)
+            await MainActor.run {
+                guard loadedBannerImagePath == path else { return }
+                bannerImage = image
+            }
+        }
+    }
+
     private var bannerHeader: some View {
         HStack(alignment: .center, spacing: 12) {
             Image(systemName: "folder.fill")
@@ -243,7 +720,7 @@ struct EventStatsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 editableEventTitle
                 if let date = scanDate {
-                    Text("Last scan: \(date.formatted(date: .abbreviated, time: .omitted))")
+                    Text("\(scanQuality?.label ?? "Last") scan: \(date.formatted(date: .abbreviated, time: .omitted))")
                         .font(.manrope(11, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.78))
                         .shadow(color: Color.black.opacity(0.6), radius: 6, x: 0, y: 1)
@@ -264,6 +741,12 @@ struct EventStatsView: View {
                         .font(.manrope(12, weight: .bold))
                 }
                 .buttonStyle(AuroraGhostButtonStyle())
+            }
+
+            if effectiveBannerIsCompact,
+               let bookmarkIndex,
+               !appState.isLibraryFolder(at: bookmarkIndex) {
+                lockEventButton
             }
 
             shareMenu
@@ -310,6 +793,7 @@ struct EventStatsView: View {
         let totalBytes = summary?.totalBytes ?? activeReport?.totalBytes ?? 0
         let bytes = AuroraFormat.bytesParts(totalBytes)
         let rawCount = knownRawFileCount ?? activeReport?.totalFilesAnalyzed ?? summary?.photoCount ?? 0
+        let shootingMetrics = activeReport?.shootingTimeMetrics
         let topLenses = activeReport?.allLenses.prefix(3).map { lens in
             EventSocialRankItem(
                 name: LensDisplayFormatter.displayName(make: lens.make, model: lens.model),
@@ -319,7 +803,7 @@ struct EventStatsView: View {
         } ?? []
         let topCameras = activeReport?.allCameras.prefix(3).map { camera in
             EventSocialRankItem(
-                name: friendlyCameraName(for: camera.model),
+                name: camera.fullName,
                 subtitle: nil,
                 count: AuroraFormat.count(camera.count)
             )
@@ -347,6 +831,9 @@ struct EventStatsView: View {
             avgShutter: activeReport?.avgShutterSpeed.map(AuroraFormat.shutter) ?? "—",
             avgAperture: activeReport?.avgAperture.map(AuroraFormat.aperture) ?? "—",
             avgFocal: activeReport?.avgFocalLength.map(AuroraFormat.focal) ?? "—",
+            mostRawPhotosInDay: shootingMetrics?.busiestPhotoDay.map { AuroraFormat.count($0.photoCount) } ?? "—",
+            totalWorkingHours: shootingMetrics.map { formatSocialDuration($0.totalCoverageSeconds) } ?? "—",
+            longestActiveDay: shootingMetrics?.longestCoverageDay.map { formatSocialDuration($0.coverageSeconds) } ?? "—",
             topLenses: topLenses,
             topCameras: topCameras
         )
@@ -355,35 +842,61 @@ struct EventStatsView: View {
     @ViewBuilder
     private var editableEventTitle: some View {
         if isEditingEventName, bookmarkIndex != nil {
-            TextField("Event name", text: $eventNameDraft)
-                .font(.sora(21, weight: .bold))
-                .tracking(-0.3)
-                .foregroundStyle(.white)
-                .textFieldStyle(.plain)
-                .focused($eventNameFieldFocused)
-                .onSubmit(commitEventNameEdit)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.black.opacity(0.45))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
-                )
-                .frame(maxWidth: 420, alignment: .leading)
+            HStack(spacing: 8) {
+                TextField("Event name", text: $eventNameDraft)
+                    .font(.sora(21, weight: .bold))
+                    .tracking(-0.3)
+                    .foregroundStyle(.white)
+                    .textFieldStyle(.plain)
+                    .focused($eventNameFieldFocused)
+                    .onSubmit(commitEventNameEdit)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black.opacity(0.45))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                    )
+                    .frame(maxWidth: 420, alignment: .leading)
+
+                Button(action: commitEventNameEdit) {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 26, height: 26)
+                        .background(Color.black.opacity(0.32), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .auroraTooltip("Save name")
+            }
         } else {
-            Text(currentEventName)
-                .font(.sora(21, weight: .bold))
-                .tracking(-0.3)
-                .foregroundStyle(.white)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
-                .contentShape(Rectangle())
-                .onTapGesture(perform: beginEventNameEdit)
-                .auroraTooltip(bookmarkIndex == nil ? "" : "Click to rename event")
+            HStack(spacing: 8) {
+                Text(currentEventName)
+                    .font(.sora(21, weight: .bold))
+                    .tracking(-0.3)
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .shadow(color: Color.black.opacity(0.6), radius: 8, x: 0, y: 2)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: beginEventNameEdit)
+
+                if bookmarkIndex != nil {
+                    Button(action: beginEventNameEdit) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .frame(width: 26, height: 26)
+                            .background(Color.black.opacity(0.22), in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .auroraTooltip("Rename event")
+                }
+            }
         }
     }
 
@@ -424,6 +937,9 @@ struct EventStatsView: View {
                 Button("Choose Banner Photo…") {
                     chooseBannerPhoto(for: bookmarkIndex)
                 }
+                Button(effectiveBannerIsCompact ? "Expand Banner" : "Collapse Banner") {
+                    setBannerCompact(!effectiveBannerIsCompact)
+                }
                 if eventBannerImagePath != nil {
                     Button("Reposition Banner") {
                         beginBannerReposition()
@@ -449,6 +965,34 @@ struct EventStatsView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+        }
+    }
+
+    private var effectiveBannerIsCompact: Bool {
+        bookmarkIndex != nil && isBannerCompact
+    }
+
+    private var bannerDisplayModeKey: String? {
+        guard let bookmarkIndex else { return nil }
+        return "eventBannerCompact-\(bookmarkIndex)"
+    }
+
+    private func loadBannerDisplayMode() {
+        guard let key = bannerDisplayModeKey else {
+            isBannerCompact = false
+            return
+        }
+        isBannerCompact = UserDefaults.standard.bool(forKey: key)
+    }
+
+    private func setBannerCompact(_ compact: Bool) {
+        guard let key = bannerDisplayModeKey else { return }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+            isBannerCompact = compact
+        }
+        UserDefaults.standard.set(compact, forKey: key)
+        if compact {
+            isRepositioningBanner = false
         }
     }
 
@@ -521,6 +1065,9 @@ struct EventStatsView: View {
 
     private func beginBannerReposition() {
         guard eventBannerImagePath != nil else { return }
+        if effectiveBannerIsCompact {
+            setBannerCompact(false)
+        }
         bannerOffsetDraft = eventBannerOffset
         bannerDragStartOffset = nil
         isRepositioningBanner = true
@@ -581,25 +1128,48 @@ struct EventStatsView: View {
         if isEventLocked {
             // Locked state — amber pill communicating stats are preserved
             HStack(spacing: 6) {
-                Image(systemName: "lock.fill")
-                    .font(.system(size: 10, weight: .bold))
-                Text("Stats Locked")
-                    .font(.manrope(11, weight: .bold))
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10, weight: .bold))
+                    Text("Stats Locked")
+                        .font(.manrope(11, weight: .bold))
+                }
+                .foregroundStyle(Color.auroraGold)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(Color.auroraGold.opacity(0.18))
+                        .overlay(Capsule().strokeBorder(Color.auroraGold.opacity(0.45), lineWidth: 1))
+                )
+                .onTapGesture { showUnlockConfirmPrompt = true }
+                .popover(isPresented: $showUnlockConfirmPrompt, arrowEdge: .bottom) {
+                    lockActionPopover(
+                        icon: "lock.open.fill",
+                        title: "Reopen \(currentEventName)?",
+                        message: "The saved snapshot will be removed and the event will return to live counts.",
+                        primaryTitle: "Reopen Event",
+                        primaryColor: .auroraGold,
+                        primaryAction: reopenLockedEvent,
+                        cancelAction: { showUnlockConfirmPrompt = false }
+                    )
+                }
+                .popover(isPresented: $showPostLockSharePrompt, arrowEdge: .bottom) {
+                    postLockSharePopover
+                }
+
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.auroraGold.opacity(0.72))
+                    .onHover { showLockedInfo = $0 }
+                    .popover(isPresented: $showLockedInfo, arrowEdge: .bottom) {
+                        lockedInfoPopover
+                    }
             }
-            .foregroundStyle(Color.auroraGold)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                Capsule()
-                    .fill(Color.auroraGold.opacity(0.18))
-                    .overlay(Capsule().strokeBorder(Color.auroraGold.opacity(0.45), lineWidth: 1))
-            )
-            .onTapGesture { confirmUnlock() }
-            .auroraTooltip("Stats are locked. Tap to reopen this event.")
         } else {
             // Unlocked state — CTA + info icon
             HStack(spacing: 6) {
-                Button(action: confirmLock) {
+                Button(action: { showLockConfirmPrompt = true }) {
                     HStack(spacing: 6) {
                         Image(systemName: "lock")
                             .font(.system(size: 10, weight: .bold))
@@ -616,6 +1186,17 @@ struct EventStatsView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .popover(isPresented: $showLockConfirmPrompt, arrowEdge: .bottom) {
+                    lockActionPopover(
+                        icon: "lock.fill",
+                        title: "Lock \(currentEventName)?",
+                        message: "All current stats will be saved permanently. You can reopen this event later if needed.",
+                        primaryTitle: "Lock Event",
+                        primaryColor: .auroraBlue,
+                        primaryAction: lockCurrentEvent,
+                        cancelAction: { showLockConfirmPrompt = false }
+                    )
+                }
 
                 Image(systemName: "info.circle.fill")
                     .font(.system(size: 13, weight: .medium))
@@ -661,6 +1242,136 @@ struct EventStatsView: View {
         .environment(\.colorScheme, .dark)
     }
 
+    private var lockedInfoPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.auroraGold)
+                Text("Stats Locked")
+                    .font(.sora(14, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+            }
+
+            Text("Stats, and the gallery's JPG detection, are locked and won't update automatically. Tap the badge to reopen this event and pick up any changes.")
+                .font(.manrope(12, weight: .medium))
+                .foregroundStyle(Color.auroraMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 250, alignment: .leading)
+        .background(Color.auroraPanel)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func lockActionPopover(
+        icon: String,
+        title: String,
+        message: String,
+        primaryTitle: String,
+        primaryColor: Color,
+        primaryAction: @escaping () -> Void,
+        cancelAction: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.auroraPanel2)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                Image(systemName: icon)
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(primaryColor)
+            }
+            .frame(width: 52, height: 52)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.manrope(13, weight: .heavy))
+                    .foregroundStyle(Color.auroraTxt)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(message)
+                    .font(.manrope(13, weight: .medium))
+                    .foregroundStyle(Color.auroraMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(spacing: 8) {
+                subtlePopoverButton(title: primaryTitle, primary: true, fill: primaryColor, action: primaryAction)
+                subtlePopoverButton(title: "Cancel", action: cancelAction)
+            }
+            .padding(.top, 2)
+        }
+        .padding(20)
+        .frame(width: 260)
+        .background(Color.auroraPanel)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var postLockSharePopover: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.auroraPanel2)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(LinearGradient.auroraGrad)
+            }
+            .frame(width: 52, height: 52)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Share event stats?")
+                    .font(.manrope(13, weight: .heavy))
+                    .foregroundStyle(Color.auroraTxt)
+                Text("Export a social-ready image for Instagram now that this event is locked.")
+                    .font(.manrope(13, weight: .medium))
+                    .foregroundStyle(Color.auroraMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(spacing: 8) {
+                subtlePopoverButton(title: "Instagram Story", primary: true, fill: .blue) {
+                    showPostLockSharePrompt = false
+                    exportSocialShare(format: .story)
+                }
+                subtlePopoverButton(title: "Instagram Post") {
+                    showPostLockSharePrompt = false
+                    exportSocialShare(format: .post)
+                }
+                subtlePopoverButton(title: "Not Now") {
+                    showPostLockSharePrompt = false
+                }
+            }
+            .padding(.top, 2)
+        }
+        .padding(20)
+        .frame(width: 260)
+        .background(Color.auroraPanel)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func subtlePopoverButton(title: String, primary: Bool = false, fill: Color = .blue, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.manrope(13, weight: .bold))
+                .foregroundStyle(.white.opacity(primary ? 1.0 : 0.86))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(primary ? AnyShapeStyle(fill) : AnyShapeStyle(Color.white.opacity(0.10)))
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
     private func lockInfoRow(icon: String, color: Color, text: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: icon)
@@ -674,14 +1385,9 @@ struct EventStatsView: View {
         }
     }
 
-    private func confirmLock() {
+    private func lockCurrentEvent() {
         guard let bookmarkIndex else { return }
-        let alert = NSAlert()
-        alert.messageText = "Lock \(currentEventName)?"
-        alert.informativeText = "All current stats will be saved permanently. You can reopen this event later if needed."
-        alert.addButton(withTitle: "Lock Event")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        showLockConfirmPrompt = false
 
         if appState.finalizeEvent(at: bookmarkIndex) == nil {
             let warn = NSAlert()
@@ -689,18 +1395,20 @@ struct EventStatsView: View {
             warn.informativeText = "Run a scan first using the Refresh button, then lock the event."
             warn.addButton(withTitle: "OK")
             warn.runModal()
+        } else {
+            showPostLockSharePrompt = true
         }
     }
 
-    private func confirmUnlock() {
+    private func reopenLockedEvent() {
         guard let bookmarkIndex else { return }
-        let alert = NSAlert()
-        alert.messageText = "Reopen \(currentEventName)?"
-        alert.informativeText = "The saved snapshot will be removed and the event will return to live counts."
-        alert.addButton(withTitle: "Reopen Event")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        showUnlockConfirmPrompt = false
         appState.reopenEvent(at: bookmarkIndex)
+        // Unlocking is exactly the signal that should resume the auto-refresh these
+        // gate on `!isEventLocked` — kick it off immediately rather than leaving the
+        // user waiting for the next periodic tick (up to 20s away).
+        loadJPGCountsByDay()
+        checkForNewJPGsAndRebuildIfNeeded()
     }
 
     private var eventBannerImagePath: String? {
@@ -728,7 +1436,7 @@ struct EventStatsView: View {
             AuroraPanelHeader(title: "Import History")
 
             LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: summary.firstDate == nil ? 2 : 3),
+                columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 5),
                 spacing: AuroraSpacing.gridGap
             ) {
                 PhotoStatCard(
@@ -737,11 +1445,22 @@ struct EventStatsView: View {
                     pages: [(label: "Photos Imported", value: AuroraFormat.count(summary.photoCount))]
                 )
 
-                let parts = AuroraFormat.bytesParts(summary.totalBytes)
                 PhotoStatCard(
                     icon: "externaldrive.fill",
                     accent: .auroraBlue,
-                    pages: [(label: "Data Transferred", value: "\(parts.value) \(parts.unit)")]
+                    pages: dataTransferredPages(summary: summary)
+                )
+
+                PhotoStatCard(
+                    icon: "arrow.up.circle.fill",
+                    accent: .auroraViolet,
+                    pages: importCountPages(summary: summary)
+                )
+
+                PhotoStatCard(
+                    icon: "clock",
+                    accent: .auroraPurple,
+                    pages: importingTimePages(dayCount: importDayCount(summary: summary))
                 )
 
                 if let first = summary.firstDate {
@@ -754,7 +1473,50 @@ struct EventStatsView: View {
                 }
             }
         }
-        .auroraStaticCard()
+        .auroraCollapsibleStaticCard(storageKey: "event.importHistory")
+    }
+
+    private func dataTransferredPages(summary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)) -> [(label: String, value: String)] {
+        let total = AuroraFormat.bytesParts(summary.totalBytes)
+        let imports = max(summary.sessionCount, 1)
+        let avgImport = AuroraFormat.bytesParts(summary.totalBytes / Int64(imports))
+        let days = max(importDayCount(summary: summary), 1)
+        let avgDay = AuroraFormat.bytesParts(summary.totalBytes / Int64(days))
+        return [
+            (label: "Data Transferred", value: "\(total.value) \(total.unit)"),
+            (label: "Avg / Import", value: "\(avgImport.value) \(avgImport.unit)"),
+            (label: "Avg / Day", value: "\(avgDay.value) \(avgDay.unit)")
+        ]
+    }
+
+    private func importCountPages(summary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)) -> [(label: String, value: String)] {
+        let days = max(importDayCount(summary: summary), 1)
+        return [
+            (label: "Total Imports", value: AuroraFormat.count(summary.sessionCount)),
+            (label: "Avg / Day", value: String(format: "%.1f", Double(summary.sessionCount) / Double(days)))
+        ]
+    }
+
+    private func importingTimePages(dayCount: Int) -> [(label: String, value: String)] {
+        guard let report, report.totalDuration > 0 else {
+            return [(label: "Time Wasted Importing", value: "—")]
+        }
+        let total = AuroraFormat.durationParts(report.totalDuration)
+        let avgDay = AuroraFormat.durationParts(report.totalDuration / max(dayCount, 1))
+        return [
+            (label: "Time Wasted Importing", value: "\(total.value) \(total.unit)"),
+            (label: "Avg / Day", value: "\(avgDay.value) \(avgDay.unit)")
+        ]
+    }
+
+    private func importDayCount(summary: (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)) -> Int {
+        let days = Set(eventImportHistoryEntries.map { Calendar.current.startOfDay(for: $0.date) })
+        if !days.isEmpty { return days.count }
+        return 1
+    }
+
+    private func normalizeEventPath(_ path: String) -> String {
+        path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     // MARK: - States
@@ -797,14 +1559,19 @@ struct EventStatsView: View {
 
     private var backgroundScanningState: some View {
         let fileCount = backgroundScanFileCount
+        let processedCount = backgroundScanProcessedFileCount
         let pct = Int((scanProgress * 100).rounded())
+        let quality = currentBackgroundScanQuality ?? .full
+        let title = quality == .quick ? "Quick scanning photos…" : "Deep scan running…"
+        let timingText = scanTimingText(fileCount: fileCount)
+        let showSlowInfo = showSlowScanInfo
         let subtitle = fileCount > 0
-            ? "Scanning \(fileCount) RAW files…"
-            : "Scanning photos…"
+            ? (processedCount > 0 ? "Scanned \(processedCount) of \(fileCount) RAW files…" : "Scanning \(fileCount) RAW files…")
+            : (quality == .quick ? "Building quick stats first…" : "Refining full EXIF stats in background…")
 
         return VStack(spacing: 14) {
             HStack {
-                Text(subtitle)
+                Text(title)
                     .font(.manrope(15, weight: .bold))
                     .foregroundStyle(Color.auroraTxt)
                 Spacer()
@@ -819,10 +1586,46 @@ struct EventStatsView: View {
                 .tint(Color.auroraViolet)
                 .animation(.linear(duration: 0.4), value: scanProgress)
 
-            Text("Scan time may vary depending on the number of RAW files in this folder.")
+            Text(subtitle)
                 .font(.manrope(11, weight: .medium))
                 .foregroundStyle(Color.auroraFaint)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let timingText {
+                slowScanTimingRow(timingText: timingText, showInfo: showSlowInfo)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, minHeight: 120)
+        .auroraStaticCard()
+    }
+
+    private var queuedScanState: some View {
+        let status = queuedScanPosition.map { "Queued #\($0)" } ?? "Queued"
+
+        return HStack(spacing: 14) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(Color.auroraViolet)
+                .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Waiting for other folders to get scanned")
+                    .font(.manrope(15, weight: .bold))
+                    .foregroundStyle(Color.auroraTxt)
+                Text("Aurora scans added folders one at a time to keep the app responsive.")
+                    .font(.manrope(11, weight: .medium))
+                    .foregroundStyle(Color.auroraFaint)
+            }
+
+            Spacer()
+
+            Text(status)
+                .font(.manrope(12, weight: .bold))
+                .foregroundStyle(Color.auroraViolet)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.auroraViolet.opacity(0.14), in: Capsule())
         }
         .padding(20)
         .frame(maxWidth: .infinity, minHeight: 120)
@@ -853,6 +1656,10 @@ struct EventStatsView: View {
     @ViewBuilder
     private func statsContent(for report: StatsReport) -> some View {
         VStack(spacing: 16) {
+            if isBackgroundScanning, currentBackgroundScanQuality == .full {
+                quickStatsBanner
+            }
+
             photoStatsCard(for: report)
 
             HStack(alignment: .top, spacing: 16) {
@@ -865,7 +1672,229 @@ struct EventStatsView: View {
                         .frame(maxWidth: .infinity)
                 }
             }
+
+            ShootingTimePanel(
+                report: report,
+                title: "Event Shooting Time",
+                subtitle: "Working hours and active shooting time for this event",
+                sourceNamesByDay: shootingTimeSourceNames(for: report)
+            )
+
+            HStack(alignment: .top, spacing: 16) {
+                EventDailyMediaChart(
+                    title: "RAWs per Day",
+                    subtitle: "RAW files captured each event day",
+                    entries: rawCountsByDay(for: report),
+                    tint: .auroraViolet,
+                    emptyMessage: "No RAW day data yet"
+                )
+                    .frame(maxWidth: .infinity)
+
+                EventDailyMediaChart(
+                    title: "JPGs per Day",
+                    subtitle: jpgChartSubtitle,
+                    entries: jpgCountsByDayEntries,
+                    tint: .auroraMagenta,
+                    emptyMessage: jpgChartEmptyMessage,
+                    isLoading: isLoadingJPGCounts
+                )
+                    .frame(maxWidth: .infinity)
+            }
         }
+    }
+
+    private func rawCountsByDay(for report: StatsReport) -> [EventDailyMediaChart.Entry] {
+        report.captureTimestampsByDay
+            .map { day, timestamps in
+                EventDailyMediaChart.Entry(dayKey: day, count: timestamps.count)
+            }
+            .filter { $0.count > 0 }
+            .sorted { $0.dayKey < $1.dayKey }
+    }
+
+    private var jpgCountsByDayEntries: [EventDailyMediaChart.Entry] {
+        let entries = jpgCountsByDay
+            .map { day, count in EventDailyMediaChart.Entry(dayKey: day, count: count) }
+            .filter { $0.count > 0 }
+            .sorted { $0.dayKey < $1.dayKey }
+        if !entries.isEmpty { return entries }
+
+        guard deliveredPhotoCount > 0,
+              let dayKey = jpgFallbackDayKey else { return [] }
+        return [EventDailyMediaChart.Entry(dayKey: dayKey, count: deliveredPhotoCount)]
+    }
+
+    private var isShowingJPGTotalFallback: Bool {
+        jpgCountsByDay.isEmpty && deliveredPhotoCount > 0 && jpgFallbackDayKey != nil
+    }
+
+    private var jpgChartSubtitle: String {
+        if isLoadingJPGCounts { return "Counting JPG files…" }
+        if isShowingJPGTotalFallback { return "Cached JPG total shown offline" }
+        return "JPG deliverables found each day"
+    }
+
+    private var jpgFallbackDayKey: String? {
+        if let latestRawDay = report?.captureTimestampsByDay.keys.max() {
+            return latestRawDay
+        }
+        if let scanDate {
+            return Self.dayKey(from: scanDate)
+        }
+        return nil
+    }
+
+    private var jpgChartEmptyMessage: String {
+        if isLoadingJPGCounts { return "Counting JPG files…" }
+        if !diskIsReachable, deliveredPhotoCount > 0 { return "Cached JPG total available, day breakdown pending" }
+        if !diskIsReachable { return "JPG counts unavailable offline" }
+        if deliveredPhotoCount > 0 { return "JPG day breakdown unavailable" }
+        return "No JPG files found"
+    }
+
+    private static func dayKey(from date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    private func shootingTimeSourceNames(for report: StatsReport) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: report.captureTimestampsByDay.keys.map { ($0, eventName) })
+    }
+
+    private var quickStatsBanner: some View {
+        let pct = Int((scanProgress * 100).rounded())
+        let fileCount = backgroundScanFileCount
+        let processedCount = backgroundScanProcessedFileCount
+        let timingText = scanTimingText(fileCount: fileCount)
+        let showSlowInfo = showSlowScanInfo
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                ProgressView()
+                    .scaleEffect(0.75)
+                    .tint(Color.auroraCyan)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(refreshBannerTitle)
+                        .font(.manrope(13, weight: .bold))
+                        .foregroundStyle(Color.auroraTxt)
+                    Text(fileCount > 0
+                         ? (processedCount > 0 ? "Deep EXIF scan has analyzed \(processedCount) of \(fileCount) RAWs." : "Deep EXIF scan is analyzing \(fileCount) RAWs in the background.")
+                         : "Deep EXIF scan is running in the background and will replace these stats automatically.")
+                        .font(.manrope(11, weight: .medium))
+                        .foregroundStyle(Color.auroraFaint)
+                    if let timingText {
+                        slowScanTimingRow(timingText: timingText, showInfo: showSlowInfo)
+                    }
+                }
+                Spacer()
+                Text("\(pct)%")
+                    .font(.manrope(13, weight: .bold))
+                    .foregroundStyle(Color.auroraCyan)
+                    .monospacedDigit()
+                    .animation(.none, value: pct)
+                Text("Preliminary")
+                    .font(.manrope(11, weight: .bold))
+                    .foregroundStyle(Color.auroraCyan)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(Color.auroraCyan.opacity(0.13), in: Capsule())
+            }
+
+            ProgressView(value: scanProgress)
+                .tint(Color.auroraCyan)
+                .animation(.linear(duration: 0.4), value: scanProgress)
+        }
+        .padding(14)
+        .auroraStaticCard()
+    }
+
+    private var refreshBannerTitle: String {
+        if scanQuality == .partial { return "Stats updating" }
+        if scanQuality == .quick { return "Quick stats ready" }
+        return "Refreshing stats"
+    }
+
+    private func slowScanTimingRow(timingText: String, showInfo: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(timingText)
+                .font(.manrope(10.5, weight: .semibold))
+                .foregroundStyle(Color.auroraFaint.opacity(0.92))
+                .monospacedDigit()
+            if showInfo {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.auroraCyan.opacity(0.9))
+                    .auroraTooltip("Why is this a bit slow?\n\nThis can happen with a considerable number of RAWs, photos stored on a NAS or slower external disk, network latency, large RAW files, or batches that need deeper EXIF metadata.", edge: .top)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func scanTimingText(fileCount: Int) -> String? {
+        guard let bookmarkIndex,
+              let startTime = appState.backgroundScanStartTimes[bookmarkIndex] else { return nil }
+        let elapsed = Date().timeIntervalSince(startTime)
+        let elapsedText = formatDuration(elapsed)
+        guard fileCount > 0 else { return "Elapsed: \(elapsedText)" }
+
+        let processed = appState.backgroundScanProcessedFileCount[bookmarkIndex] ?? 0
+        if processed > 0 {
+            let filesPerSecond = Double(processed) / max(1, elapsed)
+            let remainingFiles = max(0, fileCount - processed)
+            let remaining = filesPerSecond > 0 ? Double(remainingFiles) / filesPerSecond : 0
+            return "Elapsed: \(elapsedText) · ETA: \(formatDuration(remaining))"
+        }
+
+        let estimatedTotal = max(30.0, Double(fileCount) * 0.30)
+        let remaining = max(0, estimatedTotal - elapsed)
+        return "Elapsed: \(elapsedText) · ETA estimate: \(formatDuration(remaining))"
+    }
+
+    private func shouldShowSlowScanInfo(fileCount: Int) -> Bool {
+        // Gating on remaining time alone made the info icon disappear near the end
+        // of a slow scan (ETA drops under 5min even though the scan already took
+        // much longer than that) — once a scan has crossed the "slow" threshold,
+        // keep the explanation available for the rest of it instead of flickering off.
+        if let bookmarkIndex, let startTime = appState.backgroundScanStartTimes[bookmarkIndex] {
+            let elapsed = Date().timeIntervalSince(startTime)
+            if elapsed > 300 { return true }
+        }
+        guard let remaining = scanRemainingTime(fileCount: fileCount) else { return false }
+        return remaining > 300
+    }
+
+    private func scanRemainingTime(fileCount: Int) -> TimeInterval? {
+        guard let bookmarkIndex,
+              let startTime = appState.backgroundScanStartTimes[bookmarkIndex],
+              fileCount > 0 else { return nil }
+        let elapsed = Date().timeIntervalSince(startTime)
+        let processed = appState.backgroundScanProcessedFileCount[bookmarkIndex] ?? 0
+        if processed > 0 {
+            let filesPerSecond = Double(processed) / max(1, elapsed)
+            guard filesPerSecond > 0 else { return nil }
+            return Double(max(0, fileCount - processed)) / filesPerSecond
+        }
+        return max(0, max(30.0, Double(fileCount) * 0.30) - elapsed)
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 { return String(format: "%dh %02dm", hours, minutes) }
+        return String(format: "%dm %02ds", minutes, secs)
+    }
+
+    private func formatSocialDuration(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        if hours > 0 { return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 
     @ViewBuilder
@@ -873,8 +1902,6 @@ struct EventStatsView: View {
         let isLimitedData = report.rawOutput.contains("mdls fallback") && report.totalFilesAnalyzed > 0
         let isShowingCachedStatsWithoutCurrentRAWs = diskIsReachable && knownRawFileCount == 0 && report.totalFilesAnalyzed > 0
         VStack(alignment: .leading, spacing: 6) {
-            AuroraPanelHeader(title: "Photo Stats")
-
             if isShowingCachedStatsWithoutCurrentRAWs {
                 HStack(spacing: 8) {
                     Image(systemName: "archivebox")
@@ -935,7 +1962,6 @@ struct EventStatsView: View {
                 PhotoStatCard(icon: "rectangle.portrait.fill", accent: .auroraLive, pages: orientationPages(for: report))
             }
         }
-        .auroraStaticCard()
     }
 
     private func rawFileCount(for report: StatsReport) -> Int {
@@ -1048,7 +2074,7 @@ struct EventStatsView: View {
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .auroraStaticCard()
+        .auroraCollapsibleStaticCard(storageKey: "event.topLenses")
     }
 
     private func lensCard(lens: StatsReport.LensStat) -> some View {
@@ -1098,14 +2124,14 @@ struct EventStatsView: View {
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .auroraStaticCard()
+        .auroraCollapsibleStaticCard(storageKey: "event.topCameras")
     }
 
     private func cameraCard(camera: StatsReport.CameraStat, rank: Int) -> some View {
         VStack(spacing: 8) {
             Text(rank == 1 ? "🥇" : rank == 2 ? "🥈" : "🥉")
                 .font(.system(size: 48))
-            Text(friendlyCameraName(for: camera.model))
+            Text(camera.fullName)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.textPrimary)
                 .lineLimit(1)
@@ -1130,15 +2156,6 @@ struct EventStatsView: View {
 
     // MARK: - Helpers
 
-    private func friendlyCameraName(for model: String) -> String {
-        let mappings: [String: String] = [
-            "ILCE-7M4": "Sony A7 IV",
-            "ILCE-1M2": "Sony A1 II",
-            "ILCE-9M3": "Sony A9 III"
-        ]
-        return mappings[model] ?? model
-    }
-
     private func formatBytes(_ bytes: Int64) -> String {
         let tb = Double(bytes) / (1024 * 1024 * 1024 * 1024)
         if tb >= 1 { return String(format: "%.2f TB", tb) }
@@ -1153,35 +2170,62 @@ struct EventStatsView: View {
     /// Load from cache immediately. Never auto-scans — the scan is triggered when the
     /// folder is first added (Statistics/Dashboard). The user can manually refresh here.
     @MainActor
+    /// `StatsReport` carries a timestamp per analyzed file (`captureTimestampsByDay`)
+    /// plus several per-camera/lens/shutter/ISO/aperture/focal-length count
+    /// dictionaries — for a large "production" event (thousands of RAWs) this is a
+    /// meaningfully bigger JSON payload than the gallery's manifest. Reading and
+    /// decoding it synchronously on the main thread (the same bug already found and
+    /// fixed for `loadGalleryFromCache`) blocked the UI every time this ran — on
+    /// every event open, and every 400ms tick of the scan-progress poll while a scan
+    /// is running.
     private func loadFromCache() {
-        if let cached = cachedStatsForCurrentEvent() {
-            report = cached.report
-            scanDate = cached.scanDate
-            isCachedData = true
-            hasLoaded = true
-            errorMessage = nil
-        } else {
-            // No cache yet — mark as loaded so we show the correct empty/offline state
-            hasLoaded = true
-            let url = URL(fileURLWithPath: destinationPath)
-            let reachable = !destinationPath.isEmpty && (try? url.checkResourceIsReachable()) == true
-            if !reachable {
-                errorMessage = "Folder not found — disk may be disconnected"
-                appState.log("Event folder unreachable: \(destinationPath)", level: .warning)
+        let path = destinationPath
+        let previousPath = bookmarkIndex.flatMap { idx -> String? in
+            guard idx < appState.eventFolderPreviousCachedPaths.count else { return nil }
+            let candidate = appState.eventFolderPreviousCachedPaths[idx]
+            return candidate.isEmpty ? nil : candidate
+        }
+        Task.detached(priority: .userInitiated) {
+            let cached = EventStatsCache.loadWithQuality(forPath: path) ?? previousPath.flatMap { EventStatsCache.loadWithQuality(forPath: $0) }
+            await MainActor.run {
+                guard currentEventPath == path else { return }
+                if let cached {
+                    report = cached.report
+                    scanDate = cached.scanDate
+                    scanQuality = cached.scanQuality
+                    isCachedData = true
+                    hasLoaded = true
+                    errorMessage = nil
+                } else {
+                    // No cache yet — mark as loaded so we show the correct empty/offline state
+                    hasLoaded = true
+                    let url = URL(fileURLWithPath: path)
+                    let reachable = !path.isEmpty && (try? url.checkResourceIsReachable()) == true
+                    if !reachable {
+                        errorMessage = "Folder not found — disk may be disconnected"
+                        appState.log("Event folder unreachable: \(path)", level: .warning)
+                    }
+                    // If reachable but no cache: show emptyState with "Scan Photos" button in header
+                }
             }
-            // If reachable but no cache: show emptyState with "Scan Photos" button in header
         }
     }
 
-    private func cachedStatsForCurrentEvent() -> (report: StatsReport, scanDate: Date, rawFileCountAtScan: Int?)? {
-        if let cached = EventStatsCache.load(forPath: destinationPath) {
+    /// Still used as a synchronous fallback inside `loadEventStats()` (an already
+    /// `@MainActor` function) for the rare case a fresh scan comes back empty and we
+    /// fall back to the last cached stats — not a hot/repeated path, so the
+    /// synchronous read there is fine. `loadFromCache()` above does its own capture
+    /// of the relevant paths instead of calling this, since it needs to run the
+    /// actual disk read off the main thread.
+    private func cachedStatsForCurrentEvent() -> (report: StatsReport, scanDate: Date, rawFileCountAtScan: Int?, scanQuality: EventStatsScanQuality)? {
+        if let cached = EventStatsCache.loadWithQuality(forPath: destinationPath) {
             return cached
         }
         guard let bookmarkIndex,
               bookmarkIndex < appState.eventFolderPreviousCachedPaths.count else { return nil }
         let previousPath = appState.eventFolderPreviousCachedPaths[bookmarkIndex]
         guard !previousPath.isEmpty else { return nil }
-        return EventStatsCache.load(forPath: previousPath)
+        return EventStatsCache.loadWithQuality(forPath: previousPath)
     }
 
     /// Fresh exiftool scan — saves result to cache on success.
@@ -1194,28 +2238,82 @@ struct EventStatsView: View {
         isLoading = true
         errorMessage = nil
 
+        // Register in backgroundScanningBookmarkIndices so the progress bar and
+        // sidebar indicator activate — same mechanism used by auto-scans.
+        if let idx = bookmarkIndex {
+            appState.backgroundScanningBookmarkIndices.insert(idx)
+            appState.backgroundScanStartTimes[idx] = Date()
+            appState.backgroundScanQualities[idx] = .full
+        }
+
         Task {
             guard let runner = statsRunner else {
                 isLoading = false
+                if let idx = bookmarkIndex {
+                    appState.backgroundScanningBookmarkIndices.remove(idx)
+                    appState.backgroundScanProcessedFileCount.removeValue(forKey: idx)
+                    appState.backgroundScanStartTimes.removeValue(forKey: idx)
+                    appState.backgroundScanQualities.removeValue(forKey: idx)
+                }
                 return
             }
 
-            let result = await runner.runStatsForEventFolder(at: url)
+            // Count files upfront so the estimated progress bar is meaningful.
+            if let idx = bookmarkIndex, appState.backgroundScanFileCount[idx] == nil {
+                let count = VolumeWatcher.countRawFiles(at: url, extensions: appState.supportedExtensions)
+                appState.backgroundScanFileCount[idx] = count
+                appState.backgroundScanProcessedFileCount[idx] = 0
+            }
+
+            let result = await runner.runStatsForEventFolderInBatches(at: url, quality: .full) { processed, total, partialReport in
+                if let idx = bookmarkIndex {
+                    appState.backgroundScanProcessedFileCount[idx] = processed
+                    appState.backgroundScanFileCount[idx] = total
+                    if let partialReport, partialReport.totalFilesAnalyzed > 0 {
+                        let now = Date()
+                        EventStatsCache.save(partialReport, forPath: destinationPath, scanDate: now, rawFileCountAtScan: partialReport.totalFilesAnalyzed, scanQuality: .partial)
+                        appState.noteEventStatsCacheChanged()
+                        appState.updateEventFolderCache(at: idx, count: max(total, partialReport.totalFilesAnalyzed), path: destinationPath)
+                        appState.setEventFolderPeakIfHigher(at: idx, count: max(total, partialReport.totalFilesAnalyzed))
+                    }
+                }
+            }
+
+            if let idx = bookmarkIndex {
+                appState.backgroundScanningBookmarkIndices.remove(idx)
+                appState.backgroundScanFileCount.removeValue(forKey: idx)
+                appState.backgroundScanProcessedFileCount.removeValue(forKey: idx)
+                appState.backgroundScanStartTimes.removeValue(forKey: idx)
+                appState.backgroundScanQualities.removeValue(forKey: idx)
+            }
             isLoading = false
             hasLoaded = true
 
             if let r = result, r.totalFilesAnalyzed > 0 {
                 report = r
+                scanQuality = .full
                 isCachedData = false
                 let now = Date()
                 scanDate = now
-                EventStatsCache.save(r, forPath: destinationPath, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
+                EventStatsCache.save(r, forPath: destinationPath, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed, scanQuality: .full)
+                appState.noteEventStatsCacheChanged()
                 if let bookmarkIndex {
                     appState.updateEventFolderCache(at: bookmarkIndex, count: r.totalFilesAnalyzed, path: destinationPath)
                     appState.setEventFolderPeakIfHigher(at: bookmarkIndex, count: r.totalFilesAnalyzed)
                 }
                 appState.log("Event stats scanned & cached: \(eventName) — \(r.totalFilesAnalyzed) photos")
+                rebuildGalleryInBackground()
             } else {
+                if let bookmarkIndex, appState.isLibraryFolder(at: bookmarkIndex) {
+                    if let cached = cachedStatsForCurrentEvent() {
+                        report = cached.report
+                        scanDate = cached.scanDate
+                        scanQuality = cached.scanQuality
+                        isCachedData = true
+                    }
+                    appState.log("Library folder scan returned no RAW stats; keeping cached stats for \(eventName)", level: .warning)
+                    return
+                }
                 let fileCount = VolumeWatcher.listRawFiles(at: url, extensions: appState.supportedExtensions).count
                 if fileCount == 0 {
                     if let bookmarkIndex {
@@ -1224,6 +2322,7 @@ struct EventStatsView: View {
                     if let cached = cachedStatsForCurrentEvent() {
                         report = cached.report
                         scanDate = cached.scanDate
+                        scanQuality = cached.scanQuality
                         isCachedData = true
                     }
                     appState.log("Event scan found no current RAW files; keeping cached stats for \(eventName)", level: .warning)
@@ -1232,5 +2331,243 @@ struct EventStatsView: View {
                 }
             }
         }
+    }
+}
+
+private struct EventDailyMediaChart: View {
+    struct Entry: Identifiable, Equatable {
+        let dayKey: String
+        let count: Int
+
+        var id: String { dayKey }
+    }
+
+    let title: String
+    let subtitle: String
+    let entries: [Entry]
+    let tint: Color
+    let emptyMessage: String
+    var isLoading: Bool = false
+
+    @State private var hoveredEntryID: String?
+    @State private var isHoveringChart = false
+    @State private var animateBars = false
+
+    private var displayEntries: [Entry] {
+        guard !entries.isEmpty else { return [] }
+        let sorted = entries.sorted { $0.dayKey < $1.dayKey }
+        guard let latestDate = sorted.compactMap({ Self.date(from: $0.dayKey) }).max() else { return sorted }
+
+        let countsByDay = Dictionary(uniqueKeysWithValues: sorted.map { ($0.dayKey, $0.count) })
+        let calendar = Calendar(identifier: .gregorian)
+        return (0..<7).compactMap { offset in
+            guard let date = calendar.date(byAdding: .day, value: offset - 6, to: latestDate) else { return nil }
+            let key = Self.dayKey(from: date)
+            return Entry(dayKey: key, count: countsByDay[key] ?? 0)
+        }
+    }
+
+    private var maxCount: Int { max(displayEntries.map(\.count).max() ?? 1, 1) }
+    private var maxEntryID: String? { displayEntries.max { $0.count < $1.count }?.id }
+    private var totalText: String? {
+        guard !entries.isEmpty else { return nil }
+        return AuroraFormat.count(entries.reduce(0) { $0 + $1.count })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    AuroraCollapsibleHeaderTitle(title: title)
+                    Text(subtitle)
+                        .font(.manrope(11, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if let total = totalText {
+                    Text(total)
+                        .font(.manrope(11, weight: .bold))
+                        .foregroundStyle(tint)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Capsule(style: .continuous).fill(tint.opacity(0.12)))
+                }
+            }
+
+            if entries.isEmpty {
+                VStack(spacing: 10) {
+                    if isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(emptyMessage)
+                        .font(.manrope(12, weight: .semibold))
+                        .foregroundStyle(Color.auroraFaint)
+                }
+                .frame(maxWidth: .infinity, minHeight: 170)
+            } else {
+                chart
+                    .frame(height: 190)
+            }
+        }
+        .auroraCollapsibleStaticCard(
+            storageKey: "event.dailyMedia.\(title)",
+            radius: AuroraRadius.large,
+            paddingH: 16,
+            paddingV: 16,
+            collapsedVisibleHeight: 31
+        )
+        .onAppear { animateBars = true }
+        .onChange(of: entries) { _, _ in restartAnimation() }
+    }
+
+    private var chart: some View {
+        GeometryReader { geo in
+            let chartEntries = displayEntries
+            let chartHeight = geo.size.height - 42
+            let contentWidth = max(geo.size.width, CGFloat(chartEntries.count) * ImportTimelinePeriod.day.minBarWidth)
+
+            ZStack(alignment: .bottomLeading) {
+                grid(width: contentWidth, height: chartHeight)
+                HStack(alignment: .bottom, spacing: 6) {
+                    ForEach(chartEntries) { entry in
+                        let activeID = hoveredEntryID ?? (isHoveringChart ? nil : maxEntryID)
+                        EventDailyTimelineBar(
+                            entry: entry,
+                            fraction: animateBars ? CGFloat(entry.count) / CGFloat(maxCount) : 0,
+                            isHighlighted: entry.id == activeID,
+                            chartHeight: chartHeight
+                        )
+                        .frame(width: barWidth(totalWidth: contentWidth, entryCount: chartEntries.count))
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            guard hovering else { return }
+                            withAnimation(.easeOut(duration: 0.12)) { hoveredEntryID = entry.id }
+                        }
+                    }
+                }
+                .padding(.horizontal, 6)
+                .frame(width: contentWidth, height: geo.size.height, alignment: .bottomLeading)
+            }
+            .frame(width: contentWidth, height: geo.size.height)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.12)) {
+                    isHoveringChart = hovering
+                    if !hovering { hoveredEntryID = nil }
+                }
+            }
+        }
+    }
+
+    private func barWidth(totalWidth: CGFloat, entryCount: Int) -> CGFloat {
+        let totalSpacing = CGFloat(max(entryCount - 1, 0)) * 6 + 12
+        return max(ImportTimelinePeriod.day.minBarWidth, (totalWidth - totalSpacing) / CGFloat(max(entryCount, 1)))
+    }
+
+    private func grid(width: CGFloat, height: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            ForEach(0..<4) { index in
+                Rectangle()
+                    .fill(index == 3 ? Color.auroraStroke.opacity(0.7) : Color.auroraStroke.opacity(0.28))
+                    .frame(height: 1)
+                if index < 3 { Spacer() }
+            }
+        }
+        .frame(width: width, height: height)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .padding(.top, 8)
+    }
+
+    private func restartAnimation() {
+        animateBars = false
+        withAnimation(.timingCurve(0.18, 0.86, 0.22, 1, duration: 0.95)) {
+            animateBars = true
+        }
+    }
+
+    private static func date(from dayKey: String) -> Date? {
+        dayKeyFormatter.date(from: dayKey)
+    }
+
+    private static func dayKey(from date: Date) -> String {
+        dayKeyFormatter.string(from: date)
+    }
+
+    private static let dayKeyFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}
+
+private struct EventDailyTimelineBar: View {
+    let entry: EventDailyMediaChart.Entry
+    let fraction: CGFloat
+    let isHighlighted: Bool
+    let chartHeight: CGFloat
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if isHighlighted {
+                Text(AuroraFormat.count(entry.count))
+                    .font(.sora(10.5, weight: .heavy))
+                    .foregroundStyle(Color.auroraCyan)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                    .frame(height: 14)
+            } else {
+                Spacer().frame(height: 14)
+            }
+
+            ZStack(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.auroraPanel2.opacity(0.55))
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(barGradient)
+                    .frame(height: entry.count > 0 ? max(6, chartHeight * min(max(fraction, 0), 1)) : 0)
+                    .shadow(color: barTint.opacity(isHighlighted ? 0.55 : 0.24), radius: isHighlighted ? 12 : 5, x: 0, y: 0)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: chartHeight)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+            )
+
+            Text(label)
+                .font(.manrope(10, weight: .bold))
+                .foregroundStyle(isHighlighted ? Color.auroraTxt : Color.auroraFaint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .frame(height: 18)
+        }
+    }
+
+    private var label: String { isHighlighted ? shortLabel : "" }
+
+    private var shortLabel: String {
+        let parts = entry.dayKey.split(separator: "-")
+        guard parts.count == 3,
+              let month = Int(parts[1]),
+              let day = Int(parts[2]) else { return entry.dayKey }
+        let monthSymbols = Calendar.current.shortMonthSymbols
+        let monthName = (1...12).contains(month) ? monthSymbols[month - 1] : String(parts[1])
+        return "\(monthName) \(day)"
+    }
+
+    private var barTint: Color { isHighlighted ? .auroraCyan : .auroraViolet }
+
+    private var barGradient: LinearGradient {
+        LinearGradient(
+            colors: isHighlighted
+                ? [Color.auroraCyan, Color.auroraBlue]
+                : [Color.auroraViolet.opacity(0.92), Color.auroraMagenta.opacity(0.8)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
     }
 }

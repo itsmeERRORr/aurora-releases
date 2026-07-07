@@ -1,5 +1,86 @@
 import Foundation
 
+struct ShootingTimeDay: Equatable, Identifiable {
+    let dayKey: String
+    let photoCount: Int
+    let coverageSeconds: TimeInterval
+    let shootingSeconds: TimeInterval
+
+    var id: String { dayKey }
+}
+
+struct ShootingTimeMetrics: Equatable {
+    let days: [ShootingTimeDay]
+
+    var totalCoverageSeconds: TimeInterval {
+        days.reduce(0) { $0 + $1.coverageSeconds }
+    }
+
+    var totalShootingSeconds: TimeInterval {
+        days.reduce(0) { $0 + $1.shootingSeconds }
+    }
+
+    var totalPhotos: Int {
+        days.reduce(0) { $0 + $1.photoCount }
+    }
+
+    var longestCoverageDay: ShootingTimeDay? {
+        days.max { $0.coverageSeconds < $1.coverageSeconds }
+    }
+
+    var longestShootingDay: ShootingTimeDay? {
+        days.max { $0.shootingSeconds < $1.shootingSeconds }
+    }
+
+    var busiestPhotoDay: ShootingTimeDay? {
+        days.max { $0.photoCount < $1.photoCount }
+    }
+
+    var averagePhotosPerCoverageHour: Double? {
+        guard totalCoverageSeconds > 0 else { return nil }
+        return Double(totalPhotos) / (totalCoverageSeconds / 3600)
+    }
+
+    init?(timestampsByDay: [String: [Double]]) {
+        let builtDays = timestampsByDay.compactMap { dayKey, rawTimestamps -> ShootingTimeDay? in
+            let timestamps = rawTimestamps.sorted()
+            guard !timestamps.isEmpty else { return nil }
+
+            let coverage = Self.uniquePhotoHoursSeconds(from: timestamps)
+            let shooting = Self.uniqueCaptureSeconds(from: timestamps)
+
+            return ShootingTimeDay(
+                dayKey: dayKey,
+                photoCount: timestamps.count,
+                coverageSeconds: coverage,
+                shootingSeconds: shooting
+            )
+        }
+        .sorted { $0.dayKey < $1.dayKey }
+
+        guard !builtDays.isEmpty else { return nil }
+        days = builtDays
+    }
+
+    private static func uniqueCaptureSeconds(from timestamps: [Double]) -> TimeInterval {
+        TimeInterval(Set(timestamps.map { Int($0.rounded(.down)) }).count)
+    }
+
+    private static func uniquePhotoHoursSeconds(from timestamps: [Double]) -> TimeInterval {
+        let hourKeys = Set(timestamps.map { timestamp in
+            let date = Date(timeIntervalSince1970: timestamp)
+            return coverageCalendar.dateComponents([.year, .month, .day, .hour], from: date)
+        })
+        return TimeInterval(hourKeys.count * 3600)
+    }
+
+    private static let coverageCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar
+    }()
+}
+
 struct StatsReport: Equatable, Codable {
     var topLenses: [LensStat]
     var mostUsedCamera: CameraStat?
@@ -94,7 +175,9 @@ struct StatsReport: Equatable, Codable {
             return CameraStat(
                 make: String(parts.first ?? ""),
                 model: String(parts.last ?? ""),
-                count: count
+                count: count,
+                maxShutterCount: cameraMaxShutterCounts[key],
+                lastSeenDate: cameraLastSeenDates[key]
             )
         }
     }
@@ -106,7 +189,7 @@ struct StatsReport: Equatable, Codable {
             let trimmed = str.trimmingCharacters(in: .whitespaces)
             return !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" }
         }
-        let sorted = lensCounts
+        let sorted = Self.normalizedLensCounts(lensCounts)
             .filter { pair in
                 let parts = pair.key.split(separator: "|", maxSplits: 1)
                 let model = String(parts.last ?? Substring(pair.key))
@@ -143,6 +226,31 @@ struct StatsReport: Equatable, Codable {
     var monthCounts: [String: Int] // "MMM yyyy" -> count
     var weekCounts: [String: Int] // "YYYY-Www" -> count
     var yearCounts: [String: Int] // "YYYY" -> count
+    var captureTimestampsByDay: [String: [Double]] // "yyyy-MM-dd" -> capture timestamps
+    var cameraMaxShutterCounts: [String: Int]  // "MAKE|MODEL" -> max shutter count seen
+    var cameraLastSeenDates: [String: Date]    // "MAKE|MODEL" -> latest capture date seen
+
+    static func instantFolderScan(fileCount: Int) -> StatsReport {
+        StatsReport(
+            topLenses: [],
+            mostUsedCamera: nil,
+            shutterSpeeds: [],
+            totalFilesAnalyzed: fileCount,
+            rawOutput: "instant folder scan",
+            avgISO: nil,
+            avgAperture: nil,
+            avgFocalLength: nil,
+            lensCounts: [:],
+            cameraCounts: [:],
+            shutterCounts: [:],
+            isoCounts: [:],
+            apertureCounts: [:],
+            focalCounts: [:],
+            monthCounts: [:],
+            weekCounts: [:],
+            yearCounts: [:]
+        )
+    }
 
     init(
         topLenses: [LensStat],
@@ -180,7 +288,10 @@ struct StatsReport: Equatable, Codable {
         focalCount: Int = 0,
         monthCounts: [String: Int] = [:],
         weekCounts: [String: Int] = [:],
-        yearCounts: [String: Int] = [:]
+        yearCounts: [String: Int] = [:],
+        captureTimestampsByDay: [String: [Double]] = [:],
+        cameraMaxShutterCounts: [String: Int] = [:],
+        cameraLastSeenDates: [String: Date] = [:]
     ) {
         self.topLenses = topLenses
         self.mostUsedCamera = mostUsedCamera
@@ -218,6 +329,27 @@ struct StatsReport: Equatable, Codable {
         self.monthCounts = monthCounts
         self.weekCounts = weekCounts
         self.yearCounts = yearCounts
+        self.captureTimestampsByDay = captureTimestampsByDay
+        self.cameraMaxShutterCounts = cameraMaxShutterCounts
+        self.cameraLastSeenDates = cameraLastSeenDates
+    }
+
+    var shootingTimeMetrics: ShootingTimeMetrics? {
+        ShootingTimeMetrics(timestampsByDay: captureTimestampsByDay)
+    }
+
+    mutating func mergeCaptureTimestamps(from other: StatsReport) {
+        for (day, timestamps) in other.captureTimestampsByDay {
+            captureTimestampsByDay[day, default: []].append(contentsOf: timestamps)
+        }
+    }
+
+    mutating func mergeBestCaptureDays(from other: StatsReport) {
+        for (day, timestamps) in other.captureTimestampsByDay where !timestamps.isEmpty {
+            if (captureTimestampsByDay[day]?.count ?? 0) < timestamps.count {
+                captureTimestampsByDay[day] = timestamps
+            }
+        }
     }
 
     var mostUsedISO: Double? {
@@ -259,6 +391,33 @@ struct StatsReport: Equatable, Codable {
         orientationCounts["landscape", default: 0]
     }
 
+    static func normalizedLensKey(make: String, model: String) -> String {
+        let cleanMake = make.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upperMake = cleanMake.uppercased()
+        let upperModel = cleanModel.uppercased()
+
+        if upperMake.contains("RICOH"),
+           upperModel.contains("F2.8"),
+           (upperModel.contains("GR LENS 26MM") || upperModel.contains("26.1MM") || upperModel.contains("26MM")) {
+            return "\(cleanMake)|GR LENS 26mm F2.8"
+        }
+
+        return "\(cleanMake)|\(cleanModel)"
+    }
+
+    static func normalizedLensKey(_ key: String) -> String {
+        let parts = key.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2 else { return key }
+        return normalizedLensKey(make: String(parts[0]), model: String(parts[1]))
+    }
+
+    private static func normalizedLensCounts(_ counts: [String: Int]) -> [String: Int] {
+        counts.reduce(into: [:]) { result, pair in
+            result[normalizedLensKey(pair.key), default: 0] += pair.value
+        }
+    }
+
     struct LensStat: Equatable, Identifiable, Codable {
         let id: UUID
         let make: String
@@ -292,6 +451,7 @@ struct StatsReport: Equatable, Codable {
         private func inferredBrand(from model: String, fallback: String) -> String {
             let upper = model.uppercased()
 
+            if upper.contains("RICOH") || fallback.uppercased().contains("RICOH") { return "Ricoh" }
             if upper.contains("SAMYANG") { return "Samyang" }
             if upper.contains("SIGMA") || upper.contains(" DG DN ") || upper.contains("| ART") || upper.contains(" ART ") { return "Sigma" }
             if upper.contains("TAMRON") { return "Tamron" }
@@ -323,8 +483,108 @@ struct StatsReport: Equatable, Codable {
         let make: String
         let model: String
         let count: Int
+        var maxShutterCount: Int?
+        var lastSeenDate: Date?
 
-        var fullName: String { "\(make) \(model)" }
+        init(make: String, model: String, count: Int, maxShutterCount: Int? = nil, lastSeenDate: Date? = nil) {
+            self.make = make
+            self.model = model
+            self.count = count
+            self.maxShutterCount = maxShutterCount
+            self.lastSeenDate = lastSeenDate
+        }
+
+        var fullName: String {
+            let trimmed = model.trimmingCharacters(in: .whitespaces)
+            let friendly = Self.friendlyModel(trimmed, make: make)
+            // Use the first word of make for prefix detection so verbose makes like
+            // "RICOH IMAGING COMPANY, LTD." don't get prepended to "Ricoh GR IIIx".
+            let makeFirstWord = make.uppercased().components(separatedBy: .whitespaces).first ?? ""
+            if !makeFirstWord.isEmpty && friendly.uppercased().hasPrefix(makeFirstWord) {
+                return friendly
+            }
+            return "\(make) \(friendly)".trimmingCharacters(in: .whitespaces)
+        }
+
+        // Maps internal/vendor EXIF names to compact marketing names.
+        private static func friendlyModel(_ model: String, make: String) -> String {
+            let upperMake = make.uppercased()
+            let upper = model.uppercased()
+
+            if upperMake.contains("RICOH"), upper.contains("GR IIIX") || upper.contains("GR III X") {
+                return "Ricoh GR IIIx"
+            }
+            if upperMake.contains("RICOH"), upper.contains("GR III") {
+                return "Ricoh GR III"
+            }
+
+            if upperMake.contains("CANON") {
+                let compact = upper.replacingOccurrences(of: " ", with: "")
+                let canonMap: [String: String] = [
+                    "EOSR6M2": "Canon EOS R6 Mark II",
+                    "EOSR6MARKII": "Canon EOS R6 Mark II",
+                    "EOSR6M3": "Canon EOS R6 Mark III",
+                    "EOSR6MARKIII": "Canon EOS R6 Mark III"
+                ]
+                if let name = canonMap[compact] { return name }
+            }
+
+            guard upperMake.contains("SONY") else { return model }
+            let sonyMap: [String: String] = [
+                // Alpha full-frame mirrorless
+                "ILCE-1M2":  "Sony A1 II",
+                "ILCE-1":    "Sony A1",
+                "ILCE-9M3":  "Sony A9 III",
+                "ILCE-9M2":  "Sony A9 II",
+                "ILCE-9":    "Sony A9",
+                "ILCE-7M4":  "Sony A7 IV",
+                "ILCE-7M3":  "Sony A7 III",
+                "ILCE-7M2":  "Sony A7 II",
+                "ILCE-7":    "Sony A7",
+                "ILCE-7RM5": "Sony A7R V",
+                "ILCE-7RM4": "Sony A7R IV",
+                "ILCE-7RM4A":"Sony A7R IVA",
+                "ILCE-7RM3": "Sony A7R III",
+                "ILCE-7RM3A":"Sony A7R IIIA",
+                "ILCE-7RM2": "Sony A7R II",
+                "ILCE-7R":   "Sony A7R",
+                "ILCE-7SM3": "Sony A7S III",
+                "ILCE-7SM2": "Sony A7S II",
+                "ILCE-7S":   "Sony A7S",
+                "ILCE-7CM2": "Sony A7C II",
+                "ILCE-7C":   "Sony A7C",
+                "ILCE-7CR":  "Sony A7CR",
+                // APS-C mirrorless
+                "ILCE-6700": "Sony A6700",
+                "ILCE-6600": "Sony A6600",
+                "ILCE-6500": "Sony A6500",
+                "ILCE-6400": "Sony A6400",
+                "ILCE-6300": "Sony A6300",
+                "ILCE-6100": "Sony A6100",
+                "ILCE-6000": "Sony A6000",
+                "ILCE-5100": "Sony A5100",
+                "ILCE-5000": "Sony A5000",
+                // Cinema / pro
+                "ILME-FX3":  "Sony FX3",
+                "ILME-FX30": "Sony FX30",
+                "ILME-FX6":  "Sony FX6",
+                "ILME-FX9":  "Sony FX9",
+                // SLT
+                "ILCA-99M2": "Sony A99 II",
+                "ILCA-99":   "Sony A99",
+                "ILCA-77M2": "Sony A77 II",
+                "ILCA-68":   "Sony A68",
+            ]
+            if let name = sonyMap[upper] { return name }
+            // Fallback: strip ILCE-/ILCA-/ILME- prefix and prepend "Sony A"
+            for prefix in ["ILCE-", "ILCA-", "ILME-"] {
+                if upper.hasPrefix(prefix) {
+                    let suffix = String(model.dropFirst(prefix.count))
+                    return "Sony \(suffix)"
+                }
+            }
+            return model
+        }
     }
 
     struct ShutterStat: Equatable, Identifiable, Codable {
@@ -356,7 +616,8 @@ struct StatsReport: Equatable, Codable {
         case avgFocalLength, maxFocalLength, minFocalLength
         case totalBytes, totalDuration, importCount, firstImportDate
         case lensCounts, cameraCounts, shutterCounts, isoCounts, apertureCounts, focalCounts, orientationCounts, maxShutterSpeed, minShutterSpeed
-        case isoSum, isoCount, apertureSum, apertureCount, focalSum, focalCount, monthCounts, weekCounts, yearCounts
+        case isoSum, isoCount, apertureSum, apertureCount, focalSum, focalCount, monthCounts, weekCounts, yearCounts, captureTimestampsByDay
+        case cameraMaxShutterCounts, cameraLastSeenDates
     }
 
     func encode(to encoder: Encoder) throws {
@@ -399,6 +660,10 @@ struct StatsReport: Equatable, Codable {
         try container.encode(monthCounts, forKey: .monthCounts)
         try container.encode(weekCounts, forKey: .weekCounts)
         try container.encode(yearCounts, forKey: .yearCounts)
+        try container.encode(captureTimestampsByDay, forKey: .captureTimestampsByDay)
+        try container.encode(cameraMaxShutterCounts, forKey: .cameraMaxShutterCounts)
+        let shutterDateStrings = Dictionary(uniqueKeysWithValues: cameraLastSeenDates.map { ($0.key, $0.value.timeIntervalSince1970) })
+        try container.encode(shutterDateStrings, forKey: .cameraLastSeenDates)
     }
 
     init(from decoder: Decoder) throws {
@@ -448,6 +713,23 @@ struct StatsReport: Equatable, Codable {
         monthCounts = try container.decodeIfPresent([String: Int].self, forKey: .monthCounts) ?? [:]
         weekCounts = try container.decodeIfPresent([String: Int].self, forKey: .weekCounts) ?? [:]
         yearCounts = try container.decodeIfPresent([String: Int].self, forKey: .yearCounts) ?? [:]
+        captureTimestampsByDay = try container.decodeIfPresent([String: [Double]].self, forKey: .captureTimestampsByDay) ?? [:]
+        cameraMaxShutterCounts = try container.decodeIfPresent([String: Int].self, forKey: .cameraMaxShutterCounts) ?? [:]
+        if let dateSeconds = try container.decodeIfPresent([String: Double].self, forKey: .cameraLastSeenDates) {
+            cameraLastSeenDates = Dictionary(uniqueKeysWithValues: dateSeconds.map { ($0.key, Date(timeIntervalSince1970: $0.value)) })
+        } else {
+            cameraLastSeenDates = [:]
+        }
+
+        if let camera = mostUsedCamera {
+            let key = "\(camera.make)|\(camera.model)"
+            if cameraMaxShutterCounts[key] == nil, let count = camera.maxShutterCount {
+                cameraMaxShutterCounts[key] = count
+            }
+            if cameraLastSeenDates[key] == nil, let date = camera.lastSeenDate {
+                cameraLastSeenDates[key] = date
+            }
+        }
     }
 
     // MARK: - Accumulation
@@ -468,7 +750,7 @@ struct StatsReport: Equatable, Codable {
             let model = String(parts.last ?? "").trimmingCharacters(in: .whitespaces)
             return !model.isEmpty && model.allSatisfy { $0 == "-" }
         }
-        combinedLensCounts = combinedLensCounts.filter { !isNoLens($0.key) }
+        combinedLensCounts = normalizedLensCounts(combinedLensCounts.filter { !isNoLens($0.key) })
 
         var combinedCameraCounts = report1.cameraCounts
         for (camera, count) in report2.cameraCounts {
@@ -515,6 +797,21 @@ struct StatsReport: Equatable, Codable {
             combinedYearCounts[year, default: 0] += count
         }
 
+        var combinedCaptureTimestampsByDay = report1.captureTimestampsByDay
+        for (day, timestamps) in report2.captureTimestampsByDay {
+            combinedCaptureTimestampsByDay[day, default: []].append(contentsOf: timestamps)
+        }
+
+        var combinedCameraMaxShutterCounts = report1.cameraMaxShutterCounts
+        for (key, count) in report2.cameraMaxShutterCounts {
+            combinedCameraMaxShutterCounts[key] = max(combinedCameraMaxShutterCounts[key] ?? 0, count)
+        }
+
+        var combinedCameraLastSeenDates = report1.cameraLastSeenDates
+        for (key, date) in report2.cameraLastSeenDates {
+            combinedCameraLastSeenDates[key] = max(combinedCameraLastSeenDates[key] ?? .distantPast, date)
+        }
+
         // Combine sums
         let combinedIsoSum = report1.isoSum + report2.isoSum
         let combinedIsoCount = report1.isoCount + report2.isoCount
@@ -543,7 +840,9 @@ struct StatsReport: Equatable, Codable {
             cameraStat = CameraStat(
                 make: String(parts.first ?? ""),
                 model: String(parts.last ?? ""),
-                count: topCamera.value
+                count: topCamera.value,
+                maxShutterCount: combinedCameraMaxShutterCounts[topCamera.key],
+                lastSeenDate: combinedCameraLastSeenDates[topCamera.key]
             )
         } else {
             cameraStat = nil
@@ -610,7 +909,10 @@ struct StatsReport: Equatable, Codable {
             focalCount: combinedFocalCount,
             monthCounts: combinedMonthCounts,
             weekCounts: combinedWeekCounts,
-            yearCounts: combinedYearCounts
+            yearCounts: combinedYearCounts,
+            captureTimestampsByDay: combinedCaptureTimestampsByDay,
+            cameraMaxShutterCounts: combinedCameraMaxShutterCounts,
+            cameraLastSeenDates: combinedCameraLastSeenDates
         )
     }
 
@@ -629,6 +931,7 @@ struct StatsReport: Equatable, Codable {
         let remainingMonthCounts = Self.subtractCounts(monthCounts, removing: removed.monthCounts)
         let remainingWeekCounts = Self.subtractCounts(weekCounts, removing: removed.weekCounts)
         let remainingYearCounts = Self.subtractCounts(yearCounts, removing: removed.yearCounts)
+        let remainingCaptureTimestampsByDay = Self.subtractTimestamps(captureTimestampsByDay, removing: removed.captureTimestampsByDay)
 
         let remainingIsoSum = max(0, isoSum - removed.isoSum)
         let remainingIsoCount = max(0, isoCount - removed.isoCount)
@@ -639,7 +942,11 @@ struct StatsReport: Equatable, Codable {
 
         return StatsReport(
             topLenses: Self.topLenses(from: remainingLensCounts),
-            mostUsedCamera: Self.topCamera(from: remainingCameraCounts),
+            mostUsedCamera: Self.topCamera(
+                from: remainingCameraCounts,
+                maxShutterCounts: cameraMaxShutterCounts,
+                lastSeenDates: cameraLastSeenDates
+            ),
             shutterSpeeds: Self.topShutters(from: remainingShutterCounts),
             totalFilesAnalyzed: remainingFileCount,
             rawOutput: "Adjusted stats from \(remainingFileCount) files",
@@ -673,8 +980,67 @@ struct StatsReport: Equatable, Codable {
             focalCount: remainingFocalCount,
             monthCounts: remainingMonthCounts,
             weekCounts: remainingWeekCounts,
-            yearCounts: remainingYearCounts
+            yearCounts: remainingYearCounts,
+            captureTimestampsByDay: remainingCaptureTimestampsByDay,
+            cameraMaxShutterCounts: cameraMaxShutterCounts,
+            cameraLastSeenDates: cameraLastSeenDates
         )
+    }
+
+    mutating func mergeMissingRankingCounts(from other: StatsReport) {
+        var changed = false
+
+        for (lens, count) in other.lensCounts where lensCounts[lens] == nil {
+            lensCounts[lens] = count
+            changed = true
+        }
+
+        for (camera, count) in other.cameraCounts where cameraCounts[camera] == nil {
+            cameraCounts[camera] = count
+            changed = true
+        }
+
+        for (camera, count) in other.cameraMaxShutterCounts {
+            let current = cameraMaxShutterCounts[camera] ?? 0
+            if count > current {
+                cameraMaxShutterCounts[camera] = count
+                changed = true
+            }
+        }
+
+        for (camera, date) in other.cameraLastSeenDates {
+            let current = cameraLastSeenDates[camera] ?? .distantPast
+            if date > current {
+                cameraLastSeenDates[camera] = date
+                changed = true
+            }
+        }
+
+        guard changed else { return }
+        topLenses = Self.topLenses(from: lensCounts)
+        mostUsedCamera = Self.topCamera(
+            from: cameraCounts,
+            maxShutterCounts: cameraMaxShutterCounts,
+            lastSeenDates: cameraLastSeenDates
+        )
+    }
+
+    private static func subtractTimestamps(_ timestamps: [String: [Double]], removing removed: [String: [Double]]) -> [String: [Double]] {
+        var result = timestamps
+        for (day, removedValues) in removed {
+            guard var values = result[day] else { continue }
+            for removedValue in removedValues {
+                if let index = values.firstIndex(of: removedValue) {
+                    values.remove(at: index)
+                }
+            }
+            if values.isEmpty {
+                result.removeValue(forKey: day)
+            } else {
+                result[day] = values
+            }
+        }
+        return result
     }
 
     private static func subtractCounts<Key: Hashable>(_ counts: [Key: Int], removing removed: [Key: Int]) -> [Key: Int] {
@@ -691,7 +1057,7 @@ struct StatsReport: Equatable, Codable {
     }
 
     private static func topLenses(from counts: [String: Int]) -> [LensStat] {
-        counts
+        normalizedLensCounts(counts)
             .filter { !isNoLensKey($0.key) }
             .sorted { $0.value > $1.value }
             .prefix(3)
@@ -707,13 +1073,19 @@ struct StatsReport: Equatable, Codable {
             }
     }
 
-    private static func topCamera(from counts: [String: Int]) -> CameraStat? {
+    private static func topCamera(
+        from counts: [String: Int],
+        maxShutterCounts: [String: Int] = [:],
+        lastSeenDates: [String: Date] = [:]
+    ) -> CameraStat? {
         guard let topCamera = counts.max(by: { $0.value < $1.value }) else { return nil }
         let parts = topCamera.key.split(separator: "|", maxSplits: 1)
         return CameraStat(
             make: String(parts.first ?? ""),
             model: String(parts.last ?? ""),
-            count: topCamera.value
+            count: topCamera.value,
+            maxShutterCount: maxShutterCounts[topCamera.key],
+            lastSeenDate: lastSeenDates[topCamera.key]
         )
     }
 

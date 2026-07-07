@@ -11,8 +11,12 @@ enum RenameCaptureDateReader {
     }
 
     private static func findExiftool() -> String? {
-        ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
-            .first { FileManager.default.fileExists(atPath: $0) }
+        var paths: [String] = []
+        if let bundled = Bundle.main.path(forResource: "exiftool", ofType: nil) {
+            paths.append(bundled)
+        }
+        paths += ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
+        return paths.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     private static func runExiftool(exiftoolPath: String, files: [URL]) -> [String: Date] {

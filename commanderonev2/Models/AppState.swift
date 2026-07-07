@@ -74,6 +74,86 @@ struct EventBannerOffset: Equatable, Codable {
 final class AppState {
     private var isLoadingPersistedState = false
 
+    // MARK: - Gallery fullscreen viewer
+    // Presented as an in-window overlay from ContentView (like ProgressOverlayView)
+    // rather than a `.sheet()` — macOS sheets open a separate modal window that
+    // blocks and dims the parent, so clicks on the rest of the app never reach our
+    // view hierarchy and can't dismiss it. Living here lets EventGalleryCard trigger
+    // it while ContentView renders it over the whole main content area.
+    var galleryFullscreenPhotos: [GalleryPhotoRecord] = []
+    var galleryFullscreenIndex: Int?
+
+    // MARK: - Trial / Licensing
+    var trialUsage = TrialUsageState() {
+        didSet { TrialUsageStore.save(trialUsage) }
+    }
+    var licenseIsActivated = LicensingService.isActivated()
+    var trialAccessBlockedMessage: String?
+    var trialAccessBlockedToken = UUID()
+
+    var hasFullAccess: Bool {
+        licenseIsActivated
+    }
+
+    var isTrialMode: Bool {
+        !hasFullAccess
+    }
+
+    var trialActionsRemaining: Int {
+        hasFullAccess ? TrialUsageState.maxActions : trialUsage.remainingActions
+    }
+
+    var trialStatusText: String {
+        if hasFullAccess { return "Aurora activated" }
+        return "Trial: \(trialUsage.usedActions) of \(TrialUsageState.maxActions) actions used"
+    }
+
+    func canUseTrialAction(count: Int = 1) -> Bool {
+        hasFullAccess || trialUsage.usedActions + count <= TrialUsageState.maxActions
+    }
+
+    @discardableResult
+    func consumeTrialAction(_ actionName: String, count: Int = 1) -> Bool {
+        if hasFullAccess { return true }
+        guard canUseTrialAction(count: count) else {
+            requestActivationForTrialLimit()
+            return false
+        }
+        trialUsage.usedActions += count
+        log("Trial action used: \(actionName) (\(trialUsage.usedActions)/\(TrialUsageState.maxActions))")
+        // Push the new count to the server (fire-and-forget). If offline it stays
+        // local and syncs on the next successful call / launch.
+        Task { await syncTrialUsage() }
+        return true
+    }
+
+    /// Reconciles the local trial counter with the server: the effective count is
+    /// `max(local, server)`. No-op for activated users, and a failed sync (offline
+    /// or error) leaves the local value untouched — so imports still work offline.
+    /// The server is the source of truth that prevents resetting the counter by
+    /// deleting the local file.
+    func syncTrialUsage() async {
+        guard !hasFullAccess else { return }
+        let local = trialUsage.usedActions
+        guard let serverUsed = await TrialSyncService.sync(localUsed: local) else { return }
+        let reconciled = max(local, serverUsed)
+        if reconciled != trialUsage.usedActions {
+            trialUsage.usedActions = reconciled
+        }
+    }
+
+    func requestActivationForTrialLimit() {
+        trialAccessBlockedMessage = "Your free trial includes 5 imports or added folders. Activate Aurora to continue."
+        trialAccessBlockedToken = UUID()
+    }
+
+    func refreshLicenseStatus() {
+        licenseIsActivated = LicensingService.isActivated()
+        if licenseIsActivated {
+            trialAccessBlockedMessage = nil
+        }
+    }
+
     // MARK: - Volumes
     var mountedVolumes: [VolumeInfo] = []
     var activeVolume: VolumeInfo?
@@ -84,6 +164,7 @@ final class AppState {
     var sourceFileCountForDestinationCheck: Int = 0
     var allDestinationFilesAlreadyImported = false
     var sourceFilesImportStatusMessage: String?
+    private var isRefreshingEventJPGDayCaches = false
 
     // MARK: - Destination
     var destinationURL: URL?
@@ -137,6 +218,7 @@ final class AppState {
         didSet {
             guard let stats = totalStatsReport else {
                 StatsStorage.clear()
+                invalidateDashboardStatsCache()
                 return
             }
             // Save asynchronously so the MainActor is never blocked by JSON encoding
@@ -144,8 +226,11 @@ final class AppState {
             Task.detached(priority: .utility) {
                 StatsStorage.save(stats)
             }
+            invalidateDashboardStatsCache()
         }
     }
+    @ObservationIgnored private var dashboardTotalStatsReportCacheKey: String?
+    @ObservationIgnored private var dashboardTotalStatsReportCache: StatsReport?
 
     // MARK: - Finalized Events
 
@@ -186,6 +271,7 @@ final class AppState {
             } else {
                 UserDefaults.standard.removeObject(forKey: "activeEventFolderIndex")
             }
+            saveLibraryStateSnapshot()
         }
     }
 
@@ -196,8 +282,14 @@ final class AppState {
     var backgroundScanningBookmarkIndices: Set<Int> = []
     /// RAW file count per bookmark index, populated just before the scan starts.
     var backgroundScanFileCount: [Int: Int] = [:]
+    /// RAW files already processed by the current deep scan, when batch scanning is active.
+    var backgroundScanProcessedFileCount: [Int: Int] = [:]
     /// When the scan started per bookmark index, used to animate a progress estimate.
     var backgroundScanStartTimes: [Int: Date] = [:]
+    /// Transient Add Folder scan quality for UI copy: quick scan first, full scan second.
+    var backgroundScanQualities: [Int: EventStatsScanQuality] = [:]
+    /// Incremented when a per-event stats cache changes so global computed stats re-read cache files.
+    var eventStatsCacheRevision = 0
 
     /// All configured event folders, shown in the Events sidebar.
     /// The order is user-controlled via drag/drop; new events are inserted at the top.
@@ -286,10 +378,10 @@ final class AppState {
     }
 
     var photosByMonth: [(month: String, count: Int)] {
-        // Use the total stats report which contains photo capture dates from metadata
-        guard let report = totalStatsReport else {
+        // Use the dashboard report so Added Folders contribute alongside import history.
+        guard let report = dashboardStatsReport else {
             #if DEBUG
-            print("AppState.photosByMonth: No totalStatsReport available")
+            print("AppState.photosByMonth: No dashboardTotalStatsReport available")
             #endif
             return []
         }
@@ -366,11 +458,11 @@ final class AppState {
     }
 
     /// All years that have photo data, sorted descending (most recent first).
-    /// Derived from totalStatsReport.monthCounts keys ("MMM yyyy") + current year always included.
+    /// Derived from dashboardTotalStatsReport.monthCounts keys ("MMM yyyy") + current year always included.
     var availableYears: [Int] {
         let currentYear = Calendar.current.component(.year, from: Date())
         var years: Set<Int> = [currentYear]
-        if let report = totalStatsReport {
+        if let report = dashboardTotalStatsReport {
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM yyyy"
             for key in report.monthCounts.keys {
@@ -383,7 +475,7 @@ final class AppState {
     }
 
     /// Months Jan–Dec for a specific year.
-    /// Uses totalStatsReport.monthCounts (EXIF-based, unlimited accumulation).
+    /// Uses dashboardTotalStatsReport.monthCounts (EXIF-based, imports + Added Folders).
     /// Falls back to importHistory when no stats are available.
     func photosByYear(_ year: Int) -> [(label: String, count: Int)] {
         let calendar = Calendar.current
@@ -392,7 +484,7 @@ final class AppState {
         dateFormatter.dateFormat = "MMM yyyy"
 
         // Primary: EXIF-accumulated monthCounts — keys are "MMM yyyy" (e.g. "Feb 2026")
-        if let report = totalStatsReport, !report.monthCounts.isEmpty {
+        if let report = dashboardTotalStatsReport, !report.monthCounts.isEmpty {
             return (1...12).map { month in
                 var comps = DateComponents()
                 comps.year = year
@@ -458,6 +550,7 @@ final class AppState {
     private(set) var currentlyScanningIndex: Int? = nil
     /// Dedicated StatsRunner for the library scan queue (lazy — created on first use).
     private var libraryScanRunner: StatsRunner?
+    private var scanQueueMergeIntoTotals: Set<Int> = []
 
     /// Live results for the "Most photos per event" card.
     /// Stored in AppState so that navigating away and back never triggers a re-scan.
@@ -479,6 +572,7 @@ final class AppState {
             syncCachedCounts()
             syncManualDatesCount()
             syncFinalizedEventIDs()
+            syncTagsCount()
             if !isLoadingPersistedState {
                 syncEventSidebarTree()
                 saveEventFolderBookmarks()
@@ -509,6 +603,10 @@ final class AppState {
     var eventFolderCachedJPGCounts: [Int] = [] {
         didSet { saveCachedJPGCounts() }
     }
+    /// Last known JPG/JPEG day breakdown per folder — shown when disk is offline.
+    var eventFolderCachedJPGCountsByDay: [[String: Int]] = [] {
+        didSet { saveCachedJPGCountsByDay() }
+    }
     /// Resolved folder paths (last known) — used to detect if destination overlaps with an event folder.
     var eventFolderCachedPaths: [String] = [] {
         didSet { saveCachedPaths() }
@@ -527,6 +625,20 @@ final class AppState {
     var eventFolderBannerOffsets: [EventBannerOffset] = [] {
         didSet { saveBannerOffsets() }
     }
+    /// Tags per event folder (Studio, Sports, etc). Same count as eventFolderBookmarks.
+    var eventFolderTags: [[String]] = [] {
+        didSet { saveEventFolderTags() }
+    }
+
+    /// Selected tag filter for the Dashboard/Statistics page. nil = no tag filter.
+    var dashboardTagFilter: EventTag? = nil {
+        didSet { invalidateDashboardStatsCache() }
+    }
+    /// Selected year filter for the Dashboard/Statistics page. nil = no year filter.
+    /// Defaults to the current year rather than "All" — most users care about this year's work first.
+    var dashboardYearFilter: Int? = Calendar.current.component(.year, from: Date()) {
+        didSet { invalidateDashboardStatsCache() }
+    }
 
     // MARK: - Configuration
     /// RAW extensions across common camera systems.
@@ -539,6 +651,7 @@ final class AppState {
     // MARK: - Init
     init() {
         isLoadingPersistedState = true
+        trialUsage = TrialUsageStore.load()
         logEntries = SystemLogStore.loadAll()
 
         autoImport = UserDefaults.standard.bool(forKey: "autoImport")
@@ -583,6 +696,10 @@ final class AppState {
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
             eventFolderDisplayNames = decoded
         }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderTagsData"),
+           let decoded = try? PropertyListDecoder().decode([[String]].self, from: data) {
+            eventFolderTags = decoded
+        }
         // Load event folder peak counts (antes dos bookmarks)
         if let data = UserDefaults.standard.data(forKey: "eventFolderPeakRawCountsData"),
            let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
@@ -596,6 +713,10 @@ final class AppState {
         if let data = UserDefaults.standard.data(forKey: "eventFolderCachedJPGCountsData"),
            let decoded = try? PropertyListDecoder().decode([Int].self, from: data) {
             eventFolderCachedJPGCounts = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: "eventFolderCachedJPGCountsByDayData"),
+           let decoded = try? PropertyListDecoder().decode([[String: Int]].self, from: data) {
+            eventFolderCachedJPGCountsByDay = decoded
         }
         if let data = UserDefaults.standard.data(forKey: "eventFolderCachedPathsData"),
            let decoded = try? PropertyListDecoder().decode([String].self, from: data) {
@@ -652,6 +773,24 @@ final class AppState {
         syncCachedCounts()
         syncManualDatesCount()
         syncFinalizedEventIDs()
+
+        let legacySnapshot = makeLibraryStateSnapshot()
+        if let snapshot = LibraryStateStore.load(),
+           snapshot.bookmarkCount >= legacySnapshot.bookmarkCount {
+            applyLibraryStateSnapshot(snapshot)
+            syncDisplayNamesCount()
+            syncIsLibraryCount()
+            syncPeakCounts()
+            syncCachedCounts()
+            syncManualDatesCount()
+            syncFinalizedEventIDs()
+            print("AppState.init: Loaded library_state.json with \(eventFolderBookmarks.count) folders")
+        } else {
+            LibraryStateStore.createPreMigrationBackup(librarySnapshot: legacySnapshot, importHistory: importHistory)
+            LibraryStateStore.save(legacySnapshot)
+            print("AppState.init: Created library_state.json with \(legacySnapshot.bookmarkCount) folders")
+        }
+
         isLoadingPersistedState = false
         syncEventSidebarTree()
         syncEventFolderOrder()
@@ -750,6 +889,15 @@ final class AppState {
         }
     }
 
+    private func syncTagsCount() {
+        let n = eventFolderBookmarks.count
+        if eventFolderTags.count > n {
+            eventFolderTags = Array(eventFolderTags.prefix(n))
+        } else if eventFolderTags.count < n {
+            eventFolderTags += Array(repeating: [], count: n - eventFolderTags.count)
+        }
+    }
+
     private func syncPeakCounts() {
         let n = eventFolderBookmarks.count
         if eventFolderPeakRawCounts.count > n {
@@ -770,6 +918,11 @@ final class AppState {
             eventFolderCachedJPGCounts = Array(eventFolderCachedJPGCounts.prefix(n))
         } else if eventFolderCachedJPGCounts.count < n {
             eventFolderCachedJPGCounts += Array(repeating: -1, count: n - eventFolderCachedJPGCounts.count)
+        }
+        if eventFolderCachedJPGCountsByDay.count > n {
+            eventFolderCachedJPGCountsByDay = Array(eventFolderCachedJPGCountsByDay.prefix(n))
+        } else if eventFolderCachedJPGCountsByDay.count < n {
+            eventFolderCachedJPGCountsByDay += Array(repeating: [:], count: n - eventFolderCachedJPGCountsByDay.count)
         }
         if eventFolderCachedPaths.count > n {
             eventFolderCachedPaths = Array(eventFolderCachedPaths.prefix(n))
@@ -935,6 +1088,21 @@ final class AppState {
         }
     }
 
+    func sortRootEventSidebarByName() {
+        var nodes = eventSidebarNodes
+        sortSidebarNodesByName(&nodes)
+        eventSidebarNodes = nodes
+        syncEventFolderOrder()
+    }
+
+    func sortEventSidebarFolderByName(id: UUID) {
+        var nodes = eventSidebarNodes
+        if sortSidebarFolderChildrenByName(id: id, in: &nodes) {
+            eventSidebarNodes = nodes
+            syncEventFolderOrder()
+        }
+    }
+
     func moveEventSidebarItem(_ item: EventSidebarItemReference, intoFolder targetFolderID: UUID?) {
         if case .folder(let folderID) = item,
            let targetFolderID,
@@ -997,6 +1165,46 @@ final class AppState {
             }
         }
         return false
+    }
+
+    private func sortSidebarFolderChildrenByName(id: UUID, in nodes: inout [EventSidebarNode]) -> Bool {
+        for index in nodes.indices {
+            if nodes[index].kind == .folder && nodes[index].id == id {
+                sortSidebarNodesByName(&nodes[index].children)
+                return true
+            }
+            if sortSidebarFolderChildrenByName(id: id, in: &nodes[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func sortSidebarNodesByName(_ nodes: inout [EventSidebarNode]) {
+        nodes.sort { lhs, rhs in
+            if lhs.kind != rhs.kind { return lhs.kind == .folder }
+            let lhsName = sidebarDisplayName(for: lhs)
+            let rhsName = sidebarDisplayName(for: rhs)
+            let comparison = lhsName.localizedCaseInsensitiveCompare(rhsName)
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    private func sidebarDisplayName(for node: EventSidebarNode) -> String {
+        switch node.kind {
+        case .folder:
+            return node.name
+        case .event:
+            guard let index = node.eventIndex else { return "" }
+            let customName = index < eventFolderDisplayNames.count
+                ? eventFolderDisplayNames[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            if !customName.isEmpty { return customName }
+            let folderPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
+            if !folderPath.isEmpty { return URL(fileURLWithPath: folderPath).lastPathComponent }
+            return "Event \(index + 1)"
+        }
     }
 
     private func removeSidebarNode(_ item: EventSidebarItemReference, from nodes: inout [EventSidebarNode]) -> EventSidebarNode? {
@@ -1123,52 +1331,81 @@ final class AppState {
         let strings: [String] = eventFolderFinalizedEventID.map { $0?.uuidString ?? "" }
         guard let data = try? PropertyListEncoder().encode(strings) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderFinalizedEventIDData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveEventFolderOrder() {
         guard let data = try? PropertyListEncoder().encode(eventFolderOrder) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderOrderData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveEventSidebarNodes() {
         guard let data = try? PropertyListEncoder().encode(eventSidebarNodes) else { return }
         UserDefaults.standard.set(data, forKey: "eventSidebarNodesData")
+        saveLibraryStateSnapshot()
     }
 
     private func savePreviousCachedPaths() {
         guard let data = try? PropertyListEncoder().encode(eventFolderPreviousCachedPaths) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderPreviousCachedPathsData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveBannerImagePaths() {
         guard let data = try? PropertyListEncoder().encode(eventFolderBannerImagePaths) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderBannerImagePathsData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveBannerOffsets() {
         guard let data = try? PropertyListEncoder().encode(eventFolderBannerOffsets) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderBannerOffsetsData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveEventFolderBookmarks() {
         guard let data = try? PropertyListEncoder().encode(eventFolderBookmarks) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderBookmarksData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveEventFolderDisplayNames() {
         guard let data = try? PropertyListEncoder().encode(eventFolderDisplayNames) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderDisplayNamesData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveEventFolderIsLibrary() {
         guard !isLoadingPersistedState else { return }
         guard let data = try? PropertyListEncoder().encode(eventFolderIsLibrary) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderIsLibraryData")
+        saveLibraryStateSnapshot()
+    }
+
+    private func saveEventFolderTags() {
+        guard !isLoadingPersistedState else { return }
+        guard let data = try? PropertyListEncoder().encode(eventFolderTags) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderTagsData")
+        invalidateDashboardStatsCache()
+        saveLibraryStateSnapshot()
+    }
+
+    func tags(at index: Int) -> Set<EventTag> {
+        guard index >= 0, index < eventFolderTags.count else { return [] }
+        return Set(eventFolderTags[index].compactMap(EventTag.init(rawValue:)))
+    }
+
+    func setTags(_ tags: Set<EventTag>, at index: Int) {
+        guard index >= 0, index < eventFolderBookmarks.count else { return }
+        syncTagsCount()
+        eventFolderTags[index] = tags.map(\.rawValue).sorted()
     }
 
     private func saveEventFolderManualDates() {
         let values = eventFolderManualDates.map { $0?.timeIntervalSince1970 ?? -1 }
         UserDefaults.standard.set(values, forKey: "eventFolderManualDatesData")
+        saveLibraryStateSnapshot()
     }
 
     func manualDateForEvent(at index: Int) -> Date? {
@@ -1200,21 +1437,78 @@ final class AppState {
     private func saveEventFolderPeakRawCounts() {
         guard let data = try? PropertyListEncoder().encode(eventFolderPeakRawCounts) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderPeakRawCountsData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveCachedCounts() {
         guard let data = try? PropertyListEncoder().encode(eventFolderCachedCounts) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderCachedCountsData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveCachedJPGCounts() {
         guard let data = try? PropertyListEncoder().encode(eventFolderCachedJPGCounts) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderCachedJPGCountsData")
+        saveLibraryStateSnapshot()
+    }
+
+    private func saveCachedJPGCountsByDay() {
+        guard let data = try? PropertyListEncoder().encode(eventFolderCachedJPGCountsByDay) else { return }
+        UserDefaults.standard.set(data, forKey: "eventFolderCachedJPGCountsByDayData")
+        saveLibraryStateSnapshot()
     }
 
     private func saveCachedPaths() {
         guard let data = try? PropertyListEncoder().encode(eventFolderCachedPaths) else { return }
         UserDefaults.standard.set(data, forKey: "eventFolderCachedPathsData")
+        saveLibraryStateSnapshot()
+    }
+
+    private func saveLibraryStateSnapshot() {
+        guard !isLoadingPersistedState else { return }
+        LibraryStateStore.save(makeLibraryStateSnapshot())
+    }
+
+    private func makeLibraryStateSnapshot() -> LibraryStateSnapshot {
+        LibraryStateSnapshot(
+            eventFolderBookmarks: eventFolderBookmarks,
+            eventFolderDisplayNames: eventFolderDisplayNames,
+            eventFolderIsLibrary: eventFolderIsLibrary,
+            eventFolderManualDates: eventFolderManualDates,
+            eventFolderPeakRawCounts: eventFolderPeakRawCounts,
+            eventFolderCachedCounts: eventFolderCachedCounts,
+            eventFolderCachedJPGCounts: eventFolderCachedJPGCounts,
+            eventFolderCachedJPGCountsByDay: eventFolderCachedJPGCountsByDay,
+            eventFolderCachedPaths: eventFolderCachedPaths,
+            eventFolderPreviousCachedPaths: eventFolderPreviousCachedPaths,
+            eventFolderBannerImagePaths: eventFolderBannerImagePaths,
+            eventFolderBannerOffsets: eventFolderBannerOffsets,
+            eventFolderFinalizedEventID: eventFolderFinalizedEventID,
+            eventFolderOrder: eventFolderOrder,
+            eventSidebarNodes: eventSidebarNodes,
+            activeEventFolderIndex: activeEventFolderIndex,
+            eventFolderTags: eventFolderTags
+        )
+    }
+
+    private func applyLibraryStateSnapshot(_ snapshot: LibraryStateSnapshot) {
+        eventFolderDisplayNames = snapshot.eventFolderDisplayNames
+        eventFolderTags = snapshot.eventFolderTags ?? Array(repeating: [], count: snapshot.eventFolderBookmarks.count)
+        eventFolderPeakRawCounts = snapshot.eventFolderPeakRawCounts
+        eventFolderCachedCounts = snapshot.eventFolderCachedCounts
+        eventFolderCachedJPGCounts = snapshot.eventFolderCachedJPGCounts
+        eventFolderCachedJPGCountsByDay = snapshot.eventFolderCachedJPGCountsByDay ?? Array(repeating: [:], count: snapshot.eventFolderBookmarks.count)
+        eventFolderCachedPaths = snapshot.eventFolderCachedPaths
+        eventFolderPreviousCachedPaths = snapshot.eventFolderPreviousCachedPaths
+        eventFolderBannerImagePaths = snapshot.eventFolderBannerImagePaths
+        eventFolderBannerOffsets = snapshot.eventFolderBannerOffsets
+        eventFolderManualDates = snapshot.eventFolderManualDates
+        eventSidebarNodes = snapshot.eventSidebarNodes
+        eventFolderIsLibrary = snapshot.eventFolderIsLibrary
+        eventFolderBookmarks = snapshot.eventFolderBookmarks
+        eventFolderFinalizedEventID = snapshot.eventFolderFinalizedEventID
+        eventFolderOrder = snapshot.eventFolderOrder
+        activeEventFolderIndex = snapshot.activeEventFolderIndex
     }
 
     private func normalizePath(_ path: String) -> String {
@@ -1232,6 +1526,155 @@ final class AppState {
         if index < eventFolderCachedPaths.count {
             eventFolderCachedPaths[index] = path
         }
+    }
+
+    func updateEventFolderJPGDayCache(at index: Int, countsByDay: [String: Int]) {
+        guard index >= 0, index < eventFolderCachedJPGCountsByDay.count else { return }
+        eventFolderCachedJPGCountsByDay[index] = countsByDay
+        if index < eventFolderCachedJPGCounts.count {
+            eventFolderCachedJPGCounts[index] = countsByDay.reduce(0) { $0 + $1.value }
+        }
+    }
+
+    func refreshJPGDayCacheForImportedDestination(_ destinationPath: String) {
+        guard let index = eventFolderIndex(containingImportedDestination: destinationPath),
+              index < eventFolderCachedPaths.count else { return }
+        guard index >= eventFolderFinalizedEventID.count || eventFolderFinalizedEventID[index] == nil else { return }
+
+        let eventPath = eventFolderCachedPaths[index].isEmpty ? destinationPath : eventFolderCachedPaths[index]
+        guard !eventPath.isEmpty else { return }
+        let url = URL(fileURLWithPath: eventPath)
+
+        Task {
+            let counts = await Task.detached(priority: .background) {
+                Self.countJPGFilesByDay(at: url)
+            }.value
+            guard !counts.isEmpty else {
+                log("No JPG day cache update after import: no JPG files found for event")
+                return
+            }
+            updateEventFolderJPGDayCache(at: index, countsByDay: counts)
+            EventStatsCache.saveJPGCountsByDay(counts, forPath: eventPath)
+            log("Updated JPG day cache after import: \(counts.reduce(0) { $0 + $1.value }) JPG files across \(counts.count) day\(counts.count == 1 ? "" : "s")")
+        }
+    }
+
+    func refreshReachableEventJPGDayCaches(reason: String) {
+        guard !isRefreshingEventJPGDayCaches else { return }
+        guard canRefreshEventJPGDayCaches else {
+            log("Skipped automatic JPG day refresh while import state is \(importState.label)")
+            return
+        }
+        syncCachedCounts()
+        syncFinalizedEventIDs()
+
+        let items = eventFolderCachedPaths.enumerated().compactMap { index, path -> (index: Int, path: String)? in
+            guard index < eventFolderFinalizedEventID.count, eventFolderFinalizedEventID[index] == nil else { return nil }
+            guard !path.isEmpty else { return nil }
+            return (index, path)
+        }
+        guard !items.isEmpty else { return }
+
+        isRefreshingEventJPGDayCaches = true
+        Task {
+            var updates: [(index: Int, path: String, counts: [String: Int])] = []
+            for item in items {
+                let url = URL(fileURLWithPath: item.path)
+                let counts = await Task.detached(priority: .background) {
+                    Self.countJPGFilesByDay(at: url)
+                }.value
+                guard !counts.isEmpty else { continue }
+                updates.append((item.index, item.path, counts))
+            }
+
+            for update in updates {
+                updateEventFolderJPGDayCache(at: update.index, countsByDay: update.counts)
+                EventStatsCache.saveJPGCountsByDay(update.counts, forPath: update.path)
+            }
+
+            isRefreshingEventJPGDayCaches = false
+            if !updates.isEmpty {
+                log("Updated JPG day cache for \(updates.count) event folder\(updates.count == 1 ? "" : "s") (\(reason))")
+            }
+        }
+    }
+
+    private var canRefreshEventJPGDayCaches: Bool {
+        switch importState {
+        case .idle, .done, .error:
+            return true
+        case .scanning, .importing, .paused, .verifying, .ejecting, .ejectingDone, .generatingStats:
+            return false
+        }
+    }
+
+    nonisolated static func countJPGFilesByDay(at url: URL) -> [String: Int] {
+        let fm = FileManager.default
+        guard (try? url.checkResourceIsReachable()) ?? false else { return [:] }
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [:] }
+
+        var counts: [String: Int] = [:]
+        for case let fileURL as URL in enumerator {
+            let ext = fileURL.pathExtension.lowercased()
+            guard ext == "jpg" || ext == "jpeg" else { continue }
+            if let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]), values.isRegularFile == false {
+                continue
+            }
+            guard let day = dayKeyForJPGFile(fileURL) else { continue }
+            counts[day, default: 0] += 1
+        }
+        return counts
+    }
+
+    nonisolated private static func dayKeyForJPGFile(_ url: URL) -> String? {
+        if let pathDay = dayKeyFromPath(url.path) { return pathDay }
+
+        let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        guard let date = values?.creationDate ?? values?.contentModificationDate else { return nil }
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    nonisolated private static func dayKeyFromPath(_ path: String) -> String? {
+        let tokens = path
+            .split { char in char == "/" || char == "_" || char == " " }
+            .map(String.init)
+
+        for token in tokens.reversed() {
+            let normalized = token.replacingOccurrences(of: ".", with: "-")
+            let parts = normalized.split(separator: "-").map(String.init)
+            guard parts.count == 3 else { continue }
+
+            if parts[0].count == 4,
+               let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]),
+               isValidDay(year: year, month: month, day: day) {
+                return String(format: "%04d-%02d-%02d", year, month, day)
+            }
+
+            if parts[2].count == 4,
+               let day = Int(parts[0]), let month = Int(parts[1]), let year = Int(parts[2]),
+               isValidDay(year: year, month: month, day: day) {
+                return String(format: "%04d-%02d-%02d", year, month, day)
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func isValidDay(year: Int, month: Int, day: Int) -> Bool {
+        guard (1900...2200).contains(year), (1...12).contains(month), (1...31).contains(day) else { return false }
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.year = year
+        components.month = month
+        components.day = day
+        return components.date != nil
     }
 
     /// Recounts RAW and JPG/JPEG files for open, reachable event folders.
@@ -1358,23 +1801,75 @@ final class AppState {
         return (true, rawCount, jpgCount)
     }
 
+    private struct NormalizedImportHistoryEntry {
+        let normalizedDestination: String
+        let sourceNameKey: String
+        let destinationNameKey: String
+        let componentKeys: Set<String>
+        let fileCount: Int
+        let totalBytes: Int64
+        let date: Date
+    }
+
+    // Rebuilt lazily and invalidated by count — importHistory is effectively an
+    // append-only log, so a count check is enough to know when to recompute.
+    // `importStats` used to redo locale-aware Unicode folding (`normalizedMatchKey`)
+    // for every history entry on every single call. That's fine for a one-off
+    // call, but `gatherInputs`-style loops (TopEventsPanel/PhotosPerEventChart's
+    // EventAggregator, LatestEventsPanel) call this once per event in the whole
+    // library — for a library with hundreds of imports across dozens of events,
+    // that's tens of thousands of foldings synchronously on the main actor,
+    // which is exactly the multi-second Dashboard-scroll freeze seen on a large
+    // real library (small test libraries never showed it — the O(events ×
+    // history) cost was negligible at that scale).
+    private var cachedNormalizedImportHistory: (count: Int, entries: [NormalizedImportHistoryEntry])?
+
+    private func normalizedImportHistoryEntries() -> [NormalizedImportHistoryEntry] {
+        if let cached = cachedNormalizedImportHistory, cached.count == importHistory.count {
+            return cached.entries
+        }
+        let entries = importHistory.map { entry -> NormalizedImportHistoryEntry in
+            let destination = normalizePath(entry.destinationPath)
+            let componentKeys = Set(URL(fileURLWithPath: destination).pathComponents.map(normalizedMatchKey))
+            return NormalizedImportHistoryEntry(
+                normalizedDestination: destination,
+                sourceNameKey: normalizedMatchKey(entry.sourceName),
+                destinationNameKey: normalizedMatchKey(entry.destinationName),
+                componentKeys: componentKeys,
+                fileCount: entry.fileCount,
+                totalBytes: entry.totalBytes,
+                date: entry.date
+            )
+        }
+        cachedNormalizedImportHistory = (importHistory.count, entries)
+        return entries
+    }
+
     /// Returns aggregated import stats for a specific event folder path.
     /// Matches all ImportHistoryEntry records where destinationPath equals or is inside the event folder.
     func importStats(
         forEventPath eventPath: String,
-        alternatePaths: [String] = []
+        alternatePaths: [String] = [],
+        eventName: String? = nil
     ) -> (photoCount: Int, totalBytes: Int64, sessionCount: Int, firstDate: Date?, lastDate: Date?)? {
         let candidatePaths = ([eventPath] + alternatePaths)
             .map(normalizePath)
             .filter { !$0.isEmpty }
         let uniquePaths = Array(Set(candidatePaths))
-        guard !uniquePaths.isEmpty else { return nil }
+        let eventNameKey = normalizedMatchKey(eventName ?? "")
+        guard !uniquePaths.isEmpty || !eventNameKey.isEmpty else { return nil }
 
-        let matching = importHistory.filter { entry in
-            let destination = normalizePath(entry.destinationPath)
-            return uniquePaths.contains { path in
-                destination == path || destination.hasPrefix(path + "/")
+        let matching = normalizedImportHistoryEntries().filter { entry in
+            if uniquePaths.contains(where: { path in
+                pathsOverlap(entry.normalizedDestination, path)
+            }) {
+                return true
             }
+
+            guard !eventNameKey.isEmpty else { return false }
+            return entry.sourceNameKey == eventNameKey
+                || entry.destinationNameKey == eventNameKey
+                || entry.componentKeys.contains(eventNameKey)
         }
         guard !matching.isEmpty else { return nil }
         let photoCount = matching.reduce(0) { $0 + $1.fileCount }
@@ -1393,7 +1888,32 @@ final class AppState {
         guard index >= 0, index < eventFolderBookmarks.count else { return nil }
         let currentPath = index < eventFolderCachedPaths.count ? eventFolderCachedPaths[index] : ""
         let previousPath = index < eventFolderPreviousCachedPaths.count ? eventFolderPreviousCachedPaths[index] : ""
-        return importStats(forEventPath: currentPath, alternatePaths: [previousPath])
+        return importStats(
+            forEventPath: currentPath,
+            alternatePaths: [previousPath],
+            eventName: displayNameForEvent(at: index) ?? URL(fileURLWithPath: currentPath).lastPathComponent
+        )
+    }
+
+    private func pathsOverlap(_ lhs: String, _ rhs: String) -> Bool {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+        return lhs == rhs
+            || lhs.hasPrefix(rhs + "/")
+            || rhs.hasPrefix(lhs + "/")
+    }
+
+    private func destinationPath(_ path: String, containsComponentMatching key: String) -> Bool {
+        guard !path.isEmpty, !key.isEmpty else { return false }
+        return URL(fileURLWithPath: path).pathComponents.contains { component in
+            normalizedMatchKey(component) == key
+        }
+    }
+
+    private func normalizedMatchKey(_ value: String) -> String {
+        value
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     func mergeImportedStatsIntoEventCache(_ importedStats: StatsReport, destinationPath: String) {
@@ -1450,7 +1970,7 @@ final class AppState {
     }
 
     @discardableResult
-    func addEventFolder(bookmark: Data, displayName: String? = nil) -> Int {
+    func addEventFolder(bookmark: Data, displayName: String? = nil, selectAsImportDestination: Bool = true) -> Int {
         eventFolderBookmarks.append(bookmark)
         let newIndex = eventFolderBookmarks.count - 1
         let trimmedName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1465,19 +1985,24 @@ final class AppState {
         // Resolve immediately so the cached path is populated for this session
         // (otherwise EventStatsView thinks the folder is unreachable).
         refreshEventFolderCachedPaths()
-        if newIndex < eventFolderCachedPaths.count,
+        if selectAsImportDestination,
+           newIndex < eventFolderCachedPaths.count,
            !eventFolderCachedPaths[newIndex].isEmpty {
             let url = URL(fileURLWithPath: eventFolderCachedPaths[newIndex])
             destinationURL = url
             destinationBookmarkData = BookmarkManager.saveBookmark(for: url)
         }
-        refreshEventFolderMediaCounts()
+        if selectAsImportDestination {
+            refreshEventFolderMediaCounts()
+        }
         return newIndex
     }
 
-    func addLibraryFolder(url: URL) {
-        guard let bookmark = BookmarkManager.saveBookmark(for: url) else { return }
-        let index = addEventFolder(bookmark: bookmark, displayName: url.lastPathComponent)
+    @discardableResult
+    func addLibraryFolder(url: URL) -> Bool {
+        guard let bookmark = BookmarkManager.saveBookmark(for: url) else { return false }
+        guard consumeTrialAction("added folder") else { return false }
+        let index = addEventFolder(bookmark: bookmark, displayName: url.lastPathComponent, selectAsImportDestination: false)
         if index < eventFolderIsLibrary.count {
             eventFolderIsLibrary[index] = true
         }
@@ -1485,6 +2010,46 @@ final class AppState {
             scanQueue.append(index)
         }
         drainScanQueue()
+        return true
+    }
+
+    func scanEventFolderIfRawFilesExist(at index: Int, mergeIntoGlobalTotals: Bool = false) {
+        guard index >= 0, index < eventFolderCachedPaths.count else { return }
+        let path = eventFolderCachedPaths[index]
+        guard !path.isEmpty else { return }
+        guard !scanQueue.contains(index), currentlyScanningIndex != index else { return }
+
+        let url = URL(fileURLWithPath: path)
+        Task { [weak self] in
+            guard let self else { return }
+            let rawCount = await Task.detached { [extensions = self.supportedExtensions] in
+                VolumeWatcher.countRawFiles(at: url, extensions: extensions)
+            }.value
+
+            guard rawCount > 0 else {
+                self.log("Event folder has no existing RAW files: \(url.lastPathComponent)")
+                return
+            }
+
+            let report = StatsReport.instantFolderScan(fileCount: rawCount)
+            let now = Date()
+            EventStatsCache.save(report, forPath: path, scanDate: now, rawFileCountAtScan: rawCount, scanQuality: .quick)
+            self.noteEventStatsCacheChanged()
+            self.updateEventFolderCache(at: index, count: rawCount, path: path)
+            self.setEventFolderPeakIfHigher(at: index, count: rawCount)
+            self.backgroundScanFileCount[index] = rawCount
+            self.backgroundScanProcessedFileCount[index] = 0
+            self.backgroundScanQualities[index] = .quick
+            self.log("Event folder instant scan complete: \(url.lastPathComponent) — \(rawCount) photos")
+
+            if !self.scanQueue.contains(index), self.currentlyScanningIndex != index {
+                self.scanQueue.append(index)
+            }
+            if mergeIntoGlobalTotals {
+                self.scanQueueMergeIntoTotals.insert(index)
+            }
+            self.drainScanQueue()
+        }
     }
 
     private func drainScanQueue() {
@@ -1508,16 +2073,77 @@ final class AppState {
             return
         }
         let url = URL(fileURLWithPath: path)
+        backgroundScanningBookmarkIndices.insert(index)
+        backgroundScanStartTimes[index] = Date()
+        backgroundScanQualities[index] = .quick
 
         Task { [weak self] in
             guard let self else { return }
-            let result = await runner.runStatsForEventFolder(at: url)
+            let rawCount = await Task.detached { [extensions = self.supportedExtensions] in
+                VolumeWatcher.countRawFiles(at: url, extensions: extensions)
+            }.value
+            if rawCount > 0 {
+                let r = StatsReport.instantFolderScan(fileCount: rawCount)
+                let now = Date()
+                EventStatsCache.save(r, forPath: path, scanDate: now, rawFileCountAtScan: rawCount, scanQuality: .quick)
+                noteEventStatsCacheChanged()
+                updateEventFolderCache(at: index, count: rawCount, path: path)
+                setEventFolderPeakIfHigher(at: index, count: rawCount)
+                log("Library folder instant scan complete: \(url.lastPathComponent) — \(rawCount) photos")
+            } else {
+                log("Library folder instant scan found no RAW files: \(url.lastPathComponent)", level: .warning)
+                backgroundScanningBookmarkIndices.remove(index)
+                backgroundScanFileCount.removeValue(forKey: index)
+                backgroundScanProcessedFileCount.removeValue(forKey: index)
+                backgroundScanStartTimes.removeValue(forKey: index)
+                backgroundScanQualities.removeValue(forKey: index)
+                currentlyScanningIndex = nil
+                drainScanQueue()
+                return
+            }
+
+            backgroundScanQualities[index] = .full
+            if rawCount > 0 {
+                backgroundScanFileCount[index] = rawCount
+                backgroundScanProcessedFileCount[index] = 0
+            }
+            backgroundScanStartTimes[index] = Date()
+            let result = await runner.runStatsForEventFolderInBatches(at: url, quality: .full) { processed, total, partialReport in
+                self.backgroundScanProcessedFileCount[index] = processed
+                self.backgroundScanFileCount[index] = total
+                if let partialReport, partialReport.totalFilesAnalyzed > 0 {
+                    let now = Date()
+                    EventStatsCache.save(partialReport, forPath: path, scanDate: now, rawFileCountAtScan: partialReport.totalFilesAnalyzed, scanQuality: .partial)
+                    self.noteEventStatsCacheChanged()
+                    self.updateEventFolderCache(at: index, count: max(total, partialReport.totalFilesAnalyzed), path: path)
+                    self.setEventFolderPeakIfHigher(at: index, count: max(total, partialReport.totalFilesAnalyzed))
+                }
+            }
+            backgroundScanFileCount.removeValue(forKey: index)
+            backgroundScanProcessedFileCount.removeValue(forKey: index)
+            backgroundScanStartTimes.removeValue(forKey: index)
+            backgroundScanQualities.removeValue(forKey: index)
+            backgroundScanningBookmarkIndices.remove(index)
             if let r = result, r.totalFilesAnalyzed > 0 {
                 let now = Date()
-                EventStatsCache.save(r, forPath: path, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
+                EventStatsCache.save(r, forPath: path, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed, scanQuality: .full)
+                noteEventStatsCacheChanged()
                 updateEventFolderCache(at: index, count: r.totalFilesAnalyzed, path: path)
                 setEventFolderPeakIfHigher(at: index, count: r.totalFilesAnalyzed)
+                if scanQueueMergeIntoTotals.remove(index) != nil {
+                    let existing = totalStatsReport
+                    Task.detached(priority: .utility) {
+                        let combined = StatsReport.combine(existing, r)
+                        await MainActor.run { self.totalStatsReport = combined }
+                    }
+                }
                 log("Library folder scan complete: \(url.lastPathComponent) — \(r.totalFilesAnalyzed) photos")
+                Task.detached(priority: .utility) {
+                    _ = EventGalleryStore.buildGallery(forEventPath: path)
+                }
+            } else {
+                scanQueueMergeIntoTotals.remove(index)
+                log("Library folder deep scan failed or timed out: \(url.lastPathComponent)", level: .warning)
             }
             currentlyScanningIndex = nil
             drainScanQueue()
@@ -1529,6 +2155,387 @@ final class AppState {
         return eventFolderIsLibrary[index]
     }
 
+    var dashboardTotalStatsReport: StatsReport? {
+        let cacheKey = dashboardTotalStatsReportKey
+        if dashboardTotalStatsReportCacheKey == cacheKey {
+            return dashboardTotalStatsReportCache
+        }
+
+        // Synchronous fallback for callers that read this without prewarming first
+        // (see `prewarmDashboardTotalStatsReport()`) — correct, but on a cache miss
+        // this does up to ~6 `EventStatsCache.load` disk reads *per event/folder in
+        // the whole library*, all on the main actor. Fine for a handful of events;
+        // a real multi-second hang for a large production library.
+        let report = buildDashboardTotalStatsReport()
+        dashboardTotalStatsReportCacheKey = cacheKey
+        dashboardTotalStatsReportCache = report
+        return report
+    }
+
+    /// Precomputes `dashboardTotalStatsReport` off the main thread. Call this
+    /// before anything that touches the getter from a hot, per-event loop (e.g.
+    /// Dashboard building one card per event) so that by the time it's actually
+    /// read synchronously, the cache is already warm and the getter above just
+    /// returns the cached value instead of redoing the full library-wide scan.
+    /// No-ops if the cache is already warm for the current key.
+    func prewarmDashboardTotalStatsReport() async {
+        let cacheKey = dashboardTotalStatsReportKey
+        guard dashboardTotalStatsReportCacheKey != cacheKey else { return }
+        let inputs = DashboardStatsAggregationInputs(
+            eventFolderCachedPaths: eventFolderCachedPaths,
+            eventFolderPreviousCachedPaths: eventFolderPreviousCachedPaths,
+            eventFolderIsLibrary: eventFolderIsLibrary,
+            totalStatsReport: totalStatsReport
+        )
+        let report = await Task.detached(priority: .userInitiated) {
+            Self.aggregateDashboardTotalStatsReport(inputs: inputs)
+        }.value
+        // The key may have changed while we were computing (another scan finished
+        // mid-flight) — only cache this result if it's still the answer for the
+        // current key, otherwise let the next prewarm/read redo it.
+        guard dashboardTotalStatsReportKey == cacheKey else { return }
+        dashboardTotalStatsReportCacheKey = cacheKey
+        dashboardTotalStatsReportCache = report
+    }
+
+    private var dashboardTotalStatsReportKey: String {
+        let totalKey = totalStatsReport.map { "\($0.totalFilesAnalyzed):\($0.totalBytes):\($0.captureTimestampsByDay.count)" } ?? "none"
+        let currentPaths = eventFolderCachedPaths.joined(separator: "\u{1f}")
+        let previousPaths = eventFolderPreviousCachedPaths.joined(separator: "\u{1f}")
+        let libraryFlags = eventFolderIsLibrary.map { $0 ? "1" : "0" }.joined()
+        return "\(eventStatsCacheRevision)|\(totalKey)|\(currentPaths)|\(previousPaths)|\(libraryFlags)"
+    }
+
+    private func invalidateDashboardStatsCache() {
+        dashboardTotalStatsReportCacheKey = nil
+        dashboardTotalStatsReportCache = nil
+    }
+
+    private func buildDashboardTotalStatsReport() -> StatsReport? {
+        Self.aggregateDashboardTotalStatsReport(inputs: DashboardStatsAggregationInputs(
+            eventFolderCachedPaths: eventFolderCachedPaths,
+            eventFolderPreviousCachedPaths: eventFolderPreviousCachedPaths,
+            eventFolderIsLibrary: eventFolderIsLibrary,
+            totalStatsReport: totalStatsReport
+        ))
+    }
+
+    /// Plain-value snapshot of everything `aggregateDashboardTotalStatsReport`
+    /// needs, gathered from `AppState` (main-actor-only) so the actual expensive
+    /// aggregation below can run `nonisolated` — i.e. off the main thread, via
+    /// `prewarmDashboardTotalStatsReport()`.
+    private struct DashboardStatsAggregationInputs {
+        let eventFolderCachedPaths: [String]
+        let eventFolderPreviousCachedPaths: [String]
+        let eventFolderIsLibrary: [Bool]
+        let totalStatsReport: StatsReport?
+
+        func isLibraryFolder(at index: Int) -> Bool {
+            index >= 0 && index < eventFolderIsLibrary.count && eventFolderIsLibrary[index]
+        }
+    }
+
+    /// This is the expensive part: up to ~6 `EventStatsCache.load` disk reads (plus
+    /// `EventRawMetadataStore` lookups) *per event/folder in the library*. Kept
+    /// `nonisolated`/`static` — touching only `inputs` and non-isolated stores — so
+    /// it can safely run inside a background `Task.detached`.
+    nonisolated private static func aggregateDashboardTotalStatsReport(inputs: DashboardStatsAggregationInputs) -> StatsReport? {
+        let combinedWithLibraryFolders = inputs.eventFolderCachedPaths.enumerated().reduce(inputs.totalStatsReport) { combined, entry in
+            let (index, path) = entry
+            guard inputs.isLibraryFolder(at: index),
+                  !path.isEmpty,
+                  let report = EventStatsCache.load(forPath: path)?.report,
+                  report.totalFilesAnalyzed > 0 else {
+                return combined
+            }
+            return StatsReport.combine(combined, report)
+        }
+
+        guard var report = combinedWithLibraryFolders else { return nil }
+
+        // Some production totals predate per-event deep EXIF refreshes. In that
+        // case the event page can know about a camera/lens from its cache while
+        // the global totals do not. Merge only missing ranking keys from normal
+        // event caches so Top Cameras/Lenses stay complete without double-counting
+        // photos, bytes, monthly totals, or existing camera/lens counts.
+        for (index, path) in inputs.eventFolderCachedPaths.enumerated() where !inputs.isLibraryFolder(at: index) && !path.isEmpty {
+            if let cached = EventStatsCache.load(forPath: path)?.report {
+                report.mergeMissingRankingCounts(from: cached)
+            }
+            if let rawMetadataReport = EventRawMetadataStore.cameraMetadataReport(forEventPathPrefix: path) {
+                report.mergeMissingRankingCounts(from: rawMetadataReport)
+            }
+            if index < inputs.eventFolderPreviousCachedPaths.count {
+                let previousPath = inputs.eventFolderPreviousCachedPaths[index]
+                if !previousPath.isEmpty,
+                   let cached = EventStatsCache.load(forPath: previousPath)?.report {
+                    report.mergeMissingRankingCounts(from: cached)
+                }
+                if !previousPath.isEmpty,
+                   let rawMetadataReport = EventRawMetadataStore.cameraMetadataReport(forEventPathPrefix: previousPath) {
+                    report.mergeMissingRankingCounts(from: rawMetadataReport)
+                }
+            }
+        }
+
+        // Active Days depends on the per-folder/event EXIF cache. Totals can already
+        // contain some capture days while still missing others, so top up from every
+        // cache and keep the most complete timestamp list for each day.
+        for (index, path) in inputs.eventFolderCachedPaths.enumerated() {
+            if !path.isEmpty,
+               let cached = EventStatsCache.load(forPath: path)?.report {
+                report.mergeBestCaptureDays(from: cached)
+            }
+            if index < inputs.eventFolderPreviousCachedPaths.count {
+                let previousPath = inputs.eventFolderPreviousCachedPaths[index]
+                if !previousPath.isEmpty,
+                   let cached = EventStatsCache.load(forPath: previousPath)?.report {
+                    report.mergeBestCaptureDays(from: cached)
+                }
+            }
+        }
+
+        return report
+    }
+
+    /// Like `dashboardTotalStatsReport`, but recombined from only the events that match
+    /// the active `dashboardTagFilter`/`dashboardYearFilter`. When no filter is active this
+    /// returns the same cached value as `dashboardTotalStatsReport` (no extra cost).
+    var dashboardStatsReport: StatsReport? {
+        statsReport(forTag: dashboardTagFilter, year: dashboardYearFilter)
+    }
+
+    /// Same combine-by-tag-and-year logic as `dashboardStatsReport`, but parameterized
+    /// explicitly instead of reading the page-wide dashboard filter. Used by Compare to
+    /// build one combined report per tag without touching `dashboardTagFilter`.
+    ///
+    /// Reads a shared cache first (see `prewarmStatsReport(forTag:year:)`) —
+    /// without it, this used to redo a synchronous `EventStatsCache.load` disk
+    /// read *per event matching the filter* on every single call, and it's read
+    /// directly from several view bodies (GeneralStatsGrid, PhotoStatsGrid,
+    /// StatisticsView) whenever a tag/year filter is active on the Dashboard.
+    func statsReport(forTag tag: EventTag?, year: Int?) -> StatsReport? {
+        guard tag != nil || year != nil else {
+            return dashboardTotalStatsReport
+        }
+        let key = statsReportCacheKey(tag: tag, year: year)
+        if let cached = Self.statsReportCacheLock.withLock({ Self.statsReportCache[key] }) {
+            return cached
+        }
+        let result = Self.combineEventStatsReports(inputs: gatherStatsReportInputs(tag: tag), year: year)
+        Self.statsReportCacheLock.withLock { Self.statsReportCache[key] = result }
+        return result
+    }
+
+    /// Precomputes and caches `statsReport(forTag:year:)`'s result off the main
+    /// thread. Call this from a `.task(id:)` in any view that reads
+    /// `dashboardStatsReport`/`statsReport(forTag:year:)` from its `body`.
+    func prewarmStatsReport(forTag tag: EventTag?, year: Int?) async {
+        guard tag != nil || year != nil else {
+            await prewarmDashboardTotalStatsReport()
+            return
+        }
+        let key = statsReportCacheKey(tag: tag, year: year)
+        guard Self.statsReportCacheLock.withLock({ Self.statsReportCache[key] }) == nil else { return }
+        let inputs = gatherStatsReportInputs(tag: tag)
+        let result = await Task.detached(priority: .userInitiated) {
+            Self.combineEventStatsReports(inputs: inputs, year: year)
+        }.value
+        Self.statsReportCacheLock.withLock { Self.statsReportCache[key] = result }
+    }
+
+    private func statsReportCacheKey(tag: EventTag?, year: Int?) -> String {
+        let paths = eventFolderCachedPaths.joined(separator: "\u{1f}")
+        let previousPaths = eventFolderPreviousCachedPaths.joined(separator: "\u{1f}")
+        return "\(eventStatsCacheRevision)|\(paths)|\(previousPaths)|\(tag?.rawValue ?? "-")|\(year.map(String.init) ?? "-")"
+    }
+
+    private static let statsReportCacheLock = NSLock()
+    private static var statsReportCache: [String: StatsReport?] = [:]
+
+    /// Cheap (main-actor, no disk I/O) per-event inputs for `combineEventStatsReports`.
+    private struct PendingStatsReportInput {
+        let currentPath: String
+        let previousPath: String
+        let finalizedSnapshot: StatsReport?
+    }
+
+    private func gatherStatsReportInputs(tag: EventTag?) -> [PendingStatsReportInput] {
+        uniqueImportDestinations.compactMap { destination -> PendingStatsReportInput? in
+            if let tag, !tags(at: destination.bookmarkIndex).contains(tag) { return nil }
+            let currentPath = destination.bookmarkIndex < eventFolderCachedPaths.count
+                ? eventFolderCachedPaths[destination.bookmarkIndex] : ""
+            let previousPath = destination.bookmarkIndex < eventFolderPreviousCachedPaths.count
+                ? eventFolderPreviousCachedPaths[destination.bookmarkIndex] : ""
+            return PendingStatsReportInput(
+                currentPath: currentPath,
+                previousPath: previousPath,
+                finalizedSnapshot: finalizedEvent(forBookmarkIndex: destination.bookmarkIndex)?.snapshot
+            )
+        }
+    }
+
+    /// The expensive step — up to 2 `EventStatsCache.load` disk reads per event.
+    /// `nonisolated`/`static` so it can run inside a background `Task.detached`.
+    nonisolated private static func combineEventStatsReports(inputs: [PendingStatsReportInput], year: Int?) -> StatsReport? {
+        var combined: StatsReport?
+        for input in inputs {
+            let liveReport: StatsReport? = {
+                if !input.currentPath.isEmpty,
+                   let report = EventStatsCache.load(forPath: input.currentPath)?.report,
+                   report.totalFilesAnalyzed > 0 {
+                    return report
+                }
+                if !input.previousPath.isEmpty,
+                   let report = EventStatsCache.load(forPath: input.previousPath)?.report,
+                   report.totalFilesAnalyzed > 0 {
+                    return report
+                }
+                return nil
+            }()
+
+            let report: StatsReport?
+            if let finalizedSnapshot = input.finalizedSnapshot {
+                report = (liveReport?.totalBytes ?? 0) > finalizedSnapshot.totalBytes ? liveReport : finalizedSnapshot
+            } else {
+                report = liveReport
+            }
+
+            guard let report else { continue }
+            if let year, (report.yearCounts[String(year)] ?? 0) <= 0 { continue }
+            combined = StatsReport.combine(combined, report)
+        }
+        return combined
+    }
+
+    /// `importHistory` restricted to entries that belong to an event matching the active
+    /// `dashboardTagFilter`/`dashboardYearFilter`. Used as a fallback data source (e.g. when
+    /// an event has no EXIF capture-day data yet) so that fallback never silently ignores
+    /// the active filter and shows every event's import days instead.
+    var filteredImportHistory: [ImportHistoryEntry] {
+        guard dashboardTagFilter != nil || dashboardYearFilter != nil else { return importHistory }
+        let destinations = uniqueImportDestinations.map { (bookmarkIndex: $0.bookmarkIndex, path: normalizePath($0.path)) }
+        return importHistory.filter { entry in
+            if let yearFilter = dashboardYearFilter,
+               Calendar.current.component(.year, from: entry.date) != yearFilter {
+                return false
+            }
+            guard let tagFilter = dashboardTagFilter else { return true }
+            let entryPath = normalizePath(entry.destinationPath)
+            return destinations.contains { destination in
+                !destination.path.isEmpty
+                    && (entryPath == destination.path
+                        || entryPath.hasPrefix(destination.path + "/")
+                        || destination.path.hasPrefix(entryPath + "/"))
+                    && tags(at: destination.bookmarkIndex).contains(tagFilter)
+            }
+        }
+    }
+
+    /// Best-known StatsReport for one event: finalized snapshot, else current/previous cached scan.
+    /// A locked snapshot is frozen at finalize time and can predate a deep scan that completed
+    /// afterwards (e.g. the user hit Refresh post-finalize), so we don't trust it blindly —
+    /// whichever of the two actually has more bytes wins.
+    func eventStatsReport(forBookmarkIndex index: Int) -> StatsReport? {
+        let liveReport = liveCachedStatsReport(forBookmarkIndex: index)
+        guard let finalized = finalizedEvent(forBookmarkIndex: index) else { return liveReport }
+        if let liveReport, liveReport.totalBytes > finalized.snapshot.totalBytes {
+            return liveReport
+        }
+        return finalized.snapshot
+    }
+
+    private func liveCachedStatsReport(forBookmarkIndex index: Int) -> StatsReport? {
+        guard index < eventFolderCachedPaths.count else { return nil }
+        let path = eventFolderCachedPaths[index]
+        if !path.isEmpty,
+           let report = EventStatsCache.load(forPath: path)?.report,
+           report.totalFilesAnalyzed > 0 {
+            return report
+        }
+        if index < eventFolderPreviousCachedPaths.count {
+            let previousPath = eventFolderPreviousCachedPaths[index]
+            if !previousPath.isEmpty,
+               let report = EventStatsCache.load(forPath: previousPath)?.report,
+               report.totalFilesAnalyzed > 0 {
+                return report
+            }
+        }
+        return nil
+    }
+
+    /// Reads a cache first — this used to redo up to 2 `EventStatsCache.load`
+    /// disk reads *per event in the whole library*, with zero memoization, every
+    /// single time it was accessed (used directly from `StatisticsView`'s body).
+    var dashboardShootingTimeSourceNamesByDay: [String: String] {
+        let key = shootingTimeSourceNamesCacheKey
+        if let cached = Self.shootingTimeSourceNamesCacheLock.withLock({ Self.shootingTimeSourceNamesCache[key] }) {
+            return cached
+        }
+        let result = Self.combineShootingTimeSourceNames(inputs: gatherShootingTimeSourceNameInputs())
+        Self.shootingTimeSourceNamesCacheLock.withLock { Self.shootingTimeSourceNamesCache[key] = result }
+        return result
+    }
+
+    /// Precomputes and caches `dashboardShootingTimeSourceNamesByDay` off the main
+    /// thread. Call this from a `.task(id: eventStatsCacheRevision)` in any view
+    /// that reads the property above from its `body`.
+    func prewarmDashboardShootingTimeSourceNamesByDay() async {
+        let key = shootingTimeSourceNamesCacheKey
+        guard Self.shootingTimeSourceNamesCacheLock.withLock({ Self.shootingTimeSourceNamesCache[key] }) == nil else { return }
+        let inputs = gatherShootingTimeSourceNameInputs()
+        let result = await Task.detached(priority: .userInitiated) {
+            Self.combineShootingTimeSourceNames(inputs: inputs)
+        }.value
+        Self.shootingTimeSourceNamesCacheLock.withLock { Self.shootingTimeSourceNamesCache[key] = result }
+    }
+
+    private var shootingTimeSourceNamesCacheKey: String {
+        let paths = uniqueImportDestinations.map(\.path).joined(separator: "\u{1f}")
+        let previousPaths = eventFolderPreviousCachedPaths.joined(separator: "\u{1f}")
+        return "\(eventStatsCacheRevision)|\(paths)|\(previousPaths)"
+    }
+
+    private static let shootingTimeSourceNamesCacheLock = NSLock()
+    private static var shootingTimeSourceNamesCache: [String: [String: String]] = [:]
+
+    private struct PendingShootingTimeSourceNameInput {
+        let name: String
+        let currentPath: String
+        let previousPath: String
+    }
+
+    private func gatherShootingTimeSourceNameInputs() -> [PendingShootingTimeSourceNameInput] {
+        uniqueImportDestinations.compactMap { destination -> PendingShootingTimeSourceNameInput? in
+            guard !destination.path.isEmpty else { return nil }
+            let previousPath = destination.bookmarkIndex < eventFolderPreviousCachedPaths.count
+                ? eventFolderPreviousCachedPaths[destination.bookmarkIndex] : ""
+            return PendingShootingTimeSourceNameInput(name: destination.name, currentPath: destination.path, previousPath: previousPath)
+        }
+    }
+
+    nonisolated private static func combineShootingTimeSourceNames(inputs: [PendingShootingTimeSourceNameInput]) -> [String: String] {
+        var result: [String: (name: String, photoCount: Int)] = [:]
+        for input in inputs {
+            let paths = [input.currentPath, input.previousPath].filter { !$0.isEmpty }
+            for path in paths {
+                guard let report = EventStatsCache.load(forPath: path)?.report else { continue }
+                for (day, timestamps) in report.captureTimestampsByDay {
+                    let count = timestamps.count
+                    if result[day]?.photoCount ?? -1 < count {
+                        result[day] = (input.name, count)
+                    }
+                }
+            }
+        }
+        return result.mapValues(\.name)
+    }
+
+    func noteEventStatsCacheChanged() {
+        invalidateDashboardStatsCache()
+        eventStatsCacheRevision &+= 1
+    }
+
     func removeEventFolder(at index: Int) {
         guard index >= 0, index < eventFolderBookmarks.count else { return }
         // Remove from all parallel arrays at the correct index BEFORE removing the bookmark,
@@ -1536,8 +2543,16 @@ final class AppState {
         // the right length (no-op). This also fixes multi-folder removal correctness.
         if index < eventFolderCachedCounts.count { eventFolderCachedCounts.remove(at: index) }
         if index < eventFolderCachedJPGCounts.count { eventFolderCachedJPGCounts.remove(at: index) }
-        if index < eventFolderCachedPaths.count  { eventFolderCachedPaths.remove(at: index)  }
-        if index < eventFolderPreviousCachedPaths.count { eventFolderPreviousCachedPaths.remove(at: index) }
+        if index < eventFolderCachedJPGCountsByDay.count { eventFolderCachedJPGCountsByDay.remove(at: index) }
+        if index < eventFolderCachedPaths.count {
+            EventGalleryStore.clear(forPath: eventFolderCachedPaths[index])
+            eventFolderCachedPaths.remove(at: index)
+        }
+        if index < eventFolderPreviousCachedPaths.count {
+            let previousPath = eventFolderPreviousCachedPaths[index]
+            if !previousPath.isEmpty { EventGalleryStore.clear(forPath: previousPath) }
+            eventFolderPreviousCachedPaths.remove(at: index)
+        }
         if index < eventFolderBannerImagePaths.count {
             let bannerPath = eventFolderBannerImagePaths[index]
             if !bannerPath.isEmpty { try? FileManager.default.removeItem(atPath: bannerPath) }
@@ -1549,6 +2564,7 @@ final class AppState {
         if index < eventFolderManualDates.count { eventFolderManualDates.remove(at: index) }
         if index < eventFolderPeakRawCounts.count { eventFolderPeakRawCounts.remove(at: index) }
         if index < eventFolderFinalizedEventID.count { eventFolderFinalizedEventID.remove(at: index) }
+        if index < eventFolderTags.count { eventFolderTags.remove(at: index) }
         eventFolderOrder = eventFolderOrder.compactMap { orderedIndex in
             if orderedIndex == index { return nil }
             return orderedIndex > index ? orderedIndex - 1 : orderedIndex
@@ -2026,6 +3042,8 @@ struct ImportProgress {
     var startTime: Date?
     var bytesPerSecond: Double = 0
     var skippedFiles: Int = 0
+    var failedFiles: Int = 0
+    var copiedAfterMoveFailureFiles: Int = 0
     var statusMessage: String?
     var failureMessage: String?
 

@@ -1,12 +1,27 @@
 import SwiftUI
 import AppKit
 
+/// One "Recent Events"/"Recent Added Folders" card's worth of data once assembled.
+private typealias RecentEventItem = (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool)
+
 struct DashboardView: View {
     @Bindable var appState: AppState
     let volumeWatcher: VolumeWatcher?
     let statsRunner: StatsRunner?
 
     @State private var isCreatingEvent = false
+    // Populated asynchronously by `refreshRecentEventAggregates()` — these used to
+    // be computed properties that re-ran `EventStatsCache.load(forPath:)` (a
+    // synchronous disk read + JSON decode of a StatsReport, which for an event with
+    // many RAWs is a sizeable payload) for *every* event/folder in the whole
+    // library on *every* body re-evaluation — which happens on basically any
+    // appState change while Dashboard is visible. On a fresh launch (cold
+    // EventStatsCache in-memory cache), that was a synchronous main-thread burst
+    // across the entire library, i.e. the multi-second freeze right after opening
+    // the app. Now the grid renders straight from these arrays and the expensive
+    // work happens off the main thread.
+    @State private var recentEventItems: [RecentEventItem] = []
+    @State private var recentAddedFolderItems: [RecentEventItem] = []
 
     let onImportNow: () -> Void
     let onPause: () -> Void
@@ -25,6 +40,8 @@ struct DashboardView: View {
                 FileBrowserRow(appState: appState)
 
                 recentEvents
+
+                recentAddedFolders
             }
             .padding(.horizontal, AuroraSpacing.mainPaddingH)
             .padding(.vertical, AuroraSpacing.mainPaddingV)
@@ -33,6 +50,43 @@ struct DashboardView: View {
         .sheet(isPresented: $isCreatingEvent) {
             CreateEventSheet { name, folderURL in
                 createEvent(name: name, folderURL: folderURL)
+            }
+        }
+        // Runs once on first appear (both ids are non-nil from the start), and again
+        // whenever event stats change anywhere in the app (revision bump) or a
+        // folder is added/removed (bookmark count change) — not on every unrelated
+        // appState mutation like the old computed-property version did.
+        // Debounced: a deep scan's progress callback bumps the revision once per
+        // batch (could be 10-50+ times for a large event), and the actual work
+        // below runs in a non-cancellable `Task.detached` — without this delay,
+        // a long scan would pile up that many overlapping background aggregations
+        // instead of settling on one once progress actually stops.
+        .task(id: appState.eventStatsCacheRevision) {
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            await refreshRecentEventAggregates()
+        }
+        .task(id: appState.eventFolderBookmarks.count) { await refreshRecentEventAggregates() }
+    }
+
+    @ViewBuilder
+    private var recentAddedFolders: some View {
+        let items = recentAddedFolderItems.prefix(4)
+
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                AuroraPanelHeader(title: "Recent Added Folders", actionLabel: nil, action: nil)
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
+                    spacing: AuroraSpacing.gridGap
+                ) {
+                    ForEach(Array(items), id: \.event.id) { item in
+                        RecentEventThumb(event: item.event, bannerImagePath: item.bannerPath) {
+                            onSelectEvent(item.event)
+                        }
+                    }
+                }
             }
         }
     }
@@ -78,32 +132,19 @@ struct DashboardView: View {
 
     // MARK: - Recent events
 
+    @ViewBuilder
     private var recentEvents: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            AuroraPanelHeader(title: "Recent Events", actionLabel: "View all →", action: onViewAllEvents)
+        let visibleItems = recentEventItems.prefix(4)
 
-            let items = appState.uniqueImportDestinations
-                .filter { !appState.isLibraryFolder(at: $0.bookmarkIndex) }
-                .compactMap { destination -> (event: EventAggregate, bannerPath: String?, bookmarkIndex: Int, isFinalized: Bool)? in
-                    guard let event = recentEventDisplay(for: destination) else { return nil }
-                    return (
-                        event: event,
-                        bannerPath: bannerImagePath(for: destination.bookmarkIndex),
-                        bookmarkIndex: destination.bookmarkIndex,
-                        isFinalized: appState.finalizedEvent(forBookmarkIndex: destination.bookmarkIndex) != nil
-                    )
-                }
-                .sorted(by: recentEventSort)
-                .prefix(4)
+        if !visibleItems.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                AuroraPanelHeader(title: "Recent Events", actionLabel: recentEventItems.count > 5 ? "View all →" : nil, action: onViewAllEvents)
 
-            if items.isEmpty {
-                emptyEvents
-            } else {
                 LazyVGrid(
                     columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
                     spacing: AuroraSpacing.gridGap
                 ) {
-                    ForEach(Array(items), id: \.event.id) { item in
+                    ForEach(Array(visibleItems), id: \.event.id) { item in
                         RecentEventThumb(event: item.event, bannerImagePath: item.bannerPath) {
                             onSelectEvent(item.event)
                         }
@@ -129,7 +170,33 @@ struct DashboardView: View {
         return path.isEmpty ? nil : path
     }
 
-    private func recentEventDisplay(for destination: (path: String, name: String, bookmarkIndex: Int)) -> EventAggregate? {
+    /// Everything `assembleAggregate(from:)` needs, gathered from `appState` while
+    /// still on the main actor (all of this is cheap array/dictionary lookups — no
+    /// disk I/O). The one genuinely expensive step, `EventStatsCache.load`, is
+    /// deliberately *not* done here; it happens off-thread in `assembleAggregate`.
+    private struct PendingEventAggregate {
+        let path: String
+        let name: String
+        let bookmarkIndex: Int
+        let totalFiles: Int
+        let totalBytesFromMetadata: Int64
+        let finalizedSnapshot: StatsReport?
+        let isFinalized: Bool
+        let currentCachePath: String
+        let previousCachePath: String
+        let displayDate: Date
+        let averageSpeed: Double
+        let tags: Set<EventTag>
+        let bannerPath: String?
+    }
+
+    /// `reportsAsFinalized` mirrors the original behavior: "Recent Events" reports
+    /// its real finalized state, while "Recent Added Folders" always reports
+    /// `false` (library folders can't be finalized in the first place).
+    private func gatherPendingAggregate(
+        for destination: (path: String, name: String, bookmarkIndex: Int),
+        reportsAsFinalized: Bool
+    ) -> PendingEventAggregate? {
         guard !destination.path.isEmpty else { return nil }
 
         let summary = appState.importStatsForEventFolder(at: destination.bookmarkIndex)
@@ -141,40 +208,86 @@ struct DashboardView: View {
             ? max(appState.eventFolderCachedCounts[destination.bookmarkIndex], 0)
             : 0
         let totalFiles = max(summary?.photoCount ?? 0, max(finalized?.photoCount ?? 0, max(peak, cached)))
-        let totalBytes = max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0)
+        let currentPath = destination.bookmarkIndex < appState.eventFolderCachedPaths.count
+            ? appState.eventFolderCachedPaths[destination.bookmarkIndex] : ""
+        let previousPath = destination.bookmarkIndex < appState.eventFolderPreviousCachedPaths.count
+            ? appState.eventFolderPreviousCachedPaths[destination.bookmarkIndex] : ""
         let displayDate = appState.effectiveDateForEvent(at: destination.bookmarkIndex) ?? .distantPast
 
-        return EventAggregate(
-            id: destination.path,
+        return PendingEventAggregate(
+            path: destination.path,
             name: destination.name,
+            bookmarkIndex: destination.bookmarkIndex,
             totalFiles: totalFiles,
-            totalBytes: totalBytes,
-            averageSpeed: appState.totalStatsReport?.averageSpeed ?? 0,
-            lastDate: displayDate
+            totalBytesFromMetadata: max(summary?.totalBytes ?? 0, finalized?.totalBytes ?? 0),
+            finalizedSnapshot: finalized?.snapshot,
+            isFinalized: reportsAsFinalized ? (finalized != nil) : false,
+            currentCachePath: currentPath,
+            previousCachePath: previousPath,
+            displayDate: displayDate,
+            averageSpeed: appState.dashboardTotalStatsReport?.averageSpeed ?? 0,
+            tags: appState.tags(at: destination.bookmarkIndex),
+            bannerPath: bannerImagePath(for: destination.bookmarkIndex)
         )
     }
 
-    private var emptyEvents: some View {
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: AuroraSpacing.gridGap), count: 4),
-            spacing: AuroraSpacing.gridGap
-        ) {
-            ForEach(0..<4, id: \.self) { _ in
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.auroraPanel2)
-                    .aspectRatio(4.0/3.0, contentMode: .fit)
-                    .overlay(
-                        Text("No event")
-                            .font(.manrope(11, weight: .semibold))
-                            .foregroundStyle(Color.auroraFaint)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(Color.auroraStroke, lineWidth: 1)
-                    )
-            }
-        }
+    /// The actual expensive step (`EventStatsCache.load`, a disk read + JSON
+    /// decode) — kept `nonisolated`/`static` so it only touches its plain-value
+    /// argument and can safely run on a background thread via `Task.detached`.
+    nonisolated private static func assembleAggregate(from pending: PendingEventAggregate) -> RecentEventItem {
+        let liveReport: StatsReport? = (!pending.currentCachePath.isEmpty ? EventStatsCache.load(forPath: pending.currentCachePath)?.report : nil)
+            ?? (!pending.previousCachePath.isEmpty ? EventStatsCache.load(forPath: pending.previousCachePath)?.report : nil)
+        let report = pending.finalizedSnapshot ?? liveReport
+        let totalBytes = max(pending.totalBytesFromMetadata, max(report?.totalBytes ?? 0, liveReport?.totalBytes ?? 0))
+        let metrics = report?.shootingTimeMetrics
+
+        let event = EventAggregate(
+            id: pending.path,
+            name: pending.name,
+            totalFiles: pending.totalFiles,
+            totalBytes: totalBytes,
+            totalWorkingSeconds: metrics?.totalCoverageSeconds ?? 0,
+            totalShootingSeconds: metrics?.totalShootingSeconds ?? 0,
+            longestCoverageDaySeconds: metrics?.longestCoverageDay?.coverageSeconds ?? 0,
+            longestCoverageDayKey: metrics?.longestCoverageDay?.dayKey,
+            averageSpeed: pending.averageSpeed,
+            lastDate: pending.displayDate,
+            bookmarkIndex: pending.bookmarkIndex,
+            tags: pending.tags
+        )
+        return (event: event, bannerPath: pending.bannerPath, bookmarkIndex: pending.bookmarkIndex, isFinalized: pending.isFinalized)
+    }
+
+    /// Gathers the cheap per-event inputs on the main actor (fast), then does the
+    /// actual cache reads off the main thread, then writes the results back. This
+    /// is what replaced the old synchronous `recentEventDisplay`/`cachedReport`
+    /// computed-property pipeline that caused the launch-time freeze.
+    private func refreshRecentEventAggregates() async {
+        // `gatherPendingAggregate` reads `appState.dashboardTotalStatsReport` once
+        // per event, synchronously, on the main actor (it has to — AppState is
+        // @MainActor). That's cheap *if already cached*, but on a cache miss it
+        // triggers a library-wide, disk-I/O-heavy aggregation (see
+        // `aggregateDashboardTotalStatsReport`) — which for a large production
+        // library was a second, bigger hang hiding behind the first one this
+        // function's own refactor fixed. Prewarming it here, off the main thread,
+        // *before* the per-event loop below means that loop only ever sees the
+        // already-cached, cheap value.
+        await appState.prewarmDashboardTotalStatsReport()
+
+        let destinations = appState.uniqueImportDestinations
+        let eventPending = destinations
+            .filter { !appState.isLibraryFolder(at: $0.bookmarkIndex) }
+            .compactMap { gatherPendingAggregate(for: $0, reportsAsFinalized: true) }
+        let folderPending = destinations
+            .filter { appState.isLibraryFolder(at: $0.bookmarkIndex) }
+            .compactMap { gatherPendingAggregate(for: $0, reportsAsFinalized: false) }
+
+        let (events, folders) = await Task.detached(priority: .userInitiated) { () -> ([RecentEventItem], [RecentEventItem]) in
+            (eventPending.map(Self.assembleAggregate), folderPending.map(Self.assembleAggregate))
+        }.value
+
+        recentEventItems = events.sorted(by: recentEventSort)
+        recentAddedFolderItems = folders.sorted(by: recentEventSort)
     }
 
     // MARK: - Actions
@@ -188,37 +301,7 @@ struct DashboardView: View {
             return "Aurora could not save access to this folder. Choose a different folder and try again."
         }
         let bookmarkIndex = appState.addEventFolder(bookmark: bookmark, displayName: name)
-
-        // Auto-scan the folder in the background so stats are ready when the user opens the event.
-        guard let runner = statsRunner else { return nil }
-        let folderPath = folderURL.path
-        appState.backgroundScanningBookmarkIndices.insert(bookmarkIndex)
-        appState.backgroundScanStartTimes[bookmarkIndex] = Date()
-        Task {
-            // Count files first so the UI can show a meaningful estimate.
-            let fileCount = VolumeWatcher.countRawFiles(at: folderURL, extensions: appState.supportedExtensions)
-            appState.backgroundScanFileCount[bookmarkIndex] = fileCount
-
-            let result = await runner.runStatsForEventFolder(at: folderURL)
-
-            appState.backgroundScanningBookmarkIndices.remove(bookmarkIndex)
-            appState.backgroundScanFileCount.removeValue(forKey: bookmarkIndex)
-            appState.backgroundScanStartTimes.removeValue(forKey: bookmarkIndex)
-
-            guard let r = result, r.totalFilesAnalyzed > 0 else { return }
-            let now = Date()
-            EventStatsCache.save(r, forPath: folderPath, scanDate: now, rawFileCountAtScan: r.totalFilesAnalyzed)
-            appState.updateEventFolderCache(at: bookmarkIndex, count: r.totalFilesAnalyzed, path: folderPath)
-            appState.setEventFolderPeakIfHigher(at: bookmarkIndex, count: r.totalFilesAnalyzed)
-            appState.log("Auto-scan complete: \(name) — \(r.totalFilesAnalyzed) photos")
-            // Merge into global stats off the MainActor so EventStatsView can
-            // load from cache immediately without waiting for the combine + save.
-            let existing = appState.totalStatsReport
-            Task.detached(priority: .utility) {
-                let combined = StatsReport.combine(existing, r)
-                await MainActor.run { appState.totalStatsReport = combined }
-            }
-        }
+        appState.scanEventFolderIfRawFilesExist(at: bookmarkIndex, mergeIntoGlobalTotals: true)
 
         return nil
     }
@@ -359,7 +442,8 @@ struct TotalLibraryCard: View {
     @Bindable var appState: AppState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 0) {
+            // Top: label + big number + subtitle
             Text("Total Library")
                 .font(.manrope(13, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
@@ -370,34 +454,43 @@ struct TotalLibraryCard: View {
                 .foregroundStyle(Color.auroraTxt)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
+                .padding(.top, 2)
 
             Text(subtitle)
                 .font(.manrope(12.5, weight: .semibold))
                 .foregroundStyle(Color.auroraMuted)
                 .lineLimit(1)
+                .padding(.top, 6)
 
-            Divider().background(Color.auroraStroke).padding(.vertical, 6)
+            Spacer(minLength: 16)
+
+            // Center: Add Folder button
+            HStack {
+                Spacer()
+                Button(action: addLibraryFolders) {
+                    Label("Add Folder", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(AuroraGradientButtonStyle(compact: false))
+                .disabled(!canAddLibraryFolder)
+                .opacity(canAddLibraryFolder ? 1 : 0.45)
+                .help(canAddLibraryFolder ? "Add folders containing RAW files to your library" : trialLimitHelp)
+                Spacer()
+            }
+
+            Spacer(minLength: 16)
+
+            // Bottom: divider + meta row
+            Divider().background(Color.auroraStroke)
+                .padding(.bottom, 12)
 
             HStack(spacing: 16) {
                 metaItem(label: "Imports", value: "\(appState.importHistory.count)")
                 Divider().frame(height: 22).background(Color.auroraStroke)
                 metaItem(label: "Avg Speed", value: speedString)
                 Divider().frame(height: 22).background(Color.auroraStroke)
-                metaItem(label: "Events", value: "\(eventCount)")
-            }
-
-            Spacer(minLength: 0)
-
-            HStack {
-                Spacer()
-                Button {
-                    addLibraryFolders()
-                } label: {
-                    Label("Add Folder", systemImage: "folder.badge.plus")
-                        .font(.manrope(12, weight: .semibold))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.auroraCyan)
+                metaItem(label: eventCount == 1 ? "Event" : "Events", value: "\(eventCount)")
+                Divider().frame(height: 22).background(Color.auroraStroke)
+                metaItem(label: addedFolderCount == 1 ? "Added Folder" : "Added Folders", value: "\(addedFolderCount)")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -423,22 +516,37 @@ struct TotalLibraryCard: View {
     }
 
     private var totalPhotos: Int {
-        appState.totalStatsReport?.totalFilesAnalyzed
+        appState.dashboardTotalStatsReport?.totalFilesAnalyzed
             ?? appState.importHistory.reduce(0) { $0 + $1.fileCount }
     }
 
     private var eventCount: Int {
-        EventAggregator.build(appState: appState).count
+        appState.uniqueImportDestinations.filter { !appState.isLibraryFolder(at: $0.bookmarkIndex) }.count
+    }
+
+    private var addedFolderCount: Int {
+        appState.uniqueImportDestinations.filter { appState.isLibraryFolder(at: $0.bookmarkIndex) }.count
+    }
+
+    private var canAddLibraryFolder: Bool {
+        appState.canUseTrialAction()
+    }
+
+    private var trialLimitHelp: String {
+        "Trial limit reached. Enter a license key to add more folders."
     }
 
     private var subtitle: String {
-        let parts = AuroraFormat.bytesParts(appState.totalStatsReport?.totalBytes ?? 0)
+        let parts = AuroraFormat.bytesParts(appState.dashboardTotalStatsReport?.totalBytes ?? 0)
         if totalPhotos == 0 { return "Your library will appear here." }
-        return "photos across \(eventCount) event\(eventCount == 1 ? "" : "s") · \(parts.value) \(parts.unit) stored"
+        if eventCount > 0 {
+            return "photos across \(eventCount) event\(eventCount == 1 ? "" : "s") · \(parts.value) \(parts.unit) stored"
+        }
+        return "photos across \(addedFolderCount) added folder\(addedFolderCount == 1 ? "" : "s") · \(parts.value) \(parts.unit) stored"
     }
 
     private var speedString: String {
-        guard let r = appState.totalStatsReport, r.averageSpeed > 0 else { return "—" }
+        guard let r = appState.dashboardTotalStatsReport, r.averageSpeed > 0 else { return "—" }
         let s = AuroraFormat.speedParts(r.averageSpeed)
         return "\(s.value) \(s.unit)"
     }
@@ -455,6 +563,10 @@ struct TotalLibraryCard: View {
     }
 
     private func addLibraryFolders() {
+        guard canAddLibraryFolder else {
+            appState.requestActivationForTrialLimit()
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -488,7 +600,8 @@ struct WaitingCard: View {
                 ZStack {
                     Circle()
                         .stroke(Color.auroraCyan.opacity(0.55), lineWidth: 1.5)
-                        .frame(width: pulse ? 56 : 42, height: pulse ? 56 : 42)
+                        .frame(width: 42, height: 42)
+                        .scaleEffect(pulse ? 1.34 : 1)
                         .opacity(pulse ? 0 : 1)
                     Circle()
                         .fill(Color.auroraCyan.opacity(0.15))
@@ -531,6 +644,7 @@ struct WaitingCard: View {
         )
         .frame(minHeight: 260)
         .onAppear {
+            clearLibraryFolderDestinationIfNeeded()
             updateAnimations()
         }
         .onDisappear {
@@ -663,7 +777,7 @@ struct WaitingCard: View {
 
     @ViewBuilder
     private var destinationPicker: some View {
-        if let dest = appState.destinationURL {
+        if let dest = validImportDestinationURL {
             HStack(spacing: 10) {
                 IconChip(systemName: "folder.fill", color: .auroraViolet, size: 32, iconScale: 0.5)
                 VStack(alignment: .leading, spacing: 2) {
@@ -719,6 +833,27 @@ struct WaitingCard: View {
         appState.activeEventFolderIndex = eventContainingDestination(url.path)?.bookmarkIndex
     }
 
+    private var validImportDestinationURL: URL? {
+        guard let destinationURL = appState.destinationURL else { return nil }
+        return isLibraryFolderPath(destinationURL.path) ? nil : destinationURL
+    }
+
+    private func clearLibraryFolderDestinationIfNeeded() {
+        guard let destinationURL = appState.destinationURL,
+              isLibraryFolderPath(destinationURL.path) else { return }
+        appState.destinationURL = nil
+        appState.destinationBookmarkData = nil
+        appState.activeEventFolderIndex = nil
+    }
+
+    private func isLibraryFolderPath(_ path: String) -> Bool {
+        let destinationPath = normalizedPath(path)
+        return appState.uniqueImportDestinations.contains { event in
+            appState.isLibraryFolder(at: event.bookmarkIndex)
+                && normalizedPath(event.path) == destinationPath
+        }
+    }
+
     private var openEvents: [(path: String, name: String, bookmarkIndex: Int)] {
         appState.uniqueImportDestinations.filter { event in
             !event.path.isEmpty
@@ -732,7 +867,7 @@ struct WaitingCard: View {
            let event = openEvents.first(where: { $0.bookmarkIndex == index }) {
             return event
         }
-        guard let destination = appState.destinationURL else { return nil }
+        guard let destination = validImportDestinationURL else { return nil }
         let destinationPath = normalizedPath(destination.path)
         return eventContainingDestination(destinationPath)
     }
@@ -833,7 +968,12 @@ struct WaitingCard: View {
                             )
                             .buttonStyle(.plain)
                     }
-                    AuroraMiniToggle(label: "Auto-import", isOn: $appState.autoImport, tint: .auroraCyan)
+                    AuroraMiniToggle(
+                        label: "Auto-import",
+                        isOn: $appState.autoImport,
+                        tint: .auroraCyan,
+                        isDisabled: appState.importState == .generatingStats
+                    )
                 }
             }
         }
@@ -858,7 +998,7 @@ struct WaitingCard: View {
 
     private var isImportNowBlocked: Bool {
         let allAlreadyImported = appState.allDestinationFilesAlreadyImported && appState.sourceFileCountForDestinationCheck > 0
-        return importableVolumes.isEmpty || allAlreadyImported || appState.destinationURL == nil
+        return appState.importState == .generatingStats || importableVolumes.isEmpty || allAlreadyImported || validImportDestinationURL == nil
     }
 
     private var shouldPulseWaitingCard: Bool {
@@ -881,7 +1021,7 @@ struct WaitingCard: View {
     }
 
     private func isDestinationVolume(_ sourceURL: URL) -> Bool {
-        guard let destinationURL = appState.destinationURL else { return false }
+        guard let destinationURL = validImportDestinationURL else { return false }
         let sourcePath = normalizedPath(sourceURL.path)
         let destinationPath = normalizedPath(destinationURL.path)
         return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
@@ -892,29 +1032,32 @@ private struct AuroraMiniToggle: View {
     let label: String
     @Binding var isOn: Bool
     let tint: Color
+    var isDisabled: Bool = false
 
     var body: some View {
         Button {
+            guard !isDisabled else { return }
             withAnimation(.easeOut(duration: 0.16)) { isOn.toggle() }
         } label: {
             HStack(spacing: 8) {
                 Text(label)
                     .font(.manrope(12, weight: .semibold))
-                    .foregroundStyle(isOn ? Color.auroraTxt : Color.auroraMuted)
+                    .foregroundStyle(isDisabled ? Color.auroraFaint : (isOn ? Color.auroraTxt : Color.auroraMuted))
                 ZStack(alignment: isOn ? .trailing : .leading) {
                     Capsule()
-                        .fill(isOn ? tint.opacity(0.95) : Color.auroraStroke2.opacity(0.9))
+                        .fill(isDisabled ? Color.auroraStroke.opacity(0.7) : (isOn ? tint.opacity(0.95) : Color.auroraStroke2.opacity(0.9)))
                         .frame(width: 36, height: 20)
                     Circle()
-                        .fill(Color.white.opacity(isOn ? 0.96 : 0.72))
+                        .fill(Color.white.opacity(isDisabled ? 0.36 : (isOn ? 0.96 : 0.72)))
                         .frame(width: 16, height: 16)
                         .padding(.horizontal, 2)
-                        .shadow(color: isOn ? tint.opacity(0.45) : .clear, radius: 6, x: 0, y: 0)
+                        .shadow(color: !isDisabled && isOn ? tint.opacity(0.45) : .clear, radius: 6, x: 0, y: 0)
                 }
             }
         }
         .buttonStyle(.plain)
-        .auroraTooltip(isOn ? "Enabled" : "Disabled")
+        .disabled(isDisabled)
+        .auroraTooltip(isDisabled ? "Unavailable while generating stats" : (isOn ? "Enabled" : "Disabled"))
     }
 }
 
@@ -972,6 +1115,8 @@ struct FileBrowserRow: View {
 
     @State private var sourceFiles: [URL] = []
     @State private var destFiles: [URL] = []
+    @State private var sourceFileSizes: [URL: String] = [:]
+    @State private var destFileSizes: [URL: String] = [:]
     @State private var isLoadingSource = false
     @State private var isLoadingDest = false
     @State private var showAdvanced = false
@@ -985,9 +1130,11 @@ struct FileBrowserRow: View {
                 icon: "sdcard",
                 color: .auroraCyan,
                 files: sourceFiles,
+                fileSizes: sourceFileSizes,
                 isLoading: isLoadingSource,
                 emptyHint: sourceVolumes.isEmpty ? "No card detected" : "No RAW files found",
                 statusText: sourceFilesStatusText,
+                storageSummary: sourceStorageSummary,
                 onAdvanced: sourceFiles.isEmpty ? nil : { showAdvanced = true }
             )
             filePanel(
@@ -995,8 +1142,10 @@ struct FileBrowserRow: View {
                 icon: "folder.fill",
                 color: .auroraViolet,
                 files: destFiles,
+                fileSizes: destFileSizes,
                 isLoading: isLoadingDest,
                 emptyHint: appState.destinationURL == nil ? "No destination set" : "No files found",
+                storageSummary: destinationStorageSummary,
                 onRefresh: appState.destinationURL == nil ? nil : { loadDestFiles(from: appState.destinationURL) }
             )
         }
@@ -1040,9 +1189,11 @@ struct FileBrowserRow: View {
         icon: String,
         color: Color,
         files: [URL],
+        fileSizes: [URL: String],
         isLoading: Bool,
         emptyHint: String,
         statusText: String? = nil,
+        storageSummary: FilePanelStorageSummary? = nil,
         onAdvanced: (() -> Void)? = nil,
         onRefresh: (() -> Void)? = nil
     ) -> some View {
@@ -1061,11 +1212,15 @@ struct FileBrowserRow: View {
                                 .lineLimit(1)
                         }
                     }
-                    if title == "Source Files", let sourceNamesText {
+                    if title == "Source Files", storageSummary == nil, let sourceNamesText {
                         Text(sourceNamesText)
                             .font(.manrope(10.5, weight: .semibold))
                             .foregroundStyle(Color.auroraFaint)
                             .lineLimit(1)
+                    }
+                    if let storageSummary {
+                        fileStorageRow(storageSummary)
+                            .padding(.top, 1)
                     }
                 }
                 if let statusText, title != "Source Files" {
@@ -1100,7 +1255,7 @@ struct FileBrowserRow: View {
                 }
             }
             .padding(.horizontal, 14)
-            .frame(height: 52)
+            .frame(height: 62)
 
             Rectangle()
                 .fill(Color.auroraStroke)
@@ -1138,7 +1293,7 @@ struct FileBrowserRow: View {
                                     .foregroundStyle(Color.auroraTxt)
                                     .lineLimit(1)
                                 Spacer()
-                                if let size = fileSize(for: file) {
+                                if let size = fileSizes[file] {
                                     Text(size)
                                         .font(.manrope(10, weight: .medium))
                                         .foregroundStyle(Color.auroraFaint)
@@ -1161,7 +1316,7 @@ struct FileBrowserRow: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 233)
+        .frame(height: 243)
         .background(
             RoundedRectangle(cornerRadius: AuroraRadius.large, style: .continuous)
                 .fill(Color.auroraPanel)
@@ -1173,7 +1328,150 @@ struct FileBrowserRow: View {
         )
     }
 
-    private func fileSize(for url: URL) -> String? {
+    private struct FilePanelStorageSummary {
+        let usedFraction: Double
+        let line: String
+        let tint: Color
+        let isAvailable: Bool
+    }
+
+    private var sourceStorageSummary: FilePanelStorageSummary? {
+        let urls = sourceVolumes.map(\.path)
+        guard !urls.isEmpty else { return nil }
+        return fileStorageSummary(for: urls)
+    }
+
+    private var destinationStorageSummary: FilePanelStorageSummary? {
+        guard let url = appState.destinationURL else { return nil }
+        return fileStorageSummary(for: url)
+    }
+
+    @ViewBuilder
+    private func fileStorageRow(_ storage: FilePanelStorageSummary) -> some View {
+        HStack(spacing: 8) {
+            StorageBar(
+                fraction: storage.usedFraction,
+                height: 5,
+                radius: 3,
+                fill: AnyShapeStyle(storage.tint)
+            )
+            .frame(width: 86)
+
+            Text(storage.line)
+                .font(.manrope(10.5, weight: .semibold))
+                .foregroundStyle(storage.isAvailable ? storage.tint.opacity(0.95) : Color.auroraFaint)
+                .lineLimit(1)
+        }
+    }
+
+    private func fileStorageSummary(for urls: [URL]) -> FilePanelStorageSummary {
+        guard urls.count > 1 else {
+            return fileStorageSummary(for: urls[0])
+        }
+
+        let summaries = urls.map { fileStorageValues(for: $0) }
+        let validSummaries = summaries.compactMap { $0 }
+        guard validSummaries.count == urls.count else {
+            return FilePanelStorageSummary(
+                usedFraction: 0,
+                line: "Storage unavailable",
+                tint: .auroraFaint,
+                isAvailable: false
+            )
+        }
+
+        let total = validSummaries.reduce(Int64(0)) { $0 + $1.total }
+        let available = validSummaries.reduce(Int64(0)) { $0 + $1.available }
+        guard total > 0 else {
+            return FilePanelStorageSummary(
+                usedFraction: 0,
+                line: "Storage unavailable",
+                tint: .auroraFaint,
+                isAvailable: false
+            )
+        }
+
+        let usedFraction = min(1, max(0, Double(total - available) / Double(total)))
+        let availableParts = AuroraFormat.bytesParts(available)
+        let percentUsed = Int((usedFraction * 100).rounded())
+        let tint = fileStorageTint(available: available, usedFraction: usedFraction)
+        let line: String
+        let lowSpaceThreshold: Int64 = 100 * 1024 * 1024 * 1024
+
+        if available < lowSpaceThreshold {
+            line = "Low space: \(availableParts.value) \(availableParts.unit) free across \(urls.count) cards"
+        } else {
+            line = "\(availableParts.value) \(availableParts.unit) free · \(percentUsed)% used across \(urls.count) cards"
+        }
+
+        return FilePanelStorageSummary(
+            usedFraction: usedFraction,
+            line: line,
+            tint: tint,
+            isAvailable: true
+        )
+    }
+
+    private func fileStorageSummary(for url: URL) -> FilePanelStorageSummary {
+        guard let values = fileStorageValues(for: url) else {
+            return FilePanelStorageSummary(
+                usedFraction: 0,
+                line: "Storage unavailable",
+                tint: .auroraFaint,
+                isAvailable: false
+            )
+        }
+
+        let usedFraction = min(1, max(0, Double(values.total - values.available) / Double(values.total)))
+        let availableParts = AuroraFormat.bytesParts(values.available)
+        let percentUsed = Int((usedFraction * 100).rounded())
+        let tint = fileStorageTint(available: values.available, usedFraction: usedFraction)
+        let line: String
+        let lowSpaceThreshold: Int64 = 100 * 1024 * 1024 * 1024
+
+        if values.available < lowSpaceThreshold {
+            line = "Low space: \(availableParts.value) \(availableParts.unit) free"
+        } else {
+            line = "\(availableParts.value) \(availableParts.unit) free · \(percentUsed)% used on \(values.volumeName)"
+        }
+
+        return FilePanelStorageSummary(
+            usedFraction: usedFraction,
+            line: line,
+            tint: tint,
+            isAvailable: true
+        )
+    }
+
+    private func fileStorageValues(for url: URL) -> (available: Int64, total: Int64, volumeName: String)? {
+        let keys: Set<URLResourceKey> = [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey,
+            .volumeTotalCapacityKey,
+            .volumeNameKey
+        ]
+        guard let values = try? url.resourceValues(forKeys: keys),
+              let totalCapacity = values.volumeTotalCapacity,
+              totalCapacity > 0 else {
+            return nil
+        }
+
+        let total = Int64(totalCapacity)
+        let availableCapacity = values.volumeAvailableCapacity.map(Int64.init)
+        let forImportant = values.volumeAvailableCapacityForImportantUsage.flatMap { $0 > 0 ? $0 : nil }
+        let available = max(0, forImportant ?? availableCapacity ?? 0)
+        let volumeName = values.volumeName ?? url.lastPathComponent
+        return (available, total, volumeName)
+    }
+
+    private func fileStorageTint(available: Int64, usedFraction: Double) -> Color {
+        let lowSpaceThreshold: Int64 = 100 * 1024 * 1024 * 1024
+        if available < lowSpaceThreshold || usedFraction >= 0.9 { return .auroraMagenta }
+        if usedFraction >= 0.75 { return .auroraViolet }
+        return .auroraCyan
+    }
+
+    private static func fileSizeText(for url: URL) -> String? {
         guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 else { return nil }
         let parts = AuroraFormat.bytesParts(Int64(size))
         return "\(parts.value) \(parts.unit)"
@@ -1184,6 +1482,7 @@ struct FileBrowserRow: View {
         guard !volumes.isEmpty else {
             loadSourceTask?.cancel()
             sourceFiles = []
+            sourceFileSizes = [:]
             clearImportBlockReason()
             return
         }
@@ -1196,9 +1495,13 @@ struct FileBrowserRow: View {
                 VolumeWatcher.listRawFiles(at: path, extensions: exts)
             }
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let sizes = Dictionary(uniqueKeysWithValues: files.compactMap { file in
+                Self.fileSizeText(for: file).map { (file, $0) }
+            })
             await MainActor.run {
                 guard !Task.isCancelled else { return }
                 sourceFiles = files
+                sourceFileSizes = sizes
                 isLoadingSource = false
                 clearImportBlockReason()
             }
@@ -1209,6 +1512,7 @@ struct FileBrowserRow: View {
         guard let url = url else {
             loadDestTask?.cancel()
             destFiles = []
+            destFileSizes = [:]
             clearImportBlockReason()
             return
         }
@@ -1218,9 +1522,13 @@ struct FileBrowserRow: View {
         loadDestTask = Task.detached(priority: .utility) {
             let files = VolumeWatcher.listRawFiles(at: url, extensions: exts)
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let sizes = Dictionary(uniqueKeysWithValues: files.compactMap { file in
+                Self.fileSizeText(for: file).map { (file, $0) }
+            })
             await MainActor.run {
                 guard !Task.isCancelled else { return }
                 destFiles = files
+                destFileSizes = sizes
                 isLoadingDest = false
                 clearImportBlockReason()
             }

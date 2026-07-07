@@ -1,4 +1,26 @@
 import SwiftUI
+import AppKit
+
+enum BannerImageCache {
+    private static let cache = NSCache<NSString, NSImage>()
+
+    static func image(forPath path: String) -> NSImage? {
+        cache.object(forKey: path as NSString)
+    }
+
+    static func load(path: String) -> NSImage? {
+        if let cached = image(forPath: path) {
+            return cached
+        }
+        guard let image = NSImage(contentsOfFile: path) else { return nil }
+        cache.setObject(image, forKey: path as NSString)
+        return image
+    }
+
+    static func remove(path: String) {
+        cache.removeObject(forKey: path as NSString)
+    }
+}
 
 /// Shows the first photo in an event folder when accessible, otherwise the
 /// Aurora signature gradient for the event.
@@ -11,7 +33,9 @@ struct EventThumbnail: View {
     /// Custom banner image path — takes priority over the folder thumbnail.
     var bannerImagePath: String? = nil
 
-    @StateObject private var loader = EventThumbnailLoader.shared
+    @State private var bannerImage: NSImage?
+    @State private var loadedBannerImagePath: String?
+    @State private var folderImage: NSImage?
 
     var body: some View {
         ZStack {
@@ -25,27 +49,59 @@ struct EventThumbnail: View {
                     )
                 )
 
-            if let path = bannerImagePath, let img = NSImage(contentsOfFile: path) {
+            if let img = bannerImage {
                 Image(nsImage: img)
                     .resizable()
                     .scaledToFill()
+                    .clipped()
                     .transition(.opacity)
-            } else if let path = folderPath, let img = loader.image(forFolderPath: path) {
+            } else if let img = folderImage {
                 Image(nsImage: img)
                     .resizable()
                     .scaledToFill()
+                    .clipped()
                     .transition(.opacity)
             }
 
             overlay
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .onAppear {
-            if bannerImagePath == nil, let path = folderPath {
-                loader.requestLoad(folderPath: path)
+        .onAppear { loadBannerImageIfNeeded() }
+        .onChange(of: bannerImagePath) { _, _ in
+            loadBannerImageIfNeeded()
+        }
+        // Each instance awaits its own folder thumbnail and stores it in its own
+        // `@State` — no shared/global invalidation, so one thumbnail finishing
+        // never forces every other `EventThumbnail` on screen to be recreated.
+        .task(id: folderPath) {
+            guard bannerImagePath == nil, let path = folderPath else { return }
+            if let cached = EventThumbnailLoader.shared.image(forFolderPath: path) {
+                folderImage = cached
+                return
+            }
+            folderImage = await EventThumbnailLoader.shared.load(forFolderPath: path)
+        }
+    }
+
+    private func loadBannerImageIfNeeded() {
+        guard let path = bannerImagePath else {
+            bannerImage = nil
+            loadedBannerImagePath = nil
+            return
+        }
+        guard loadedBannerImagePath != path else { return }
+        loadedBannerImagePath = path
+        if let cached = BannerImageCache.image(forPath: path) {
+            bannerImage = cached
+            return
+        }
+        Task.detached(priority: .utility) {
+            let image = BannerImageCache.load(path: path)
+            await MainActor.run {
+                guard loadedBannerImagePath == path else { return }
+                bannerImage = image
             }
         }
-        .id("\(loader.version)-\(bannerImagePath ?? "")") // re-evaluate when cache or manual banner changes
     }
 }
 

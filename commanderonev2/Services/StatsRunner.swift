@@ -96,8 +96,9 @@ final class StatsRunner {
             var report = await Task.detached {
                 Self.runMdlsStats(files: Array(filePaths.prefix(200)))
             }.value
-            // Skip totalBytes calculation for fallback - too slow
-            report.totalBytes = 0
+            report.totalBytes = await Task.detached {
+                Self.calculateTotalBytes(files: filePaths)
+            }.value
             report.totalDuration = 0
             report.firstImportDate = nil
             return report
@@ -114,8 +115,9 @@ final class StatsRunner {
 
         var r = report
 
-        // Skip totalBytes calculation - it's too slow for large NAS folders
-        r.totalBytes = 0
+        r.totalBytes = await Task.detached {
+            Self.calculateTotalBytesForFolder(at: url, extensions: extensions)
+        }.value
         r.totalDuration = 0
         r.firstImportDate = nil
         guard r.totalFilesAnalyzed > 0 else {
@@ -129,10 +131,17 @@ final class StatsRunner {
 
     /// Run EXIF stats for an event folder in file batches so Added Folder deep scans can show
     /// real processed/total progress and keep partial work if a later batch fails.
+    /// `batchSize` defaults to `nil`, which picks the size based on the volume `url`
+    /// sits on: a NAS's higher per-file I/O latency makes a stalled/slow batch more
+    /// likely, so it keeps the smaller, more conservative 100; a local disk is fast
+    /// enough that fewer, bigger exiftool spawns win, so it gets 500. The per-batch
+    /// timeout scales with batch size so the local path doesn't lose the safety
+    /// margin the NAS path already had (300s covered 100 NAS files; 500 local files
+    /// get the equivalent 1500s).
     func runStatsForEventFolderInBatches(
         at url: URL,
         quality: EventStatsScanQuality = .full,
-        batchSize: Int = 100,
+        batchSize: Int? = nil,
         progress: @escaping @MainActor (_ processed: Int, _ total: Int, _ partialReport: StatsReport?) -> Void
     ) async -> StatsReport? {
         let extensions = appState.supportedExtensions
@@ -150,7 +159,11 @@ final class StatsRunner {
 
         var combined: StatsReport?
         var processed = 0
-        let safeBatchSize = max(1, batchSize)
+        let resolvedBatchSize: Int = await Task.detached {
+            batchSize ?? (VolumeWatcher.isLocalVolume(at: url) ? 500 : 100)
+        }.value
+        let safeBatchSize = max(1, resolvedBatchSize)
+        let batchTimeoutSeconds = 300.0 * Double(safeBatchSize) / 100.0
 
         for batch in files.chunked(into: safeBatchSize) {
             if Task.isCancelled { break }
@@ -160,7 +173,7 @@ final class StatsRunner {
                     exiftoolPath: exiftoolPath,
                     files: filePaths,
                     quality: quality,
-                    timeoutSeconds: 300
+                    timeoutSeconds: batchTimeoutSeconds
                 )
             }.value
 
@@ -175,7 +188,10 @@ final class StatsRunner {
         }
 
         guard var result = combined, result.totalFilesAnalyzed > 0 else { return nil }
-        result.totalBytes = 0
+        let filePaths = files.map(\.path)
+        result.totalBytes = await Task.detached {
+            Self.calculateTotalBytes(files: filePaths)
+        }.value
         result.totalDuration = 0
         result.firstImportDate = nil
         logCameraShutterAvailability(result, context: "folder \(quality.label) batch scan")
@@ -478,10 +494,10 @@ final class StatsRunner {
             // Store lens with make|model format. No-lens shots still carry useful
             // camera, ISO, shutter and date data, so only exclude them from lens stats.
             if let lens = lensModel, !hasNoLens, !lens.isEmpty, lens != "Unknown" {
-                let key = "\(make)|\(lens)"
+                let key = StatsReport.normalizedLensKey(make: make, model: lens)
                 lensCounts[key, default: 0] += 1
             } else if let lensID, !hasNoLens, !lensID.isEmpty, lensID != "Unknown" {
-                let key = "\(make)|\(lensID)"
+                let key = StatsReport.normalizedLensKey(make: make, model: lensID)
                 lensCounts[key, default: 0] += 1
             }
 
