@@ -1,16 +1,9 @@
 import SwiftUI
 
-struct CreatedLicenseKey: Identifiable, Codable {
-    var id: UUID = UUID()
-    let name: String
-    let plan: String
-    let key: String
-    let email: String?
-    let createdAt: Date
-}
-
-/// Admin tool (beta only) — creates license keys in Supabase via the `admin-create-license` Edge Function.
-/// The admin token is stored in Keychain on first setup and never appears in source code.
+/// Admin tool (beta only) — creates license keys in Supabase via the `admin-create-license` Edge
+/// Function and lists/revokes the real license table via `admin-dashboard` (same backend the web
+/// admin panel at jf.getaurora.pro uses). The admin credentials are stored in Keychain on first
+/// sign-in and never appear in source code.
 struct KeysManagementView: View {
     @State private var name = ""
     @State private var email = ""
@@ -18,17 +11,19 @@ struct KeysManagementView: View {
     @State private var isCreating = false
     @State private var result: CreateResult?
     @State private var copiedKey: String?
-    @State private var createdKeys: [CreatedLicenseKey] = []
-    @State private var revokingKeyID: UUID?
-    @State private var keyToRevoke: CreatedLicenseKey?
+
+    // Live license list (fetched from Supabase via admin-dashboard)
+    @State private var allLicenses: [LicensingService.AdminLicense] = []
+    @State private var isLoadingLicenses = false
+    @State private var licensesLoadError: String?
+    @State private var revokingLicenseID: String?
+    @State private var licenseToRevoke: LicensingService.AdminLicense?
 
     // Admin sign-in
     @State private var adminEmail = ""
     @State private var adminPassword = ""
     @State private var hasToken = LicensingService.hasAdminCredentials()
     @State private var showTokenSetup = false
-
-    private static let udKey = "aurora.adminCreatedKeys"
 
     enum Plan: String, CaseIterable {
         case pro, lifetime
@@ -47,25 +42,27 @@ struct KeysManagementView: View {
                 header
                 if !hasToken { tokenSetupBanner }
                 createSection
-                if !createdKeys.isEmpty { keysListSection }
+                allLicensesSection
                 Spacer()
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
         }
         .frame(minWidth: 520, minHeight: 400)
-        .onAppear { loadKeys() }
+        .onAppear {
+            if hasToken { Task { await loadAllLicenses() } }
+        }
         .confirmationDialog(
-            "Revogar key de \(keyToRevoke?.name ?? "")?",
-            isPresented: Binding(get: { keyToRevoke != nil }, set: { if !$0 { keyToRevoke = nil } }),
+            "Revogar licença de \(licenseToRevoke?.name ?? "")?",
+            isPresented: Binding(get: { licenseToRevoke != nil }, set: { if !$0 { licenseToRevoke = nil } }),
             titleVisibility: .visible
         ) {
             Button("Revogar", role: .destructive) {
-                if let entry = keyToRevoke { revokeKey(entry) }
+                if let license = licenseToRevoke { revokeLicense(license) }
             }
-            Button("Cancelar", role: .cancel) { keyToRevoke = nil }
+            Button("Cancelar", role: .cancel) { licenseToRevoke = nil }
         } message: {
-            Text("A key \(keyToRevoke?.key ?? "") ficará inválida no Supabase. Não é possível desfazer.")
+            Text("Esta licença ficará inválida no Supabase. Não é possível desfazer.")
         }
     }
 
@@ -154,6 +151,7 @@ struct KeysManagementView: View {
                     hasToken = true
                     showTokenSetup = false
                     adminPassword = ""
+                    Task { await loadAllLicenses() }
                 }
                 .buttonStyle(AuroraGradientButtonStyle(compact: true))
                 .disabled(adminEmail.trimmingCharacters(in: .whitespaces).isEmpty || adminPassword.isEmpty)
@@ -243,56 +241,69 @@ struct KeysManagementView: View {
         }
     }
 
-    // MARK: - Keys list
+    // MARK: - All licenses (live from Supabase)
 
-    private var keysListSection: some View {
+    private var allLicensesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Keys criadas")
+                Text("Todas as licenças")
                     .font(.manrope(13, weight: .bold))
                     .foregroundStyle(Color.auroraTxt)
+                if isLoadingLicenses {
+                    ProgressView().scaleEffect(0.5).frame(width: 16, height: 16)
+                }
                 Spacer()
-                Button("Limpar lista") {
-                    createdKeys = []
-                    saveKeys()
+                Button("Atualizar") {
+                    Task { await loadAllLicenses() }
                 }
                 .buttonStyle(.plain)
                 .font(.manrope(10, weight: .semibold))
                 .foregroundStyle(Color.auroraFaint)
+                .disabled(!hasToken || isLoadingLicenses)
+            }
+
+            if let licensesLoadError {
+                Text(licensesLoadError)
+                    .font(.manrope(11, weight: .semibold))
+                    .foregroundStyle(.orange)
             }
 
             VStack(spacing: 6) {
-                ForEach(createdKeys.reversed()) { entry in
-                    keyRow(entry)
+                ForEach(allLicenses) { license in
+                    licenseRow(license)
                 }
             }
         }
     }
 
-    private func keyRow(_ entry: CreatedLicenseKey) -> some View {
-        let isRevoking = revokingKeyID == entry.id
+    private func licenseRow(_ license: LicensingService.AdminLicense) -> some View {
+        let isRevoking = revokingLicenseID == license.id
+        let canRevoke = license.status == "active" || license.status == "cancelled"
 
         return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(entry.name)
+                    Text(license.name)
                         .font(.manrope(12, weight: .bold))
                         .foregroundStyle(Color.auroraTxt)
-                    Text(entry.plan.capitalized)
+                    Text(license.plan.capitalized)
                         .font(.manrope(9, weight: .bold))
-                        .foregroundStyle(entry.plan == "lifetime" ? Color.auroraGold : Color.auroraCyan)
+                        .foregroundStyle(license.plan == "lifetime" ? Color.auroraGold : Color.auroraCyan)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 2)
                         .background(
-                            (entry.plan == "lifetime" ? Color.auroraGold : Color.auroraCyan).opacity(0.15)
+                            (license.plan == "lifetime" ? Color.auroraGold : Color.auroraCyan).opacity(0.15)
                         )
                         .clipShape(Capsule())
+                    Text(license.status.capitalized)
+                        .font(.manrope(9, weight: .bold))
+                        .foregroundStyle(license.status == "active" ? .green : Color.auroraFaint)
                 }
-                Text(entry.key)
+                Text((license.licenseKeyPrefix ?? "") + "…")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(Color.auroraFaint)
                     .lineLimit(1)
-                if let email = entry.email {
+                if let email = license.customerEmail {
                     Text(email)
                         .font(.manrope(10, weight: .medium))
                         .foregroundStyle(Color.auroraMuted)
@@ -302,31 +313,25 @@ struct KeysManagementView: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 6) {
-                Text(entry.createdAt.formatted(date: .abbreviated, time: .omitted))
-                    .font(.manrope(10, weight: .medium))
-                    .foregroundStyle(Color.auroraFaint)
+                if let created = license.createdAt {
+                    Text(created.formatted(date: .abbreviated, time: .omitted))
+                        .font(.manrope(10, weight: .medium))
+                        .foregroundStyle(Color.auroraFaint)
+                }
 
-                HStack(spacing: 6) {
-                    Button(copiedKey == entry.key ? "Copiado!" : "Copiar") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(entry.key, forType: .string)
-                        copiedKey = entry.key
-                    }
-                    .buttonStyle(AuroraGhostButtonStyle())
-                    .controlSize(.small)
-
+                if canRevoke {
                     if isRevoking {
                         ProgressView().scaleEffect(0.5).frame(width: 20, height: 20)
                     } else {
                         Button {
-                            keyToRevoke = entry
+                            licenseToRevoke = license
                         } label: {
                             Image(systemName: "trash")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.red.opacity(0.7))
                         }
                         .buttonStyle(.plain)
-                        .help("Revogar esta key no Supabase")
+                        .help("Revogar esta licença no Supabase")
                     }
                 }
             }
@@ -395,19 +400,11 @@ struct KeysManagementView: View {
 
             switch r {
             case .success(let key):
-                let entry = CreatedLicenseKey(
-                    name: trimmedName,
-                    plan: plan.rawValue,
-                    key: key,
-                    email: trimmedEmail.isEmpty ? nil : trimmedEmail,
-                    createdAt: Date()
-                )
-                createdKeys.append(entry)
-                saveKeys()
                 result = .success(key: key, name: trimmedName, plan: plan.label)
                 name = ""
                 email = ""
                 plan = .pro
+                await loadAllLicenses()
             case .unauthorized:
                 hasToken = false
                 result = .unauthorized
@@ -417,40 +414,42 @@ struct KeysManagementView: View {
         }
     }
 
-    // MARK: - Revoke action
+    // MARK: - Live license list
 
-    private func revokeKey(_ entry: CreatedLicenseKey) {
-        keyToRevoke = nil
-        revokingKeyID = entry.id
+    private func loadAllLicenses() async {
+        isLoadingLicenses = true
+        licensesLoadError = nil
 
-        Task { @MainActor in
-            let r = await LicensingService.adminRevokeLicense(key: entry.key)
-            revokingKeyID = nil
+        let r = await LicensingService.adminFetchLicenses()
+        isLoadingLicenses = false
 
-            switch r {
-            case .success:
-                createdKeys.removeAll { $0.id == entry.id }
-                saveKeys()
-            case .unauthorized:
-                hasToken = false
-                result = .unauthorized
-            case .networkError(let msg):
-                result = .error("Revoke falhou: \(msg)")
-            }
+        switch r {
+        case .success(let licenses):
+            allLicenses = licenses.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        case .unauthorized:
+            hasToken = false
+        case .networkError(let msg):
+            licensesLoadError = msg
         }
     }
 
-    // MARK: - Persistence
+    private func revokeLicense(_ license: LicensingService.AdminLicense) {
+        licenseToRevoke = nil
+        revokingLicenseID = license.id
 
-    private func saveKeys() {
-        guard let data = try? JSONEncoder().encode(createdKeys) else { return }
-        UserDefaults.standard.set(data, forKey: Self.udKey)
-    }
+        Task { @MainActor in
+            let r = await LicensingService.adminRevokeLicenseByID(license.id)
+            revokingLicenseID = nil
 
-    private func loadKeys() {
-        guard let data = UserDefaults.standard.data(forKey: Self.udKey),
-              let decoded = try? JSONDecoder().decode([CreatedLicenseKey].self, from: data) else { return }
-        createdKeys = decoded
+            switch r {
+            case .success:
+                await loadAllLicenses()
+            case .unauthorized:
+                hasToken = false
+            case .networkError(let msg):
+                licensesLoadError = "Revoke falhou: \(msg)"
+            }
+        }
     }
 }
 

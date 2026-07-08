@@ -35,6 +35,8 @@ struct SettingsView: View {
     @State private var showCancelConfirm = false
     @State private var isCancelling = false
     @State private var cancelSuccessMessage: String?
+    @State private var isHoveringManageSubscription = false
+    @State private var isHoveringCancelSubscription = false
 
     var body: some View {
         ScrollView {
@@ -87,7 +89,7 @@ struct SettingsView: View {
 
     // MARK: - Stripe URLs (LIVE)
     private let stripeProMonthlyURL = "https://buy.stripe.com/aFa28kcXN9je92J6dl6J205"      // Pro monthly (5.99€ +VAT/month)
-    private let stripeProYearlyURL  = "https://buy.stripe.com/7sY5kwe1R9je4MtatB6J203"      // Pro yearly (59€ +VAT/yr)
+    private let stripeProYearlyURL  = "https://buy.stripe.com/7sY5kwe1R9je4MtatB6J203"      // Pro yearly (59.90€ +VAT/yr)
     private let stripeLifetimeURL   = "https://buy.stripe.com/bJe5kwcXNeDydiZ59h6J204"      // Lifetime (100€ +VAT/1 time-payment)
     private let stripePortalURL     = "https://billing.stripe.com/p/login/aFa28k5vl1QM0wdeJR6J200"      // Customer Portal
 
@@ -219,9 +221,20 @@ struct SettingsView: View {
                     } label: {
                         Label("Manage subscription", systemImage: "creditcard")
                             .font(.manrope(11, weight: .semibold))
-                            .foregroundStyle(Color.auroraMuted)
+                            .foregroundStyle(isHoveringManageSubscription ? Color.auroraTxt : Color.auroraMuted)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(Color.auroraMuted.opacity(isHoveringManageSubscription ? 0.14 : 0))
+                            )
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            isHoveringManageSubscription = hovering
+                        }
+                    }
 
                     Button {
                         showCancelConfirm = true
@@ -230,14 +243,27 @@ struct SettingsView: View {
                             Label("Cancelling…", systemImage: "hourglass")
                                 .font(.manrope(11, weight: .semibold))
                                 .foregroundStyle(Color.auroraMuted)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
                         } else {
                             Label("Cancel subscription", systemImage: "xmark.circle")
                                 .font(.manrope(11, weight: .semibold))
-                                .foregroundStyle(Color.auroraMuted)
+                                .foregroundStyle(isHoveringCancelSubscription ? Color.auroraLive : Color.auroraMuted)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.auroraLive.opacity(isHoveringCancelSubscription ? 0.12 : 0))
+                                )
                         }
                     }
                     .buttonStyle(.plain)
                     .disabled(isCancelling)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            isHoveringCancelSubscription = hovering
+                        }
+                    }
                     .confirmationDialog(
                         "Cancel subscription?",
                         isPresented: $showCancelConfirm,
@@ -353,7 +379,7 @@ struct SettingsView: View {
                             licenseStatus = "License key not found."
                         case .alreadyActivatedOnAnotherMac:
                             licenseStatus = "Key already in use on another Mac."
-                        case .inactive(let reason):
+                        case .inactive(let reason, _):
                             licenseStatus = reason
                         case .networkError(let msg):
                             licenseStatus = msg
@@ -385,7 +411,7 @@ struct SettingsView: View {
                 accent: Color.auroraCyan,
                 ctas: [
                     UpgradeCTA(label: "5.99€ +VAT/month", baseURL: stripeProMonthlyURL),
-                    UpgradeCTA(label: "59€ +VAT/yr", baseURL: stripeProYearlyURL),
+                    UpgradeCTA(label: "59.90€ +VAT/yr", baseURL: stripeProYearlyURL),
                 ],
                 email: email
             )

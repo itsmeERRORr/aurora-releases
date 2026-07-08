@@ -196,7 +196,10 @@ enum LicensingService {
         case success(plan: String, expiresAt: Date?, email: String?)
         case notFound
         case alreadyActivatedOnAnotherMac
-        case inactive(reason: String)
+        /// `trialReset` is true when the server just granted this device a fresh
+        /// free trial as a one-time courtesy for a lapsed license (see
+        /// validate-license's `maybeGrantTrialReset`).
+        case inactive(reason: String, trialReset: Bool)
         case networkError(String)
     }
 
@@ -252,7 +255,9 @@ enum LicensingService {
             switch http.statusCode {
             case 404: return .notFound
             case 403 where errorMsg.contains("another Mac"): return .alreadyActivatedOnAnotherMac
-            case 403: return .inactive(reason: errorMsg)
+            case 403:
+                let trialReset = json["trial_reset"] as? Bool ?? false
+                return .inactive(reason: errorMsg, trialReset: trialReset)
             default: return .networkError(errorMsg)
             }
         } catch {
@@ -338,6 +343,136 @@ enum LicensingService {
         case networkError(String)
     }
 
+    struct AdminLicense: Identifiable, Decodable {
+        let id: String
+        let licenseKeyPrefix: String?
+        let plan: String
+        let status: String
+        let customerEmail: String?
+        let expiresAt: Date?
+        let createdAt: Date?
+        let name: String
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case licenseKeyPrefix = "license_key_prefix"
+            case plan, status
+            case customerEmail = "customer_email"
+            case expiresAt = "expires_at"
+            case createdAt = "created_at"
+            case metadata
+        }
+
+        private enum MetadataKeys: String, CodingKey {
+            case name
+        }
+
+        // Custom decoding for two reasons:
+        // 1. Postgres/PostgREST timestamps (e.g. "2026-07-08T10:15:30.123456+00:00", microsecond
+        //    precision) aren't accepted by JSONDecoder's strict `.iso8601` strategy, which only
+        //    understands whole seconds — parsed instead with the same lenient formatter already
+        //    used elsewhere in this file for server-issued timestamps.
+        // 2. `metadata` is a free-form jsonb blob whose other keys (e.g. stripe-webhook's
+        //    `stripe_session_url`) can be `null` or arbitrary types, which would fail a
+        //    `[String: String]` dictionary decode — so only the one key we actually use is read.
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            licenseKeyPrefix = try container.decodeIfPresent(String.self, forKey: .licenseKeyPrefix)
+            plan = try container.decode(String.self, forKey: .plan)
+            status = try container.decode(String.self, forKey: .status)
+            customerEmail = try container.decodeIfPresent(String.self, forKey: .customerEmail)
+            let expiresAtRaw = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+            let createdAtRaw = try container.decodeIfPresent(String.self, forKey: .createdAt)
+            expiresAt = expiresAtRaw.flatMap(LicensingService.parseDate)
+            createdAt = createdAtRaw.flatMap(LicensingService.parseDate)
+
+            if let metadataContainer = try? container.nestedContainer(keyedBy: MetadataKeys.self, forKey: .metadata),
+               let decodedName = try? metadataContainer.decodeIfPresent(String.self, forKey: .name) {
+                name = decodedName
+            } else {
+                name = "—"
+            }
+        }
+    }
+
+    /// Fetches the full, authoritative license list from Supabase via the same
+    /// `admin-dashboard` Edge Function the web admin panel (jf.getaurora.pro) uses.
+    /// The in-app "Keys criadas" list is a local, per-device cache of keys created
+    /// from that same app install, so it never reflects licenses created elsewhere
+    /// (web dashboard, Stripe checkout) or revoked/upgraded elsewhere — this fetch
+    /// closes that gap.
+    static func adminFetchLicenses() async -> AdminFetchResult<[AdminLicense]> {
+        guard let token = await fetchAdminAccessToken() else {
+            return .unauthorized
+        }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-dashboard") else {
+            return .networkError("Invalid URL.")
+        }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                return .networkError("Invalid server response.")
+            }
+            if http.statusCode == 401 { return .unauthorized }
+            guard http.statusCode == 200 else {
+                return .networkError("Server error (\(http.statusCode)).")
+            }
+            struct Envelope: Decodable { let licenses: [AdminLicense] }
+            do {
+                let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+                return .success(envelope.licenses)
+            } catch {
+                return .networkError("Could not parse license list: \(error)")
+            }
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    /// Revokes a license by its Supabase row id (as returned by `adminFetchLicenses`), via the
+    /// same `admin-dashboard` action the web admin panel uses — since only the license's hash is
+    /// ever stored server-side, revoking by id (rather than the plaintext key) is the only option
+    /// once a license was created somewhere other than this app install.
+    static func adminRevokeLicenseByID(_ id: String) async -> AdminCreateResult {
+        guard let token = await fetchAdminAccessToken() else {
+            return .unauthorized
+        }
+        guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-dashboard") else {
+            return .networkError("Invalid URL.")
+        }
+
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["action": "revoke", "id": id])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .networkError("Invalid server response.")
+            }
+            if http.statusCode == 401 { return .unauthorized }
+            if http.statusCode == 200 { return .success(licenseKey: id) }
+            return .networkError(json["error"] as? String ?? "Unknown error.")
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    enum AdminFetchResult<T> {
+        case success(T)
+        case unauthorized
+        case networkError(String)
+    }
+
     static func saveAdminCredentials(email: String, password: String) {
         KeychainStore.setString(email, service: keychainService, account: adminEmailKeychainAccount)
         KeychainStore.setString(password, service: keychainService, account: adminPasswordKeychainAccount)
@@ -402,34 +537,6 @@ enum LicensingService {
             if http.statusCode == 200, let key = json["license_key"] as? String {
                 return .success(licenseKey: key)
             }
-            return .networkError(json["error"] as? String ?? "Unknown error.")
-        } catch {
-            return .networkError(error.localizedDescription)
-        }
-    }
-
-    static func adminRevokeLicense(key: String) async -> AdminCreateResult {
-        guard let token = await fetchAdminAccessToken() else {
-            return .unauthorized
-        }
-        guard let url = URL(string: "\(supabaseURL)/functions/v1/admin-revoke-license") else {
-            return .networkError("Invalid URL.")
-        }
-
-        var req = URLRequest(url: url, timeoutInterval: 15)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["license_key": key])
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: req)
-            guard let http = response as? HTTPURLResponse,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return .networkError("Invalid server response.")
-            }
-            if http.statusCode == 401 { return .unauthorized }
-            if http.statusCode == 200 { return .success(licenseKey: key) }
             return .networkError(json["error"] as? String ?? "Unknown error.")
         } catch {
             return .networkError(error.localizedDescription)

@@ -3,6 +3,17 @@
   <channel>
     <title>Aurora</title>
     <item>
+      <title>Version 1.2.55</title>
+      <pubDate>Wed, 08 Jul 2026 14:47:36 +0000</pubDate>
+      <enclosure
+        url="https://github.com/itsmeERRORr/aurora-releases/releases/download/v1.2.55/Aurora-1.2.55.dmg"
+        sparkle:version="67"
+        sparkle:shortVersionString="1.2.55"
+        sparkle:edSignature="dxOuwII+O5RLaTRjwhudlVrAe6KDsKDQK7jx1KDWfOXLE+addSP6ZSgjc/XprzVIVyZsYYtTXCUmd3ZgS8IVAg=="
+        length="7630476"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.2.54</title>
       <pubDate>Mon, 06 Jul 2026 10:56:31 +0000</pubDate>
       <enclosure

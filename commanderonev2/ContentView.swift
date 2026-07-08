@@ -11,7 +11,7 @@ struct ContentView: View {
     @State private var activeImportEngines: [String: ImportEngine] = [:]
     @State private var statsRunner: StatsRunner?
     @State private var showProgressOverlay = false
-    @State private var showLicenseExpiredAlert = false
+    @State private var proDowngradeMessage: String?
     @State private var selectedNavItem: NavigationItem = .statistics
     @State private var showAutoImportOverlay = false
     @State private var autoImportCountdown = 5
@@ -122,10 +122,16 @@ struct ContentView: View {
                 showLicenseOverlay = true
             }
         }
-        .alert("License Expired", isPresented: $showLicenseExpiredAlert) {
+        .alert(
+            "Welcome back to Free",
+            isPresented: Binding(
+                get: { proDowngradeMessage != nil },
+                set: { if !$0 { proDowngradeMessage = nil } }
+            )
+        ) {
             Button("OK") {}
         } message: {
-            Text("Your Aurora license has expired. Renew your license to continue importing.")
+            Text(proDowngradeMessage ?? "")
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -211,12 +217,16 @@ struct ContentView: View {
         startTelegramDailySummaryScheduler()
         // Revalidate immediately (updates the live gate — this is what migrates a
         // legacy unsigned cache to a signed one on first launch of this version),
-        // then keep re-checking hourly.
-        Task { @MainActor in await performLicenseRevalidation() }
+        // then keep re-checking hourly. Sequenced (not two independent Tasks):
+        // if revalidation just granted a fresh-trial reset for a lapsed license,
+        // the sync below must see the already-reset local count, or it would
+        // push the stale pre-reset value and re-inflate the server's count via
+        // the greatest()-based ratchet, silently undoing the reset.
+        Task { @MainActor in
+            await performLicenseRevalidation()
+            await appState.syncTrialUsage()
+        }
         startLicenseRevalidationTimer()
-        // Pull the authoritative trial count from the server — this corrects a
-        // deleted/edited local counter back up to what the server remembers.
-        Task { @MainActor in await appState.syncTrialUsage() }
         appState.log("App started — Aurora v1.0")
     }
 
@@ -381,7 +391,21 @@ struct ContentView: View {
         guard let stored = LicensingService.storedActivation() else { return }
         let result = await LicensingService.activate(with: stored.key)
         switch result {
-        case .inactive, .notFound:
+        case .inactive(_, let trialReset):
+            LicensingService.deactivate()
+            appState.refreshLicenseStatus()
+            if trialReset {
+                // A lapsed subscription/license just earned this device a one-time
+                // fresh trial server-side — mirror it locally and explain what
+                // happened, without forcing the license-entry overlay open. The
+                // trial banner (driven separately by appState.isTrialMode) keeps
+                // showing the live action count underneath as usual.
+                appState.grantFreshTrialAfterProDowngrade()
+                proDowngradeMessage = "Your Aurora subscription has ended, so you're back on the Free plan — as a thank-you, we've refreshed your trial with 5 new actions."
+            } else {
+                showLicenseOverlay = true
+            }
+        case .notFound:
             LicensingService.deactivate()
             appState.refreshLicenseStatus()
             showLicenseOverlay = true

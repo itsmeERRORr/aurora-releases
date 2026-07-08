@@ -147,7 +147,7 @@ struct LicenseEntryView: View {
                 status = .error("License key not found.")
             case .alreadyActivatedOnAnotherMac:
                 status = .error("This key is already in use on another Mac.")
-            case .inactive(let reason):
+            case .inactive(let reason, _):
                 status = .error(reason)
             case .networkError(let msg):
                 status = .error(msg)

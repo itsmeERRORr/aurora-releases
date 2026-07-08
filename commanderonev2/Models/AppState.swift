@@ -154,6 +154,15 @@ final class AppState {
         }
     }
 
+    /// Mirrors a one-time server-side trial reset (see validate-license's
+    /// `maybeGrantTrialReset`) granted when a lapsed license belonging to this
+    /// device is detected. Overwrites the local counter directly rather than
+    /// going through `syncTrialUsage()`'s `max(local, server)` ratchet, which
+    /// would otherwise just re-inflate it back to the pre-reset count.
+    func grantFreshTrialAfterProDowngrade() {
+        trialUsage = TrialUsageState()
+    }
+
     // MARK: - Volumes
     var mountedVolumes: [VolumeInfo] = []
     var activeVolume: VolumeInfo?
